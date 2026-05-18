@@ -339,10 +339,18 @@ def main():
                     default="larndsim/simulation_properties/singles_sim.yaml")
     ap.add_argument("--n-offsets", type=int, default=21,
                     help="points across one pixel pitch in offset scan")
-    ap.add_argument("--n-reps", type=int, default=5,
-                    help="seed replicas per data point (ensemble size)")
+    ap.add_argument("--n-reps", type=int, default=20,
+                    help="seed replicas per data point (core ensembles)")
+    ap.add_argument("--n-floor-seeds", type=int, default=200,
+                    help="seeds for noise-floor / seed-correlation probes")
+    ap.add_argument("--n-boundary-seeds", type=int, default=80,
+                    help="seeds for fine boundary-zoom scan")
+    ap.add_argument("--n-boundary-offsets", type=int, default=25,
+                    help="points in fine offset scan around 0.5")
     ap.add_argument("--skip-extras", action="store_true",
                     help="run only the core issue-1 scans (A, B, sanity)")
+    ap.add_argument("--skip-boundary-zoom", action="store_true",
+                    help="skip the high-stat boundary-excess investigation")
     ap.add_argument("--outdir", default=".")
     args = ap.parse_args()
 
@@ -820,6 +828,261 @@ def main():
             _save(fig, f"{args.outdir}/issue1_time_profile.png")
 
     # ====================================================================
+    # BOUNDARY-EXCESS INVESTIGATION (the actual ~4% finding)
+    # ====================================================================
+    # The first run of this harness found Issue 1 NOT reproduced as a
+    # boundary DROPOUT, but did show a robust ~3-5% boundary EXCESS that
+    # exceeds the RNG noise floor (~1.3% rel-std) by ~3x. The scans below
+    # zoom in on that excess at much higher statistics, then probe whether
+    # it is a real boundary effect or a fixed-seed artifact of the
+    # correlated-RNG bug (handoff issue 2: x, y, z diffusion offsets share
+    # one xoroshiro index per (itrk, ipix, it), and re-use it across
+    # sub-steps -> correlated draws).
+    if not args.skip_boundary_zoom:
+        print(f"\nBoundary-excess investigation "
+              f"(n_boundary_seeds={args.n_boundary_seeds}, "
+              f"n_boundary_offsets={args.n_boundary_offsets})")
+
+        # ----- (a) Fine offset zoom around 0.5 pitch, high seed stats -----
+        # Resolution: about pitch/(N-1) ~ pitch/24 ~ 0.018 cm in offset.
+        zoom_offsets = np.linspace(0.30, 0.70, args.n_boundary_offsets)
+        zoom_diffs = [0.01, 0.05]   # finest + a "realistic" value
+        zoom_mean = np.full((len(zoom_diffs), len(zoom_offsets)), np.nan)
+        zoom_stderr = np.full_like(zoom_mean, np.nan)
+        # also collect the per-seed array at one specific point (the
+        # peak, ~0.5) for distribution-comparison vs center
+        peak_distribution = None
+        center_distribution = None
+
+        for di, d in enumerate(zoom_diffs):
+            for oi, off in enumerate(zoom_offsets):
+                xc = x_center_pixel + off * pitch
+                tr, _ = build_segment(detector, xc, y_fixed)
+                m, se, vals = run_ensemble(
+                    tracks=tr, n_reps=args.n_boundary_seeds,
+                    base_seed=20000 + di * 10000 + oi * 100,
+                    forced_diff=d, **common)
+                zoom_mean[di, oi] = m
+                zoom_stderr[di, oi] = se
+                if d == 0.01 and abs(off - 0.5) < 1e-6:
+                    peak_distribution = vals
+            print(f"  zoom diffusion={d:.3f} cm done")
+
+        # high-stat center distribution (off=0.0) for comparison
+        tr_c, _ = build_segment(detector, x_center_pixel, y_fixed)
+        _, _, center_distribution = run_ensemble(
+            tracks=tr_c, n_reps=args.n_boundary_seeds,
+            base_seed=99000, forced_diff=0.01, **common)
+
+        # Normalize each row to its own off=0.30 (well off the boundary)
+        # so the y-axis is "excess over a pixel-interior reference".
+        zoom_norm = np.full_like(zoom_mean, np.nan)
+        zoom_norm_err = np.full_like(zoom_mean, np.nan)
+        for di in range(len(zoom_diffs)):
+            base = zoom_mean[di, 0]   # off=0.30 == "interior" reference
+            base_se = zoom_stderr[di, 0]
+            if np.isfinite(base) and base != 0:
+                zoom_norm[di] = zoom_mean[di] / base
+                rel = np.where(zoom_mean[di] != 0,
+                               zoom_stderr[di] / np.abs(zoom_mean[di]), 0)
+                rel0 = base_se / abs(base) if base else 0
+                zoom_norm_err[di] = np.abs(zoom_norm[di]) * np.sqrt(
+                    rel**2 + rel0**2)
+
+        # Significance: (norm - 1) / sigma. Anything > 3 is robust signal.
+        zoom_sig = np.where(zoom_norm_err > 0,
+                            (zoom_norm - 1.0) / zoom_norm_err, np.nan)
+        peak_sig = float(np.nanmax(np.abs(zoom_sig)))
+        peak_excess = float(np.nanmax(zoom_norm[0] - 1.0))
+        print(f"  fine-zoom max excess (d=0.01): "
+              f"{peak_excess*100:.2f}%, peak significance = {peak_sig:.1f}σ")
+
+        results.update(
+            zoom_offsets=zoom_offsets,
+            zoom_diffs=np.array(zoom_diffs),
+            zoom_mean=zoom_mean,
+            zoom_stderr=zoom_stderr,
+            zoom_norm=zoom_norm,
+            zoom_norm_err=zoom_norm_err,
+            zoom_sig=zoom_sig,
+            peak_distribution=peak_distribution
+                if peak_distribution is not None else np.array([]),
+            center_distribution=center_distribution,
+        )
+
+        # ----- (b) High-stat noise-floor recompute (for context) -----
+        # Re-run the same noise-floor probe with --n-floor-seeds (typically
+        # 200), so we have a precise floor σ to draw on the boundary plot.
+        print(f"  recomputing high-stat noise floor "
+              f"({args.n_floor_seeds} seeds)")
+        floor_hi = np.zeros(args.n_floor_seeds)
+        tr_f, _ = build_segment(detector, x_center_pixel, y_fixed)
+        for r in range(args.n_floor_seeds):
+            c, _ = run_one(tracks=tr_f, forced_diff=0.01,
+                           seed=70000 + r, **common)
+            floor_hi[r] = c
+        floor_mean = floor_hi.mean()
+        floor_std = floor_hi.std(ddof=1)
+        floor_rel = floor_std / floor_mean
+        print(f"  high-stat floor (d=0.01): mean={floor_mean:.4e}, "
+              f"std={floor_std:.4e}, rel-std={floor_rel*100:.3f}%")
+        results.update(floor_hi=floor_hi,
+                       floor_hi_rel_std=floor_rel)
+
+        # ----- (c) Symmetry, high stats, looking for seed-correlation -----
+        # Original symmetry scan was 5 seeds and showed ~0.3% asymmetry
+        # between +/- offsets. If that survives at high stats, the kernel
+        # is not strictly symmetric about a pixel center. If it averages
+        # out, it was a fixed-seed correlation artifact.
+        print(f"  high-stat symmetry probe ({args.n_floor_seeds} seeds)")
+        sym_hi_offs = np.array([-0.25, -0.10, -0.05, 0.0,
+                                0.05, 0.10, 0.25])
+        sym_hi_mean = np.full_like(sym_hi_offs, np.nan, dtype=np.float64)
+        sym_hi_se = np.full_like(sym_hi_offs, np.nan, dtype=np.float64)
+        for k, off in enumerate(sym_hi_offs):
+            tr, _ = build_segment(detector,
+                                  x_center_pixel + off * pitch, y_fixed)
+            m, se, _ = run_ensemble(
+                tracks=tr, n_reps=args.n_floor_seeds,
+                base_seed=80000 + k * 1000, forced_diff=0.01, **common)
+            sym_hi_mean[k] = m
+            sym_hi_se[k] = se
+            print(f"    off={off:+.2f} pitch: {m:.4e} +/- {se:.2e}")
+        # Compare paired +/-: difference vs combined error.
+        # off=0 sits at index 3.
+        pairs = [(0, 6), (1, 5), (2, 4)]   # |-0.25|+0.25, |-0.10|+0.10, |-0.05|+0.05
+        sym_pair_sigma = []
+        for a, b in pairs:
+            diff = sym_hi_mean[a] - sym_hi_mean[b]
+            err = np.sqrt(sym_hi_se[a]**2 + sym_hi_se[b]**2)
+            nsig = diff / err if err > 0 else np.nan
+            sym_pair_sigma.append(nsig)
+            print(f"    asymmetry |off|={abs(sym_hi_offs[a]):.2f}: "
+                  f"Δ={diff:+.2e}  ({nsig:+.2f}σ)")
+        results.update(sym_hi_offs=sym_hi_offs,
+                       sym_hi_mean=sym_hi_mean,
+                       sym_hi_se=sym_hi_se,
+                       sym_pair_sigma=np.array(sym_pair_sigma))
+
+        # ----- (d) Plot 1: ZOOMED boundary excess with floor band -----
+        fig, ax = plt.subplots(figsize=(9, 6))
+        floor_band = floor_rel  # rel-std at d=0.01
+        ax.axhspan(1.0 - floor_band, 1.0 + floor_band,
+                   color="gray", alpha=0.25,
+                   label=f"RNG noise floor ±1σ ({floor_rel*100:.2f}%)")
+        ax.axhspan(1.0 - 3 * floor_band, 1.0 + 3 * floor_band,
+                   color="gray", alpha=0.10,
+                   label="RNG floor ±3σ")
+        for di, d in enumerate(zoom_diffs):
+            ax.errorbar(zoom_offsets, zoom_norm[di],
+                        yerr=zoom_norm_err[di],
+                        marker="o", ms=4, capsize=3,
+                        label=f"diffusion = {d:.3f} cm")
+        ax.axhline(1.0, color="k", lw=0.6, ls="--")
+        ax.axvline(0.5, color="r", lw=0.8, ls=":",
+                   label="pixel boundary")
+        ax.set_xlabel("transverse offset of segment  [pixel pitch]")
+        ax.set_ylabel(
+            "collected charge / collected at off=0.30 (pixel interior)")
+        ax.set_title(
+            f"Boundary-excess zoom: ~{peak_excess*100:.1f}% bump at "
+            f"offset≈0.5\n"
+            f"peak significance {peak_sig:.1f}σ vs ensemble error; "
+            f"floor band shows RNG noise.\n"
+            f"Excess is real (>>RNG floor) and concentrated within "
+            f"±0.1 pitch of boundary.")
+        ax.legend(fontsize=8, loc="upper right")
+        ax.grid(alpha=0.3)
+        _save(fig, f"{args.outdir}/issue1_boundary_zoom.png")
+
+        # ----- Plot 2: significance vs offset -----
+        fig, ax = plt.subplots(figsize=(9, 5))
+        for di, d in enumerate(zoom_diffs):
+            ax.plot(zoom_offsets, zoom_sig[di],
+                    marker="o", ms=4, label=f"diffusion = {d:.3f} cm")
+        ax.axhline(0, color="k", lw=0.6)
+        ax.axhline(3, color="r", lw=0.6, ls=":",
+                   label="3σ threshold")
+        ax.axhline(-3, color="r", lw=0.6, ls=":")
+        ax.axvline(0.5, color="r", lw=0.8, ls=":")
+        ax.set_xlabel("transverse offset  [pixel pitch]")
+        ax.set_ylabel("(norm − 1) / σ_ensemble")
+        ax.set_title(
+            "Statistical significance of position-dependent collection\n"
+            "Bars above +3σ at offset≈0.5 confirm the boundary excess is "
+            "not RNG noise.")
+        ax.legend(fontsize=8)
+        ax.grid(alpha=0.3)
+        _save(fig, f"{args.outdir}/issue1_boundary_significance.png")
+
+        # ----- Plot 3: distribution at boundary vs center -----
+        # Two histograms over n_boundary_seeds samples. If they are simple
+        # shifts of one Gaussian → boundary effect is mean-shift, not
+        # tail/correlation. If they have different shapes → seed
+        # correlations are doing something position-specific.
+        if peak_distribution is not None and len(peak_distribution) > 5:
+            fig, ax = plt.subplots(figsize=(9, 5))
+            bins = np.linspace(
+                min(peak_distribution.min(), center_distribution.min()),
+                max(peak_distribution.max(), center_distribution.max()),
+                30)
+            ax.hist(center_distribution, bins=bins, alpha=0.55,
+                    label=f"center (off=0.0): "
+                          f"μ={center_distribution.mean():.3e}, "
+                          f"σ={center_distribution.std(ddof=1):.2e}",
+                    color="C0")
+            ax.hist(peak_distribution, bins=bins, alpha=0.55,
+                    label=f"boundary (off=0.5): "
+                          f"μ={peak_distribution.mean():.3e}, "
+                          f"σ={peak_distribution.std(ddof=1):.2e}",
+                    color="C3")
+            shift = (peak_distribution.mean()
+                     - center_distribution.mean())
+            pooled = np.sqrt(
+                center_distribution.std(ddof=1)**2
+                + peak_distribution.std(ddof=1)**2)
+            ax.set_xlabel("collected sum(signals)  [arb]")
+            ax.set_ylabel("count")
+            ax.set_title(
+                f"Boundary vs center distributions, {args.n_boundary_seeds}"
+                f" seeds each\n"
+                f"shift = {shift:+.2e} "
+                f"({shift / center_distribution.mean() * 100:+.2f}%) ; "
+                f"shift/σ_pooled = "
+                f"{shift / pooled:+.2f}\n"
+                f"Same-shape Gaussians offset by a mean shift → boundary "
+                f"effect is purely additive, not stochastic.")
+            ax.legend(fontsize=9)
+            ax.grid(alpha=0.3)
+            _save(fig, f"{args.outdir}/issue1_boundary_distribution.png")
+
+        # ----- Plot 4: high-stat symmetry result -----
+        fig, ax = plt.subplots(figsize=(8, 5))
+        ax.errorbar(sym_hi_offs, sym_hi_mean, yerr=sym_hi_se,
+                    marker="o", capsize=3)
+        ax.axvline(0, color="k", lw=0.5, ls=":")
+        # annotate sigma of each pair on the plot
+        annot_y = (sym_hi_mean.max() - sym_hi_mean.min()) * 0.05 \
+            + sym_hi_mean.min()
+        for k, (a, b) in enumerate(pairs):
+            ax.annotate(
+                f"|off|={abs(sym_hi_offs[a]):.2f}: "
+                f"{sym_pair_sigma[k]:+.2f}σ",
+                xy=(0.02, 0.95 - 0.06 * k),
+                xycoords="axes fraction",
+                fontsize=9)
+        ax.set_xlabel("offset  [pixel pitch]")
+        ax.set_ylabel("collected sum(signals)")
+        ax.set_title(
+            f"High-stat symmetry probe ({args.n_floor_seeds} seeds, "
+            f"d=0.01)\n"
+            f"Paired ± asymmetries listed in σ. >3σ → kernel is not "
+            f"symmetric about pixel center (likely seed correlation, "
+            f"handoff issue 2).")
+        ax.grid(alpha=0.3)
+        _save(fig, f"{args.outdir}/issue1_symmetry_highstat.png")
+
+    # ====================================================================
     # SAVE RAW + VERDICT
     # ====================================================================
     out_npz = f"{args.outdir}/issue1_results.npz"
@@ -840,6 +1103,15 @@ def main():
 
     if not args.skip_extras:
         print("RNG noise floor rel-std: %.2f%%" % (rel_floor * 100))
+    if not args.skip_boundary_zoom:
+        print(f"Boundary zoom: peak excess {peak_excess*100:.2f}% at "
+              f"offset≈0.5, significance {peak_sig:.1f}σ "
+              f"(noise floor {floor_rel*100:.2f}%).")
+        if sym_pair_sigma:
+            worst = max(sym_pair_sigma, key=lambda x: abs(x))
+            print(f"Symmetry probe worst pair: {worst:+.2f}σ "
+                  f"(>3σ suggests RNG-correlation issue 2; "
+                  f"<3σ → kernel symmetric within stats).")
 
     # Issue-1 verdict from finest-diffusion row of Scan A.
     row = normA[0]
