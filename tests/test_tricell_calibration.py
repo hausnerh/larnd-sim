@@ -26,22 +26,20 @@ The "tricell" is a Z-shape pattern of 5 pixels:
     track enters w_1),
   - One "exit-witness" pixel in column w_2 (first w_2 hit after the
     track exits w_1).
-The middle of the three w_1 pixels is the calibration target. ds is
-reconstructed from witness pixel positions + timing, using only the
-portion of the track that lies INSIDE the w_1 column. The witnesses
-sit OUTSIDE w_1 (in w_0 and w_2); their full center-to-center span
-covers all three columns. For a straight constant-velocity track the
-inside-w_1 portion is the central 50% of that span (between the
-w_0/w_1 boundary at 25% and the w_1/w_2 boundary at 75%):
+The middle of the three w_1 pixels is the calibration target. We
+estimate the track direction across the tricell from the best info we
+have on each axis: w from column geometry, v from witness centers, and
+drift from witness timing. Then project to get ds across the middle
+pixel:
 
-    delta_t_witness          = t_w2_witness − t_w0_witness
-    delta_drift_inside_w1    = 0.5 * V_DRIFT * delta_t_witness
-    delta_traversal_inside_w1 = 0.5 * (v_center_w2 − v_center_w0)
-    delta_column_inside_w1   = 1 * pixel_pitch   (exact, w_1 width)
-    L_inside_w1 = sqrt(delta_drift_inside² + delta_traversal_inside²
-                       + delta_column_inside²)
-    ds_middle_pixel = L_inside_w1 * pixel_pitch
-                                / |delta_traversal_inside_w1|
+    delta_w     = 1 * pixel_pitch   (exact: track moved one column
+                                     width while crossing w_1)
+    delta_v     = v_center_w2_witness − v_center_w0_witness
+                  (estimated from witness pixel centers)
+    delta_drift = V_DRIFT * (t_w2_witness − t_w0_witness)
+                  (from witness peak timing)
+    L = sqrt(delta_w² + delta_v² + delta_drift²)
+    ds_middle_pixel = L * pixel_pitch / |delta_v|
 
 The same `ds_middle_pixel_geometric_truth` (analytic 3D clip from the
 input segment) is used as the denominator for all three measurements so
@@ -566,41 +564,30 @@ def find_zshape_tricells(hit_pixel_dict, minimum_witness_charge_threshold):
 # Reconstruct ds through middle pixel from witness pixel geometry+timing
 # ---------------------------------------------------------------------------
 def reconstruct_ds_from_witnesses(tricell, detector, time_sampling_us):
-    """Compute ds through the middle pixel from witness pixels.
+    """Estimate the track direction across the tricell, then project to
+    get ds through the middle pixel.
 
-    All deltas are the path-portion INSIDE the w_1 column (the
-    column-crossing segment, NOT the full witness center-to-witness
-    center span). The two witnesses sit OUTSIDE w_1 (in columns w_0
-    and w_2 respectively), so their full center-to-center span covers
-    w_0 + w_1 + w_2; only the middle third (in w direction) is inside
-    w_1. For a straight track at constant velocity, the inside-w_1
-    portion of the path takes the 50% of the witness-to-witness span
-    bracketed by the w_0/w_1 boundary (at 25% of the way) and the
-    w_1/w_2 boundary (at 75%). Hence the factor of 0.5 on the v and
-    drift deltas.
+    Use the best information we have on each axis:
 
-      delta_t_witness         = t_w2_witness − t_w0_witness
-      delta_drift_inside_w1   = 0.5 * V_DRIFT * delta_t_witness
-      delta_traversal_inside_w1
-                              = 0.5 * (v_center_w2 − v_center_w0)
-                                (v_center used as proxy for v at the
-                                 w_0/w_1 and w_1/w_2 boundary crossings;
-                                 the 0.5 factor extracts the inside-w_1
-                                 portion of the v-traversal)
-      delta_column_inside_w1  = 1 * pixel_pitch    (exact, w_1 width)
-      L_inside_w1 = sqrt(delta_drift² + delta_traversal² + delta_column²)
-      ds_middle_pixel = L_inside_w1 * pixel_pitch
-                                  / |delta_traversal_inside_w1|
+      delta_w     = 1 * pixel_pitch
+                    (EXACT: the track moved exactly one column width
+                     in w while crossing w_1.)
+      delta_v     = v_center_w2_witness − v_center_w0_witness
+                    (Approximate: track's v-traversal across the
+                     tricell. Range depends on the exact entry/exit
+                     v-coords at the w_0/w_1 and w_1/w_2 boundaries;
+                     the witness centers are the best estimate
+                     available.)
+      delta_drift = V_DRIFT * (t_w2_witness − t_w0_witness)
+                    (From witness peak timing.)
 
-    Returns (ds_middle_pixel_cm, L_inside_w1_cm) or (None, None) if
-    delta_traversal_inside_w1 == 0.
+    These three components define the track direction vector. Project
+    to get ds across one pixel pitch in the v direction:
 
-    Caveat: using witness pixel CENTERS (then halving) is exact for a
-    straight constant-velocity track entering/exiting w_0 and w_2
-    through their faces toward w_1. Tracks that enter/exit witnesses
-    through their v-direction faces (the "bottom" of the cell in the
-    user's notes) violate the constant-velocity assumption per pitch;
-    expect ±pitch/2 of v-coordinate slop in those cases.
+      L  = sqrt(delta_w² + delta_v² + delta_drift²)
+      ds_middle_pixel = L * pixel_pitch / |delta_v|
+
+    Returns (ds_middle_pixel_cm, L_cm) or (None, None) if delta_v == 0.
     """
     pitch_cm = detector.PIXEL_PITCH
     v_drift = detector.V_DRIFT
@@ -614,26 +601,23 @@ def reconstruct_ds_from_witnesses(tricell, detector, time_sampling_us):
     delta_t_witness_us = (
         tricell['peak_tick_w2_witness']
         - tricell['peak_tick_w0_witness']) * time_sampling_us
-    delta_drift_inside_w1_cm = 0.5 * v_drift * delta_t_witness_us
+    delta_drift_cm = v_drift * delta_t_witness_us
 
     if traversal_axis == 'y':
-        delta_traversal_witness_cm = y_w2 - y_w0
+        delta_v_cm = y_w2 - y_w0
     else:  # traversal_axis == 'x'
-        delta_traversal_witness_cm = x_w2 - x_w0
-    delta_traversal_inside_w1_cm = 0.5 * delta_traversal_witness_cm
+        delta_v_cm = x_w2 - x_w0
 
-    # Inside-w_1 column extent: exactly one pixel pitch in w direction.
-    delta_column_inside_w1_cm = pitch_cm
+    # Track traversed exactly one pixel pitch in the column direction
+    # while crossing w_1.
+    delta_w_cm = pitch_cm
 
-    if delta_traversal_inside_w1_cm == 0:
+    if delta_v_cm == 0:
         return None, None
-    length_inside_w1_cm = sqrt(
-        delta_drift_inside_w1_cm ** 2
-        + delta_traversal_inside_w1_cm ** 2
-        + delta_column_inside_w1_cm ** 2)
-    ds_middle_pixel_cm = (length_inside_w1_cm * pitch_cm
-                          / abs(delta_traversal_inside_w1_cm))
-    return ds_middle_pixel_cm, length_inside_w1_cm
+    length_cm = sqrt(
+        delta_w_cm ** 2 + delta_v_cm ** 2 + delta_drift_cm ** 2)
+    ds_middle_pixel_cm = length_cm * pitch_cm / abs(delta_v_cm)
+    return ds_middle_pixel_cm, length_cm
 
 
 # ---------------------------------------------------------------------------
@@ -817,7 +801,7 @@ def main():
                     args.minimum_witness_charge_threshold))
 
                 for tricell in tricells_found:
-                    ds_reconstructed_cm, length_inside_w1_cm = \
+                    ds_reconstructed_cm, witness_path_length_cm = \
                         reconstruct_ds_from_witnesses(
                             tricell, detector, detector.TIME_SAMPLING)
                     if ds_reconstructed_cm is None:
@@ -867,7 +851,7 @@ def main():
                         i_y_center=i_y_center,
                         ds_geometric_truth_cm=ds_geometric_truth_cm,
                         ds_reconstructed_cm=ds_reconstructed_cm,
-                        length_inside_w1_cm=length_inside_w1_cm,
+                        witness_path_length_cm=witness_path_length_cm,
                         q_truth=q_truth,
                         q_drift_landed=q_drift_landed,
                         q_kernel_response=q_kernel_response,
