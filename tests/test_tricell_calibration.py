@@ -8,61 +8,57 @@ larnd-sim. For each valid Z-shape tricell extracted from a muon's
 pixel readout, we compute THREE independent dQ/dx estimates on the
 middle pixel and compare:
 
-  A — Truth: energy deposited in argon × recomb / W_ION, sliced to the
-              pixel pillar by geometric clip of the input segment.
-  B — Drift-on-pad: number of electrons that PHYSICALLY arrive on the
-                    pixel pad after drift + diffusion, computed per
-                    substep with the same Gaussian σ the kernel uses,
-                    including all RNG fluctuations. Captures Far Field
-                    Effects (inward + outward crosstalk).
-  C — Pixel readout: kernel response output (sum of signals on the
-                     pixel over all time ticks). Includes induced
-                     current, cross-induction, etc.
+  TRUTH       — energy deposited in argon × recomb / W_ION, sliced to
+                 the pixel pillar by geometric clip of the input
+                 segment.
+  DRIFT_LANDED— physical electrons that arrive on the pixel pad after
+                 drift + diffusion, computed per substep with the same
+                 Gaussian σ the kernel uses, including all RNG
+                 fluctuations. Captures Far Field Effects: inward +
+                 outward diffusion crosstalk.
+  KERNEL      — kernel response readout (sum of signals on the pixel
+                 over all time ticks). Includes induced current, cross-
+                 induction, etc.
 
 The "tricell" is a Z-shape pattern of 5 pixels:
-  - Three contiguous pixels in column w_1 (orthogonal axis v),
-  - One "entry-witness" pixel in column w_0 (last w_0 hit before
+  - Three contiguous pixels in column w_1 (along orthogonal axis v),
+  - One "entry-witness" pixel in column w_0 (last w_0 hit before the
     track enters w_1),
-  - One "exit-witness" pixel in column w_2 (first w_2 hit after
+  - One "exit-witness" pixel in column w_2 (first w_2 hit after the
     track exits w_1).
-The middle of the three w_1 pixels is the calibration target. ds_C is
-reconstructed from the witness pixel positions + timing:
+The middle of the three w_1 pixels is the calibration target. ds is
+reconstructed from witness pixel positions + timing:
 
-    Δt = t_5 − t_1
-    Δx_drift = V_DRIFT * Δt
-    Δv = v_5 − v_1                       (pixel coord along v axis)
-    Δw = w_5 − w_1 = ±2·pitch            (column index span)
-    L_path = sqrt(Δx_drift² + Δv² + Δw²)
-    ds_C_recon = L_path * (pitch_v / Δv)
+    delta_t_witness     = t_exit_witness − t_entry_witness
+    delta_drift_witness = V_DRIFT * delta_t_witness
+    delta_traversal     = v_exit_witness − v_entry_witness
+    delta_column        = w_exit_witness − w_entry_witness  (= ±2·pitch)
+    L_witness_to_witness = sqrt(delta_drift² + delta_traversal² + delta_column²)
+    ds_middle_pixel_reconstructed
+                        = L_witness_to_witness * (pixel_pitch / |delta_traversal|)
 
-(Equivalently, pitch / cos_v where cos_v is the v-component of the unit
-direction vector.) The same `ds_C_3D` (analytic geometric clip from the
-input segment) is used as the denominator for all three (A, B, C) so
+The same `ds_middle_pixel_geometric_truth` (analytic 3D clip from the
+input segment) is used as the denominator for all three measurements so
 they're directly comparable.
 
 OUTPUTS
 -------
-  tricell_dQdx_vs_truth.png       - histograms of B/A, C/A
-  tricell_ratio_vs_angle.png      - ratios vs θ_zenith
-  tricell_ratio_vs_length.png     - ratios vs L_total
-  tricell_ratio_vs_drift.png      - ratios vs drift_cm
-  tricell_ds_recon_vs_truth.png   - scatter ds_recon vs ds_3D
-  tricell_far_field.png           - B/A vs σ_T/pitch
-  tricell_C_vs_B.png              - C/B per tricell
-  tricell_w_axis_breakdown.png    - ratios split by w-axis
-  tricell_fluctuations.png        - per-seed spread of B, C
-  tricell_C_minus_B.png           - (C - B)/A scatter
-  tricell_calibration_bias.png    - dQdx_recon_ds / A vs dQdx_truth_ds / A
-  tricell_results.npz             - raw records
+  tricell_ratios_to_truth_hist.png
+  tricell_ratios_vs_zenith_angle.png
+  tricell_ratios_vs_track_length.png
+  tricell_ratios_vs_drift_distance.png
+  tricell_ds_reconstructed_vs_truth.png
+  tricell_drift_landed_vs_diffusion_width.png
+  tricell_kernel_vs_drift_landed.png
+  tricell_ratios_by_column_axis.png
+  tricell_seed_fluctuation_reliability.png
+  tricell_kernel_minus_drift_landed.png
+  tricell_calibration_bias_truth_vs_recon_ds.png
+  tricell_results.npz
 
 REQUIREMENTS
 ------------
   CUDA GPU, cupy, numba, numpy, matplotlib. Run from repo root.
-
-USAGE
------
-    python tests/test_tricell_calibration.py
-    python tests/test_tricell_calibration.py --n-tracks 200 --n-seeds 5
 """
 
 import argparse
@@ -73,8 +69,8 @@ import numpy as np
 
 
 # ---------------------------------------------------------------------------
-# Track/segment record dtype, same schema used in prior harness scripts.
-# Authoritative copy in cli/dumpTree.py:17.
+# Track/segment record dtype, inlined from cli/dumpTree.py:17.
+# Same 30-field schema used in the other tests in this directory.
 # ---------------------------------------------------------------------------
 SEGMENTS_DTYPE = np.dtype([
     ("event_id", "u4"), ("vertex_id", "u8"), ("file_vertex_id", "u8"),
@@ -90,478 +86,574 @@ SEGMENTS_DTYPE = np.dtype([
 ], align=True)
 
 
-def make_blank_tracks(n):
-    return np.zeros(n, dtype=SEGMENTS_DTYPE).view(np.recarray)
+def make_blank_track_recarray(n_segments):
+    return np.zeros(n_segments, dtype=SEGMENTS_DTYPE).view(np.recarray)
 
 
 # ---------------------------------------------------------------------------
 # Muon track generation
 # ---------------------------------------------------------------------------
-def sample_cosmic_direction(rng, theta_min_deg=10, theta_max_deg=80):
-    """Sample (θ_zenith, φ_azimuth) cosmic-like.
-    Zenith: cos²θ distribution restricted to [θ_min, θ_max].
-    Azimuth: uniform.
-    Returns (θ_radians, φ_radians).
+def sample_cosmic_direction(rng,
+                            zenith_min_deg=10.0,
+                            zenith_max_deg=80.0):
+    """Sample cosmic-like (zenith θ, azimuth φ) angles.
+
+    Zenith uses a cos²θ angular distribution, restricted to
+    [zenith_min, zenith_max]. Azimuth is uniform on [0, 2π).
+
+    Returns (zenith_radians, azimuth_radians).
     """
-    # Inverse-CDF for cos²θ between cos(θ_max) and cos(θ_min):
-    # P(cos θ ≤ c) ∝ c³, so c = U^(1/3) within bounds.
-    c_min = cos(np.radians(theta_max_deg))
-    c_max = cos(np.radians(theta_min_deg))
-    u = rng.uniform(c_min ** 3, c_max ** 3)
-    cos_theta = u ** (1.0 / 3.0)
-    theta = acos(cos_theta)
-    phi = rng.uniform(0, 2 * pi)
-    return theta, phi
+    # cos²θ distribution: dN/dcos θ ∝ cos² θ, so cumulative CDF is
+    # ∝ cos³ θ. Sample uniformly in cos³θ within bounds.
+    cos_zenith_min = cos(np.radians(zenith_max_deg))
+    cos_zenith_max = cos(np.radians(zenith_min_deg))
+    sample_uniform = rng.uniform(cos_zenith_min ** 3, cos_zenith_max ** 3)
+    cos_zenith = sample_uniform ** (1.0 / 3.0)
+    zenith = acos(cos_zenith)
+    azimuth = rng.uniform(0, 2 * pi)
+    return zenith, azimuth
 
 
-def build_muon(detector, entry_xyz, direction_xyz, length, dEdx=2.0):
-    """Single-segment muon track.
+def build_muon_segment(start_xyz, direction_xyz, track_length_cm,
+                       dEdx_MeV_per_cm=2.0):
+    """One-segment muon track from start point + unit direction vector
+    + total path length. Returns a 1-entry tracks recarray."""
+    tracks = make_blank_track_recarray(1)
+    start_x, start_y, start_z = start_xyz
+    direction_x, direction_y, direction_z = direction_xyz
+    end_x = start_x + track_length_cm * direction_x
+    end_y = start_y + track_length_cm * direction_y
+    end_z = start_z + track_length_cm * direction_z
 
-    Args:
-        entry_xyz   : (x, y, z) of segment start in detector coords
-        direction_xyz: unit 3-vector of track direction
-        length      : total path length (cm)
-        dEdx        : MeV/cm
-    """
-    t = make_blank_tracks(1)
-    sx, sy, sz = entry_xyz
-    dx, dy, dz = direction_xyz
-    ex, ey, ez = sx + length * dx, sy + length * dy, sz + length * dz
-
-    t["x_start"] = sx
-    t["x_end"] = ex
-    t["y_start"] = sy
-    t["y_end"] = ey
-    t["z_start"] = sz
-    t["z_end"] = ez
-    t["x"] = 0.5 * (sx + ex)
-    t["y"] = 0.5 * (sy + ey)
-    t["z"] = 0.5 * (sz + ez)
-    t["dx"] = length
-    t["dEdx"] = dEdx
-    t["dE"] = dEdx * length
-    t["pdg_id"] = 13
-    t["segment_id"] = 0
-    t["event_id"] = 0
-    t["traj_id"] = 0
-    t["pixel_plane"] = 0
-    t["t0"] = 0
-    t["t0_start"] = 0
-    t["t0_end"] = 0
-    t["tran_diff"] = 1e-2
-    t["long_diff"] = 1e-2
-    return t
+    tracks["x_start"] = start_x
+    tracks["x_end"] = end_x
+    tracks["y_start"] = start_y
+    tracks["y_end"] = end_y
+    tracks["z_start"] = start_z
+    tracks["z_end"] = end_z
+    tracks["x"] = 0.5 * (start_x + end_x)
+    tracks["y"] = 0.5 * (start_y + end_y)
+    tracks["z"] = 0.5 * (start_z + end_z)
+    tracks["dx"] = track_length_cm
+    tracks["dEdx"] = dEdx_MeV_per_cm
+    tracks["dE"] = dEdx_MeV_per_cm * track_length_cm
+    tracks["pdg_id"] = 13                      # muon
+    tracks["segment_id"] = 0
+    tracks["event_id"] = 0
+    tracks["traj_id"] = 0
+    tracks["pixel_plane"] = 0
+    tracks["t0"] = 0
+    tracks["t0_start"] = 0
+    tracks["t0_end"] = 0
+    tracks["tran_diff"] = 1e-2
+    tracks["long_diff"] = 1e-2
+    return tracks
 
 
 # ---------------------------------------------------------------------------
-# Kernel chain
+# Run kernel chain on a single-segment track
 # ---------------------------------------------------------------------------
-def run_kernel_chain(detector, physics, detsim, drifting, quenching,
-                     pixels_from_track, sim, create_xoroshiro128p_states,
-                     tracks, response, *, seed=42,
-                     MAX_PIXELS=500, MAX_ACTIVE_PIXELS=80):
+def run_kernel_chain(detector, physics, sim,
+                     detsim, drifting, quenching, pixels_from_track,
+                     create_xoroshiro128p_states,
+                     tracks, response_table, *,
+                     kernel_rng_seed=42,
+                     max_pixels_per_track=500,
+                     max_active_pixels_per_track=80):
     """quench → drift → get_pixels → tracks_current_mc.
 
     Returns dict with:
-        signals             : (n_tracks, MAX_PIXELS, n_ticks) array
-        neighboring_pixels  : (n_tracks, MAX_PIXELS) pixel IDs
-        active_pixels       : (n_tracks, MAX_ACTIVE_PIXELS) Bresenham pids
-        n_electrons_post_drift : float
-        tracks_after        : the tracks recarray after quench+drift
-                              (has tran_diff, long_diff, n_electrons set)
+      signals                 : (n_tracks, max_pixels_per_track, n_ticks)
+      neighboring_pixels      : (n_tracks, max_pixels_per_track) pixel IDs
+      active_pixels           : (n_tracks, max_active_pixels_per_track)
+      n_electrons_post_drift  : float (electrons after quench+drift)
+      tracks_after_drift      : the tracks recarray after quench+drift
     """
     tracks = np.copy(tracks)
-    tpb = 128
-    bpg = ceil(tracks.shape[0] / tpb)
+    threads_per_block = 128
+    blocks_per_grid = ceil(tracks.shape[0] / threads_per_block)
 
     from numba import cuda as _cuda
-    d_tracks = _cuda.to_device(tracks)
-    quenching.quench[bpg, tpb](d_tracks, physics.BOX)
-    drifting.drift[bpg, tpb](d_tracks)
-    tracks_after = d_tracks.copy_to_host()
+    device_tracks = _cuda.to_device(tracks)
+    quenching.quench[blocks_per_grid, threads_per_block](
+        device_tracks, physics.BOX)
+    drifting.drift[blocks_per_grid, threads_per_block](device_tracks)
+    tracks_after_drift = device_tracks.copy_to_host()
 
-    if float(np.sum(tracks_after["n_electrons"])) <= 0:
+    if float(np.sum(tracks_after_drift["n_electrons"])) <= 0:
         return None
 
-    active_pixels = np.full((tracks.shape[0], MAX_ACTIVE_PIXELS), -1,
-                            dtype=np.int32)
-    neighboring_pixels = np.full((tracks.shape[0], MAX_PIXELS), -1,
-                                 dtype=np.int32)
-    neighboring_radius = np.zeros((tracks.shape[0], MAX_PIXELS),
-                                  dtype=np.float32)
-    n_pixels_list = np.zeros(shape=(tracks.shape[0]), dtype=np.int64)
-    d_active = _cuda.to_device(active_pixels)
-    d_neigh = _cuda.to_device(neighboring_pixels)
-    d_radius = _cuda.to_device(neighboring_radius)
-    d_npix = _cuda.to_device(n_pixels_list)
+    active_pixels = np.full(
+        (tracks.shape[0], max_active_pixels_per_track), -1,
+        dtype=np.int32)
+    neighboring_pixels = np.full(
+        (tracks.shape[0], max_pixels_per_track), -1, dtype=np.int32)
+    neighboring_radius = np.zeros(
+        (tracks.shape[0], max_pixels_per_track), dtype=np.float32)
+    n_pixels_used = np.zeros(shape=(tracks.shape[0]), dtype=np.int64)
+    device_active = _cuda.to_device(active_pixels)
+    device_neighbors = _cuda.to_device(neighboring_pixels)
+    device_radius = _cuda.to_device(neighboring_radius)
+    device_n_pixels = _cuda.to_device(n_pixels_used)
 
-    pixels_from_track.get_pixels[bpg, tpb](d_tracks, d_active, d_neigh,
-                                           d_radius, d_npix)
-    neighboring_pixels = d_neigh.copy_to_host()
-    active_pixels = d_active.copy_to_host()
-    n_pixels_host = d_npix.copy_to_host()
-    if int(n_pixels_host[0]) >= MAX_PIXELS:
-        print(f"  WARNING: n_pixels {int(n_pixels_host[0])} hit "
-              f"MAX_PIXELS={MAX_PIXELS}; consider raising.")
+    pixels_from_track.get_pixels[blocks_per_grid, threads_per_block](
+        device_tracks, device_active, device_neighbors,
+        device_radius, device_n_pixels)
+    neighboring_pixels = device_neighbors.copy_to_host()
+    active_pixels = device_active.copy_to_host()
+    n_pixels_used_host = device_n_pixels.copy_to_host()
+    if int(n_pixels_used_host[0]) >= max_pixels_per_track:
+        print(f"  WARNING: halo size {int(n_pixels_used_host[0])} hit "
+              f"max_pixels_per_track={max_pixels_per_track}; "
+              f"raise this limit if you see this repeatedly.")
 
-    # Time-axis sizing matching cli/simulate_pixels.py
-    long_diff_max = float(np.max(tracks_after["long_diff"]))
-    t_span = float(np.max(tracks_after["t_end"] - tracks_after["t0"]))
-    diff_pad = long_diff_max / detector.V_DRIFT * detector.DIFF_N_SIGMAS
+    # Time-axis sizing matches cli/simulate_pixels.py
+    long_diff_max = float(np.max(tracks_after_drift["long_diff"]))
+    t_span = float(np.max(
+        tracks_after_drift["t_end"] - tracks_after_drift["t0"]))
+    diffusion_pad_us = (long_diff_max / detector.V_DRIFT
+                        * detector.DIFF_N_SIGMAS)
     if detector.RESPONSE_MAX_TIME > detector.DRIFT_MAX_TIME:
-        max_signal_time = (t_span + diff_pad
-                           + detector.RESPONSE_MAX_TIME
-                           - detector.DRIFT_MAX_TIME)
+        max_signal_time_us = (
+            t_span + diffusion_pad_us
+            + detector.RESPONSE_MAX_TIME - detector.DRIFT_MAX_TIME)
     else:
-        max_signal_time = t_span + diff_pad
-    signals_ticks = max(ceil(max_signal_time / detector.TIME_SAMPLING), 1)
+        max_signal_time_us = t_span + diffusion_pad_us
+    signal_n_ticks = max(
+        ceil(max_signal_time_us / detector.TIME_SAMPLING), 1)
 
     signals = np.zeros((tracks.shape[0],
                         neighboring_pixels.shape[1],
-                        signals_ticks), dtype=np.float32)
-    tpb3 = (1, 1, 64)
-    bpg3 = (ceil(signals.shape[0] / tpb3[0]),
-            ceil(signals.shape[1] / tpb3[1]),
-            ceil(signals.shape[2] / tpb3[2]))
-    n_states = int(np.prod(tpb3) * bpg3[0] * bpg3[1] * bpg3[2])
-    rng_states = create_xoroshiro128p_states(max(n_states, 1024),
-                                             seed=seed)
-    d_signals = _cuda.to_device(signals)
-    detsim.tracks_current_mc[bpg3, tpb3](d_signals, d_neigh, d_tracks,
-                                         response, rng_states)
-    signals = d_signals.copy_to_host()
+                        signal_n_ticks), dtype=np.float32)
+    threads_per_block_3d = (1, 1, 64)
+    blocks_per_grid_3d = (
+        ceil(signals.shape[0] / threads_per_block_3d[0]),
+        ceil(signals.shape[1] / threads_per_block_3d[1]),
+        ceil(signals.shape[2] / threads_per_block_3d[2]),
+    )
+    n_rng_states = int(
+        np.prod(threads_per_block_3d)
+        * blocks_per_grid_3d[0]
+        * blocks_per_grid_3d[1]
+        * blocks_per_grid_3d[2])
+    rng_states = create_xoroshiro128p_states(
+        max(n_rng_states, 1024), seed=kernel_rng_seed)
+    device_signals = _cuda.to_device(signals)
+    detsim.tracks_current_mc[blocks_per_grid_3d, threads_per_block_3d](
+        device_signals, device_neighbors, device_tracks,
+        response_table, rng_states)
+    signals = device_signals.copy_to_host()
 
     return dict(
         signals=signals,
         neighboring_pixels=neighboring_pixels,
         active_pixels=active_pixels,
-        n_electrons_post_drift=float(tracks_after["n_electrons"][0]),
-        tracks_after=tracks_after,
+        n_electrons_post_drift=float(
+            tracks_after_drift["n_electrons"][0]),
+        tracks_after_drift=tracks_after_drift,
     )
 
 
 # ---------------------------------------------------------------------------
-# Pixel coords
+# Pixel-coordinate helpers
 # ---------------------------------------------------------------------------
-def pixel_centre(detector, pixel_id, id2pixel):
-    """Return (x_centre, y_centre) of pixel pad (cm)."""
-    i_x, i_y, plane = id2pixel(int(pixel_id))
+def pixel_center_coords(detector, pixel_id, id2pixel_fn):
+    """Return (x_center_cm, y_center_cm, i_x, i_y, plane_id) of a pixel
+    pad given its integer pixel ID."""
+    i_x, i_y, plane = id2pixel_fn(int(pixel_id))
     border_x = detector.TPC_BORDERS[int(plane)][0][0]
     border_y = detector.TPC_BORDERS[int(plane)][1][0]
-    x_c = border_x + (int(i_x) + 0.5) * detector.PIXEL_PITCH
-    y_c = border_y + (int(i_y) + 0.5) * detector.PIXEL_PITCH
-    return x_c, y_c, int(i_x), int(i_y), int(plane)
+    pitch = detector.PIXEL_PITCH
+    x_center_cm = border_x + (int(i_x) + 0.5) * pitch
+    y_center_cm = border_y + (int(i_y) + 0.5) * pitch
+    return x_center_cm, y_center_cm, int(i_x), int(i_y), int(plane)
+
+
+def pixel_indices_to_center(detector, i_x, i_y, plane=0):
+    """Inverse mapping (i_x, i_y) → (x_center, y_center) in cm."""
+    border_x = detector.TPC_BORDERS[plane][0][0]
+    border_y = detector.TPC_BORDERS[plane][1][0]
+    pitch = detector.PIXEL_PITCH
+    return (border_x + (i_x + 0.5) * pitch,
+            border_y + (i_y + 0.5) * pitch)
 
 
 # ---------------------------------------------------------------------------
-# Geometric clip of segment through pixel pillar
+# Geometric clip of a 3D segment through a pixel's pillar
 # ---------------------------------------------------------------------------
-def ds_segment_through_pillar(start, end, x_lo, x_hi, y_lo, y_hi):
-    """Compute the 3D length of the segment (start → end) intersected
-    with the infinite z-pillar over the rectangle [x_lo, x_hi] × [y_lo,
-    y_hi]. Uses 2D Liang-Barsky clipping in xy and scales by full 3D
-    segment length.
-    """
-    sx, sy, sz = start
-    ex, ey, ez = end
-    dxv = ex - sx
-    dyv = ey - sy
-    dzv = ez - sz
-    full_len = sqrt(dxv * dxv + dyv * dyv + dzv * dzv)
-    if full_len == 0:
+def segment_length_through_pixel_pillar(
+        segment_start_xyz, segment_end_xyz,
+        pillar_x_lo, pillar_x_hi, pillar_y_lo, pillar_y_hi):
+    """3D length of the segment intersected with the infinite z-pillar
+    over the rectangle (pillar_x_lo, pillar_x_hi) × (pillar_y_lo,
+    pillar_y_hi). 2D Liang-Barsky in xy, scaled by full 3D length."""
+    start_x, start_y, start_z = segment_start_xyz
+    end_x, end_y, end_z = segment_end_xyz
+    delta_x = end_x - start_x
+    delta_y = end_y - start_y
+    delta_z = end_z - start_z
+    full_length = sqrt(delta_x ** 2 + delta_y ** 2 + delta_z ** 2)
+    if full_length == 0:
         return 0.0
 
-    t_in, t_out = 0.0, 1.0
-    # x slab
-    if dxv == 0:
-        if sx < x_lo or sx > x_hi:
+    t_enter, t_exit = 0.0, 1.0
+    # x slab clipping
+    if delta_x == 0:
+        if not (pillar_x_lo <= start_x <= pillar_x_hi):
             return 0.0
     else:
-        tx0 = (x_lo - sx) / dxv
-        tx1 = (x_hi - sx) / dxv
-        if tx0 > tx1:
-            tx0, tx1 = tx1, tx0
-        t_in = max(t_in, tx0)
-        t_out = min(t_out, tx1)
-    # y slab
-    if dyv == 0:
-        if sy < y_lo or sy > y_hi:
+        t_x_lo = (pillar_x_lo - start_x) / delta_x
+        t_x_hi = (pillar_x_hi - start_x) / delta_x
+        if t_x_lo > t_x_hi:
+            t_x_lo, t_x_hi = t_x_hi, t_x_lo
+        t_enter = max(t_enter, t_x_lo)
+        t_exit = min(t_exit, t_x_hi)
+    # y slab clipping
+    if delta_y == 0:
+        if not (pillar_y_lo <= start_y <= pillar_y_hi):
             return 0.0
     else:
-        ty0 = (y_lo - sy) / dyv
-        ty1 = (y_hi - sy) / dyv
-        if ty0 > ty1:
-            ty0, ty1 = ty1, ty0
-        t_in = max(t_in, ty0)
-        t_out = min(t_out, ty1)
+        t_y_lo = (pillar_y_lo - start_y) / delta_y
+        t_y_hi = (pillar_y_hi - start_y) / delta_y
+        if t_y_lo > t_y_hi:
+            t_y_lo, t_y_hi = t_y_hi, t_y_lo
+        t_enter = max(t_enter, t_y_lo)
+        t_exit = min(t_exit, t_y_hi)
 
-    if t_in >= t_out:
+    if t_enter >= t_exit:
         return 0.0
-    return full_len * (t_out - t_in)
+    return full_length * (t_exit - t_enter)
 
 
 # ---------------------------------------------------------------------------
-# B: physical charge arriving on pad via per-substep RNG-kick MC
+# Drift-landed charge per pixel (per-substep RNG-kick MC)
 # ---------------------------------------------------------------------------
-def drift_charge_per_pixel_with_rng(detector, segment_recarray,
-                                     n_electrons_post_drift, rng):
-    """Per-substep RNG-kick MC. For each substep along the track:
-      pos = base + Gaussian(0, σ_T, σ_T, σ_L)
-      determine which pixel (i_x, i_y) the kicked position lands in
-      accumulate n_electrons_post_drift / nstep into that pixel.
+def landed_charge_per_pixel_with_rng_kicks(
+        detector, tracks_after_drift, n_electrons_post_drift, rng):
+    """Per-substep RNG-kick MC of "where electrons land on the anode
+    after drift + diffusion".
 
-    Returns dict {(i_x, i_y): n_electrons_on_pad}.
+    Each substep is treated as a point charge at base_position +
+    Gaussian_kick (same σ_T, σ_L as the kernel). We accumulate
+    electrons-per-substep into the pixel whose pad rectangle contains
+    the kicked position. Sums over the entire track, including
+    substeps whose base position sits over neighbouring pixels but
+    whose kick lands them on this one (inward Far Field crosstalk).
+
+    Returns {(pixel_i_x, pixel_i_y): n_electrons_landed}.
     """
-    t = segment_recarray[0]
-    sx, sy, sz = float(t["x_start"]), float(t["y_start"]), float(t["z_start"])
-    ex, ey, ez = float(t["x_end"]), float(t["y_end"]), float(t["z_end"])
-    seg_len = sqrt((ex - sx) ** 2 + (ey - sy) ** 2 + (ez - sz) ** 2)
+    track = tracks_after_drift[0]
+    start_x = float(track["x_start"])
+    start_y = float(track["y_start"])
+    start_z = float(track["z_start"])
+    end_x = float(track["x_end"])
+    end_y = float(track["y_end"])
+    end_z = float(track["z_end"])
+    segment_length_cm = sqrt(
+        (end_x - start_x) ** 2
+        + (end_y - start_y) ** 2
+        + (end_z - start_z) ** 2)
 
-    nstep = max(int(round(seg_len / detector.MIN_STEP_SIZE)), 1)
-    sigma_T = float(t["tran_diff"])
-    sigma_L = float(t["long_diff"])
+    n_substeps = max(
+        int(round(segment_length_cm / detector.MIN_STEP_SIZE)), 1)
+    sigma_transverse_cm = float(track["tran_diff"])
+    sigma_longitudinal_cm = float(track["long_diff"])
 
-    # Base substep positions along the track
-    s = (np.arange(nstep, dtype=np.float64) + 0.5) / nstep
-    bx_arr = sx + s * (ex - sx)
-    by_arr = sy + s * (ey - sy)
-    # bz_arr = sz + s * (ez - sz)   # not needed for pad membership
+    # Substep base positions along the track center-line
+    substep_fraction = (np.arange(n_substeps, dtype=np.float64) + 0.5) \
+        / n_substeps
+    base_x = start_x + substep_fraction * (end_x - start_x)
+    base_y = start_y + substep_fraction * (end_y - start_y)
+    # base_z not needed: we score by (x, y) pad membership only.
 
-    # Gaussian kicks (we only need x, y for pad determination; z kick
-    # would affect time but we score by spatial pad membership only)
-    kx = rng.normal(0, sigma_T, size=nstep)
-    ky = rng.normal(0, sigma_T, size=nstep)
-    # kz = rng.normal(0, sigma_L, size=nstep)  # unused for B
-
-    pos_x = bx_arr + kx
-    pos_y = by_arr + ky
+    # Gaussian kicks per substep (independent draws)
+    kick_x = rng.normal(0, sigma_transverse_cm, size=n_substeps)
+    kick_y = rng.normal(0, sigma_transverse_cm, size=n_substeps)
+    landed_x = base_x + kick_x
+    landed_y = base_y + kick_y
 
     pitch = detector.PIXEL_PITCH
-    border_x = detector.TPC_BORDERS[int(t["pixel_plane"])][0][0]
-    border_y = detector.TPC_BORDERS[int(t["pixel_plane"])][1][0]
-    i_x_arr = np.floor((pos_x - border_x) / pitch).astype(np.int64)
-    i_y_arr = np.floor((pos_y - border_y) / pitch).astype(np.int64)
+    border_x = detector.TPC_BORDERS[int(track["pixel_plane"])][0][0]
+    border_y = detector.TPC_BORDERS[int(track["pixel_plane"])][1][0]
+    pixel_i_x_per_substep = np.floor(
+        (landed_x - border_x) / pitch).astype(np.int64)
+    pixel_i_y_per_substep = np.floor(
+        (landed_y - border_y) / pitch).astype(np.int64)
 
-    n_e_per_substep = n_electrons_post_drift / nstep
-    pixel_keys, counts = np.unique(
-        np.stack([i_x_arr, i_y_arr], axis=-1), axis=0, return_counts=True)
-    return {(int(k[0]), int(k[1])): float(c * n_e_per_substep)
-            for k, c in zip(pixel_keys, counts)}
+    electrons_per_substep = n_electrons_post_drift / n_substeps
+    unique_pixel_keys, substep_counts = np.unique(
+        np.stack([pixel_i_x_per_substep, pixel_i_y_per_substep],
+                 axis=-1),
+        axis=0, return_counts=True)
+    return {(int(key[0]), int(key[1])):
+            float(count * electrons_per_substep)
+            for key, count in zip(unique_pixel_keys, substep_counts)}
 
 
 # ---------------------------------------------------------------------------
-# Tricell finder
+# Pixel-hit dict from kernel output
 # ---------------------------------------------------------------------------
-def build_hit_dict(neighboring_pixels, signals, id2pixel, q_min):
-    """Return {(i_x, i_y): (ipix, Q, t_peak)} for hit pixels.
+def build_hit_pixel_dict(neighboring_pixels, signals, id2pixel_fn,
+                         minimum_pixel_charge_threshold):
+    """Build a dict of pixels with significant kernel response charge.
 
-    ipix = index into neighboring_pixels for the kernel signals lookup.
-    Q = sum(signals[0, ipix, :]) (raw, may be negative for fringe)
-    t_peak = argmax(signals[0, ipix, :]) * TIME_SAMPLING
-    Filtered by |Q| > q_min.
+    Returns {(i_x, i_y): {
+        'halo_index': index into neighboring_pixels for signal lookup,
+        'collected_charge': sum(signals[0, halo_index, :]),
+        'peak_tick': argmax(signals[0, halo_index, :]),
+        'pixel_id': raw pixel ID,
+    }}.
+
+    Pixels with |collected_charge| < threshold are excluded.
     """
-    hits = {}
-    n_neigh = neighboring_pixels.shape[1]
-    for ipix in range(n_neigh):
-        pid = int(neighboring_pixels[0, ipix])
-        if pid < 0:
+    hit_dict = {}
+    n_halo_pixels = neighboring_pixels.shape[1]
+    for halo_index in range(n_halo_pixels):
+        pixel_id = int(neighboring_pixels[0, halo_index])
+        if pixel_id < 0:
             continue
-        i_x, i_y, plane = id2pixel(pid)
-        sig = signals[0, ipix, :]
-        Q = float(sig.sum())
-        if abs(Q) < q_min:
+        i_x, i_y, plane_id = id2pixel_fn(pixel_id)
+        signal_trace = signals[0, halo_index, :]
+        collected_charge = float(signal_trace.sum())
+        if abs(collected_charge) < minimum_pixel_charge_threshold:
             continue
-        t_peak_tick = int(np.argmax(sig))
-        hits[(int(i_x), int(i_y))] = (ipix, Q, t_peak_tick, pid)
-    return hits
+        peak_tick = int(np.argmax(signal_trace))
+        hit_dict[(int(i_x), int(i_y))] = dict(
+            halo_index=halo_index,
+            collected_charge=collected_charge,
+            peak_tick=peak_tick,
+            pixel_id=pixel_id,
+        )
+    return hit_dict
 
 
-def find_zshape_tricells(hits, time_sampling, q_min_witness):
-    """Find Z-shape tricells from a hit dict.
+# ---------------------------------------------------------------------------
+# Z-shape tricell finder
+# ---------------------------------------------------------------------------
+def find_zshape_tricells(hit_pixel_dict, minimum_witness_charge_threshold):
+    """Find Z-shape tricells.
 
-    Args:
-        hits: {(i_x, i_y): (ipix, Q, t_peak_tick, pid)}
-        time_sampling: us per tick
+    For each candidate center pixel P_C:
+      1. Require three contiguous v-pixels in column w_1
+         (where w_1 = x or y).
+      2. Find the "entry-witness" pixel in column w_0 = w_1 − 1
+         whose peak time is *latest before* the w_1 trio's earliest
+         peak (forward-direction) OR *earliest after* the latest
+         (reversed-direction).
+      3. Likewise the "exit-witness" pixel in column w_2 = w_1 + 1.
 
-    Yields dicts, one per valid tricell:
-        {
-          'w_axis': 'x' or 'y',  # axis of w_1 column
-          'v_axis': 'y' or 'x',  # axis along which 3 w_1 pixels stack
-          'P_C': (i_x_C, i_y_C),
-          'P_w1_lo': (...), 'P_w1_hi': (...),
-          'P_w0': (...), 'P_w2': (...),
-          't_w0', 't_w1_lo', 't_w1_mid', 't_w1_hi', 't_w2',  # in us
-          'Q_C_raw': Q on the middle pixel,
-        }
+    Yields one dict per valid tricell.
     """
-    keys = list(hits.keys())
-    for (ix_C, iy_C) in keys:
-        ipix_C, Q_C, t_C_tick, pid_C = hits[(ix_C, iy_C)]
-        # Try v=y, w_1=x_column: require (ix_C, iy_C±1) hit
-        for v_axis, w_axis, lo_key, hi_key in [
-            ('y', 'x', (ix_C, iy_C - 1), (ix_C, iy_C + 1)),
-            ('x', 'y', (ix_C - 1, iy_C), (ix_C + 1, iy_C)),
+    pixel_keys = list(hit_pixel_dict.keys())
+
+    for (i_x_center, i_y_center) in pixel_keys:
+        center_record = hit_pixel_dict[(i_x_center, i_y_center)]
+
+        for tricell_orientation in [
+            # column_axis = the axis along which we cross 3 columns
+            # traversal_axis = the axis the 3 w_1 pixels stack along
+            dict(column_axis='x', traversal_axis='y',
+                 lo_key=(i_x_center, i_y_center - 1),
+                 hi_key=(i_x_center, i_y_center + 1)),
+            dict(column_axis='y', traversal_axis='x',
+                 lo_key=(i_x_center - 1, i_y_center),
+                 hi_key=(i_x_center + 1, i_y_center)),
         ]:
-            if lo_key not in hits or hi_key not in hits:
+            lo_key = tricell_orientation['lo_key']
+            hi_key = tricell_orientation['hi_key']
+            if lo_key not in hit_pixel_dict:
                 continue
-            ipix_lo, Q_lo, t_lo_tick, pid_lo = hits[lo_key]
-            ipix_hi, Q_hi, t_hi_tick, pid_hi = hits[hi_key]
+            if hi_key not in hit_pixel_dict:
+                continue
+            lo_record = hit_pixel_dict[lo_key]
+            hi_record = hit_pixel_dict[hi_key]
 
-            # Decide which is "earlier" in time → that's "lower side"
-            # of the w_1 column traversal
-            t_w1_min = min(t_lo_tick, t_C_tick, t_hi_tick)
-            t_w1_max = max(t_lo_tick, t_C_tick, t_hi_tick)
+            w1_min_peak_tick = min(lo_record['peak_tick'],
+                                   center_record['peak_tick'],
+                                   hi_record['peak_tick'])
+            w1_max_peak_tick = max(lo_record['peak_tick'],
+                                   center_record['peak_tick'],
+                                   hi_record['peak_tick'])
 
-            # Look for w_0 entry witness and w_2 exit witness
-            if w_axis == 'x':
-                w_col_C = ix_C
+            column_axis = tricell_orientation['column_axis']
+            traversal_axis = tricell_orientation['traversal_axis']
+            if column_axis == 'x':
+                w1_column_index = i_x_center
             else:
-                w_col_C = iy_C
-            w0_col = w_col_C - 1
-            w2_col = w_col_C + 1
+                w1_column_index = i_y_center
+            w0_column_index = w1_column_index - 1
+            w2_column_index = w1_column_index + 1
 
-            # Scan all hits in columns w_0 and w_2 for the
-            # last-before-t_w1_min and first-after-t_w1_max
-            best_w0 = None  # (key, t_tick)
-            best_w2 = None
-            for (ix_h, iy_h), (ip_h, Q_h, t_h_tick, pid_h) in hits.items():
-                if abs(Q_h) < q_min_witness:
+            # Search all hit pixels for entry/exit witnesses in
+            # columns w_0 and w_2. Track may run either direction in
+            # drift (z), so try both orderings.
+            best_forward_w0 = None
+            best_forward_w2 = None
+            best_reversed_w0 = None
+            best_reversed_w2 = None
+            for (i_x_hit, i_y_hit), hit in hit_pixel_dict.items():
+                if abs(hit['collected_charge']) < \
+                        minimum_witness_charge_threshold:
                     continue
-                col_h = ix_h if w_axis == 'x' else iy_h
-                if col_h == w0_col:
-                    if t_h_tick < t_w1_min:
-                        if best_w0 is None or t_h_tick > best_w0[1]:
-                            best_w0 = ((ix_h, iy_h), t_h_tick)
-                elif col_h == w2_col:
-                    if t_h_tick > t_w1_max:
-                        if best_w2 is None or t_h_tick < best_w2[1]:
-                            best_w2 = ((ix_h, iy_h), t_h_tick)
+                column_of_hit = (
+                    i_x_hit if column_axis == 'x' else i_y_hit)
+                peak_tick_hit = hit['peak_tick']
+                if column_of_hit == w0_column_index:
+                    if peak_tick_hit < w1_min_peak_tick:
+                        # forward direction: w_0 is before w_1
+                        if (best_forward_w0 is None
+                                or peak_tick_hit > best_forward_w0['peak_tick']):
+                            best_forward_w0 = dict(
+                                key=(i_x_hit, i_y_hit),
+                                peak_tick=peak_tick_hit,
+                                record=hit)
+                    if peak_tick_hit > w1_max_peak_tick:
+                        if (best_reversed_w0 is None
+                                or peak_tick_hit < best_reversed_w0['peak_tick']):
+                            best_reversed_w0 = dict(
+                                key=(i_x_hit, i_y_hit),
+                                peak_tick=peak_tick_hit,
+                                record=hit)
+                elif column_of_hit == w2_column_index:
+                    if peak_tick_hit > w1_max_peak_tick:
+                        if (best_forward_w2 is None
+                                or peak_tick_hit < best_forward_w2['peak_tick']):
+                            best_forward_w2 = dict(
+                                key=(i_x_hit, i_y_hit),
+                                peak_tick=peak_tick_hit,
+                                record=hit)
+                    if peak_tick_hit < w1_min_peak_tick:
+                        if (best_reversed_w2 is None
+                                or peak_tick_hit > best_reversed_w2['peak_tick']):
+                            best_reversed_w2 = dict(
+                                key=(i_x_hit, i_y_hit),
+                                peak_tick=peak_tick_hit,
+                                record=hit)
 
-            # Also handle reversed direction (track moving in opposite z)
-            best_w0_rev = None
-            best_w2_rev = None
-            for (ix_h, iy_h), (ip_h, Q_h, t_h_tick, pid_h) in hits.items():
-                if abs(Q_h) < q_min_witness:
-                    continue
-                col_h = ix_h if w_axis == 'x' else iy_h
-                if col_h == w0_col:
-                    if t_h_tick > t_w1_max:
-                        if best_w0_rev is None or t_h_tick < best_w0_rev[1]:
-                            best_w0_rev = ((ix_h, iy_h), t_h_tick)
-                elif col_h == w2_col:
-                    if t_h_tick < t_w1_min:
-                        if best_w2_rev is None or t_h_tick > best_w2_rev[1]:
-                            best_w2_rev = ((ix_h, iy_h), t_h_tick)
-
-            for w0, w2, direction in [
-                (best_w0, best_w2, 'forward'),
-                (best_w0_rev, best_w2_rev, 'reversed'),
+            for witness_w0, witness_w2, direction_label in [
+                (best_forward_w0, best_forward_w2, 'forward'),
+                (best_reversed_w0, best_reversed_w2, 'reversed'),
             ]:
-                if w0 is None or w2 is None:
+                if witness_w0 is None or witness_w2 is None:
                     continue
                 yield dict(
-                    w_axis=w_axis,
-                    v_axis=v_axis,
-                    direction=direction,
-                    P_C=(ix_C, iy_C),
-                    P_w1_lo=lo_key,
-                    P_w1_hi=hi_key,
-                    P_w0=w0[0],
-                    P_w2=w2[0],
-                    t_w0_tick=w0[1],
-                    t_w1_lo_tick=t_lo_tick,
-                    t_w1_mid_tick=t_C_tick,
-                    t_w1_hi_tick=t_hi_tick,
-                    t_w2_tick=w2[1],
-                    ipix_C=ipix_C,
-                    pid_C=pid_C,
-                    Q_C_raw=Q_C,
+                    column_axis=column_axis,
+                    traversal_axis=traversal_axis,
+                    drift_direction=direction_label,
+                    center_pixel_key=(i_x_center, i_y_center),
+                    center_halo_index=center_record['halo_index'],
+                    center_collected_charge=center_record['collected_charge'],
+                    center_pixel_id=center_record['pixel_id'],
+                    w1_lo_key=lo_key,
+                    w1_hi_key=hi_key,
+                    w0_witness_key=witness_w0['key'],
+                    w2_witness_key=witness_w2['key'],
+                    peak_tick_w0_witness=witness_w0['peak_tick'],
+                    peak_tick_w1_lo=lo_record['peak_tick'],
+                    peak_tick_w1_center=center_record['peak_tick'],
+                    peak_tick_w1_hi=hi_record['peak_tick'],
+                    peak_tick_w2_witness=witness_w2['peak_tick'],
                 )
 
 
 # ---------------------------------------------------------------------------
-# ds_C reconstructed from witness pixels (user's formula)
+# Reconstruct ds through middle pixel from witness pixel geometry+timing
 # ---------------------------------------------------------------------------
-def reconstruct_ds_witnesses(tricell, detector, time_sampling, id2pixel):
-    """Compute ds_C_recon from entry and exit witness pixels.
+def reconstruct_ds_from_witnesses(tricell, detector, time_sampling_us):
+    """Compute ds through the middle pixel using the user's formula:
 
-    user's formulation:
-        Δt   = t_w2 − t_w0
-        Δx   = V_DRIFT * Δt
-        Δv   = v_w2 − v_w0   (v is the axis the 3 w_1 pixels stack along)
-        Δz   = w_w2 − w_w0   (w is the column axis)
-        L    = sqrt(Δx² + Δv² + Δz²)
-        ds_C = L * (pitch / Δv)
+        delta_t_witness     = t_exit_witness − t_entry_witness
+        delta_drift_witness = V_DRIFT * delta_t_witness
+        delta_traversal     = v_exit_witness − v_entry_witness
+                              (along the axis the 3 w_1 pixels stack)
+        delta_column        = w_exit_witness − w_entry_witness  (= 2·pitch)
+        L_witness_to_witness
+                            = sqrt(delta_drift² + delta_traversal² + delta_column²)
+        ds_middle_pixel     = L_witness_to_witness * pitch / |delta_traversal|
 
-    Returns ds_C_recon (cm) or None if Δv = 0.
+    Returns (ds_middle_pixel_cm, length_between_witnesses_cm) or
+    (None, None) if delta_traversal == 0.
     """
     pitch = detector.PIXEL_PITCH
     v_drift = detector.V_DRIFT
-    v_axis = tricell['v_axis']
+    traversal_axis = tricell['traversal_axis']
 
-    border_x = detector.TPC_BORDERS[0][0][0]
-    border_y = detector.TPC_BORDERS[0][1][0]
+    i_x_w0, i_y_w0 = tricell['w0_witness_key']
+    i_x_w2, i_y_w2 = tricell['w2_witness_key']
+    x_w0, y_w0 = pixel_indices_to_center(detector, i_x_w0, i_y_w0)
+    x_w2, y_w2 = pixel_indices_to_center(detector, i_x_w2, i_y_w2)
 
-    ix_w0, iy_w0 = tricell['P_w0']
-    ix_w2, iy_w2 = tricell['P_w2']
-    x_w0 = border_x + (ix_w0 + 0.5) * pitch
-    y_w0 = border_y + (iy_w0 + 0.5) * pitch
-    x_w2 = border_x + (ix_w2 + 0.5) * pitch
-    y_w2 = border_y + (iy_w2 + 0.5) * pitch
+    delta_t_us = (tricell['peak_tick_w2_witness']
+                  - tricell['peak_tick_w0_witness']) * time_sampling_us
+    delta_drift_cm = v_drift * delta_t_us
 
-    delta_t = (tricell['t_w2_tick'] - tricell['t_w0_tick']) * time_sampling
-    delta_drift = v_drift * delta_t   # = drift coordinate span
+    if traversal_axis == 'y':
+        delta_traversal_cm = y_w2 - y_w0
+        delta_column_cm = x_w2 - x_w0
+    else:  # traversal_axis == 'x'
+        delta_traversal_cm = x_w2 - x_w0
+        delta_column_cm = y_w2 - y_w0
 
-    if v_axis == 'y':
-        delta_v = y_w2 - y_w0
-        delta_w = x_w2 - x_w0
-    else:  # v_axis == 'x'
-        delta_v = x_w2 - x_w0
-        delta_w = y_w2 - y_w0
-
-    if delta_v == 0:
+    if delta_traversal_cm == 0:
         return None, None
-    L_path = sqrt(delta_drift ** 2 + delta_v ** 2 + delta_w ** 2)
-    ds_recon = L_path * (pitch / abs(delta_v))
-    return ds_recon, L_path
+    length_between_witnesses_cm = sqrt(
+        delta_drift_cm ** 2
+        + delta_traversal_cm ** 2
+        + delta_column_cm ** 2)
+    ds_middle_pixel_cm = (length_between_witnesses_cm
+                          * pitch / abs(delta_traversal_cm))
+    return ds_middle_pixel_cm, length_between_witnesses_cm
 
 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 def main():
-    ap = argparse.ArgumentParser(
+    arg_parser = argparse.ArgumentParser(
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--response",
-                    default="larndsim/bin/response_44_v2a_full.npz")
-    ap.add_argument("--detector",
-                    default="larndsim/detector_properties/module0.yaml")
-    ap.add_argument("--pixel-layout",
-                    default="larndsim/pixel_layouts/multi_tile_layout-2.4.16_v4.yaml")
-    ap.add_argument("--sim-properties",
-                    default="larndsim/simulation_properties/singles_sim.yaml")
-    ap.add_argument("--n-tracks", type=int, default=100,
-                    help="number of independent muon tracks to throw")
-    ap.add_argument("--lengths", type=float, nargs="+",
-                    default=[2.0, 5.0, 10.0],
-                    help="track lengths to scan (cm)")
-    ap.add_argument("--n-seeds", type=int, default=3,
-                    help="kernel seeds per track")
-    ap.add_argument("--drift-min", type=float, default=2.0,
-                    help="min drift distance midpoint (cm)")
-    ap.add_argument("--drift-max", type=float, default=28.0,
-                    help="max drift distance midpoint (cm)")
-    ap.add_argument("--dedx", type=float, default=2.0)
-    ap.add_argument("--q-min", type=float, default=10.0,
-                    help="minimum |Q| (response units) for a pixel to "
-                         "count as hit")
-    ap.add_argument("--q-min-witness", type=float, default=10.0,
-                    help="minimum |Q| for witness pixels")
-    ap.add_argument("--rng-seed-master", type=int, default=20260519)
-    ap.add_argument("--outdir", default=".")
-    ap.add_argument("--verbose", action="store_true")
-    args = ap.parse_args()
+    arg_parser.add_argument(
+        "--response",
+        default="larndsim/bin/response_44_v2a_full.npz")
+    arg_parser.add_argument(
+        "--detector",
+        default="larndsim/detector_properties/module0.yaml")
+    arg_parser.add_argument(
+        "--pixel-layout",
+        default="larndsim/pixel_layouts/multi_tile_layout-2.4.16_v4.yaml")
+    arg_parser.add_argument(
+        "--sim-properties",
+        default="larndsim/simulation_properties/singles_sim.yaml")
+    arg_parser.add_argument(
+        "--n-tracks", type=int, default=100,
+        help="number of independent muon tracks per length")
+    arg_parser.add_argument(
+        "--track-lengths-cm", type=float, nargs="+",
+        default=[2.0, 5.0, 10.0],
+        help="track lengths to scan (cm)")
+    arg_parser.add_argument(
+        "--n-seeds-per-track", type=int, default=3,
+        help="kernel RNG seeds per track")
+    arg_parser.add_argument(
+        "--drift-distance-min-cm", type=float, default=2.0)
+    arg_parser.add_argument(
+        "--drift-distance-max-cm", type=float, default=28.0)
+    arg_parser.add_argument(
+        "--track-dEdx-MeV-per-cm", type=float, default=2.0)
+    arg_parser.add_argument(
+        "--minimum-pixel-charge-threshold", type=float, default=10.0,
+        help="minimum |collected charge| (response units) for a pixel "
+             "to count as hit")
+    arg_parser.add_argument(
+        "--minimum-witness-charge-threshold", type=float, default=10.0,
+        help="minimum |collected charge| for witness pixels")
+    arg_parser.add_argument(
+        "--master-rng-seed", type=int, default=20260519)
+    arg_parser.add_argument(
+        "--outdir", default=".")
+    arg_parser.add_argument(
+        "--verbose", action="store_true")
+    args = arg_parser.parse_args()
 
     from numba import cuda
     if not cuda.is_available():
@@ -575,453 +667,585 @@ def main():
     from larndsim import detsim, drifting, quenching, pixels_from_track
     id2pixel = pixels_from_track.id2pixel.py_func
 
-    response = detector.load_response(args.response)
-    pitch = detector.PIXEL_PITCH
-    border_x = detector.TPC_BORDERS[0][0][0]
-    border_y = detector.TPC_BORDERS[0][1][0]
-    z_anode = detector.TPC_BORDERS[0][2][0]
-    z_cathode = detector.TPC_BORDERS[0][2][1]
-    into = np.sign(z_cathode - z_anode)
-    n_pix_x = int(detector.N_PIXELS[0])
-    n_pix_y = int(detector.N_PIXELS[1])
+    response_table = detector.load_response(args.response)
+    pitch_cm = detector.PIXEL_PITCH
+    border_x_cm = detector.TPC_BORDERS[0][0][0]
+    border_y_cm = detector.TPC_BORDERS[0][1][0]
+    anode_z_cm = detector.TPC_BORDERS[0][2][0]
+    cathode_z_cm = detector.TPC_BORDERS[0][2][1]
+    into_drift_volume = np.sign(cathode_z_cm - anode_z_cm)
+    n_pixels_x = int(detector.N_PIXELS[0])
+    n_pixels_y = int(detector.N_PIXELS[1])
 
-    # Allowed entry region: at least 3 pitches from every wall, AND
-    # entry+exit of the longest track to also stay inside. We'll re-check
-    # per-track to be safe.
-    margin_pitches = 3
-    x_lo_allowed = border_x + margin_pitches * pitch
-    x_hi_allowed = border_x + (n_pix_x - margin_pitches) * pitch
-    y_lo_allowed = border_y + margin_pitches * pitch
-    y_hi_allowed = border_y + (n_pix_y - margin_pitches) * pitch
+    # Restrict entry+exit positions to be at least this many pitches
+    # away from any TPC wall so the halo isn't truncated.
+    wall_margin_pitches = 3
+    x_entry_lo = border_x_cm + wall_margin_pitches * pitch_cm
+    x_entry_hi = border_x_cm + (n_pixels_x - wall_margin_pitches) * pitch_cm
+    y_entry_lo = border_y_cm + wall_margin_pitches * pitch_cm
+    y_entry_hi = border_y_cm + (n_pixels_y - wall_margin_pitches) * pitch_cm
 
-    print(f"Configuration: pitch={pitch:.4f}, V_DRIFT={detector.V_DRIFT:.4e}, "
-          f"TIME_SAMPLING={detector.TIME_SAMPLING}, MIN_STEP_SIZE="
-          f"{detector.MIN_STEP_SIZE}")
-    print(f"N_PIXELS = ({n_pix_x}, {n_pix_y}), TPC drift extent "
-          f"({z_anode:.2f}, {z_cathode:.2f})")
-    print(f"Allowed (x, y) entry box: x ∈ [{x_lo_allowed:.2f}, "
-          f"{x_hi_allowed:.2f}], y ∈ [{y_lo_allowed:.2f}, "
-          f"{y_hi_allowed:.2f}]")
-    print(f"Scan: {args.n_tracks} tracks × {len(args.lengths)} lengths × "
-          f"{args.n_seeds} seeds → "
-          f"{args.n_tracks * len(args.lengths) * args.n_seeds} total runs")
+    print(f"Detector config: pitch={pitch_cm:.4f} cm, "
+          f"V_DRIFT={detector.V_DRIFT:.4e} cm/us, "
+          f"TIME_SAMPLING={detector.TIME_SAMPLING} us, "
+          f"MIN_STEP_SIZE={detector.MIN_STEP_SIZE} cm")
+    print(f"N_PIXELS = ({n_pixels_x}, {n_pixels_y}); "
+          f"anode_z={anode_z_cm:.2f}, cathode_z={cathode_z_cm:.2f} cm")
+    print(f"Track entry box: x ∈ [{x_entry_lo:.2f}, {x_entry_hi:.2f}], "
+          f"y ∈ [{y_entry_lo:.2f}, {y_entry_hi:.2f}] cm")
+    n_total_kernel_runs = (args.n_tracks * len(args.track_lengths_cm)
+                           * args.n_seeds_per_track)
+    print(f"Scan: {args.n_tracks} tracks × "
+          f"{len(args.track_lengths_cm)} lengths × "
+          f"{args.n_seeds_per_track} seeds = "
+          f"{n_total_kernel_runs} kernel runs")
 
-    master_rng = np.random.default_rng(args.rng_seed_master)
-    common = dict(
-        detector=detector, physics=physics, detsim=detsim,
-        drifting=drifting, quenching=quenching,
-        pixels_from_track=pixels_from_track, sim=sim,
+    master_rng = np.random.default_rng(args.master_rng_seed)
+    kernel_common = dict(
+        detector=detector, physics=physics, sim=sim,
+        detsim=detsim, drifting=drifting, quenching=quenching,
+        pixels_from_track=pixels_from_track,
         create_xoroshiro128p_states=create_xoroshiro128p_states,
-        response=response,
+        response_table=response_table,
     )
 
-    records = []
-    n_attempts = 0
+    tricell_records = []
+    n_accepted_tracks = 0
     n_valid_tricells = 0
 
-    for L in args.lengths:
-        for itrk in range(args.n_tracks):
-            # Sample direction & entry
-            theta, phi = sample_cosmic_direction(master_rng)
-            # Detector coords: z = drift axis, x and y on anode plane
-            # Direction unit vector: zenith from z-axis
-            dirx = sin(theta) * cos(phi)
-            diry = sin(theta) * sin(phi)
-            dirz = cos(theta) * into   # into the drift volume
+    for track_length_cm in args.track_lengths_cm:
+        for track_index in range(args.n_tracks):
+            # Sample direction (zenith from cos²θ, azimuth uniform)
+            zenith_rad, azimuth_rad = sample_cosmic_direction(master_rng)
+            direction_x = sin(zenith_rad) * cos(azimuth_rad)
+            direction_y = sin(zenith_rad) * sin(azimuth_rad)
+            direction_z = cos(zenith_rad) * into_drift_volume
 
-            # Choose drift_cm at the MIDPOINT of the track
-            drift_cm = master_rng.uniform(
-                max(args.drift_min, abs(dirz) * L / 2 + 1),
-                args.drift_max - abs(dirz) * L / 2 - 1)
-            z_mid = z_anode + into * drift_cm
+            # Drift distance at the track midpoint
+            half_drift_extent = abs(direction_z) * track_length_cm / 2
+            drift_lo = max(args.drift_distance_min_cm,
+                           half_drift_extent + 1)
+            drift_hi = args.drift_distance_max_cm - half_drift_extent - 1
+            if drift_lo >= drift_hi:
+                continue
+            midpoint_drift_cm = master_rng.uniform(drift_lo, drift_hi)
+            midpoint_z_cm = anode_z_cm + into_drift_volume * midpoint_drift_cm
 
-            # Entry point: choose midpoint, work outward
-            x_mid = master_rng.uniform(x_lo_allowed, x_hi_allowed)
-            y_mid = master_rng.uniform(y_lo_allowed, y_hi_allowed)
-            sx = x_mid - 0.5 * L * dirx
-            sy = y_mid - 0.5 * L * diry
-            sz = z_mid - 0.5 * L * dirz
-            ex = x_mid + 0.5 * L * dirx
-            ey = y_mid + 0.5 * L * diry
+            # Midpoint on the anode plane, then back out to start/end
+            midpoint_x_cm = master_rng.uniform(x_entry_lo, x_entry_hi)
+            midpoint_y_cm = master_rng.uniform(y_entry_lo, y_entry_hi)
+            start_x = midpoint_x_cm - 0.5 * track_length_cm * direction_x
+            start_y = midpoint_y_cm - 0.5 * track_length_cm * direction_y
+            start_z = midpoint_z_cm - 0.5 * track_length_cm * direction_z
+            end_x = midpoint_x_cm + 0.5 * track_length_cm * direction_x
+            end_y = midpoint_y_cm + 0.5 * track_length_cm * direction_y
+            end_z = midpoint_z_cm + 0.5 * track_length_cm * direction_z
 
-            # Check entry/exit inside allowed box
-            if not (x_lo_allowed <= sx <= x_hi_allowed and
-                    x_lo_allowed <= ex <= x_hi_allowed and
-                    y_lo_allowed <= sy <= y_hi_allowed and
-                    y_lo_allowed <= ey <= y_hi_allowed):
+            # Reject if track exits the allowed (x, y) entry box
+            if not (x_entry_lo <= start_x <= x_entry_hi
+                    and x_entry_lo <= end_x <= x_entry_hi
+                    and y_entry_lo <= start_y <= y_entry_hi
+                    and y_entry_lo <= end_y <= y_entry_hi):
                 continue
 
-            entry_xyz = (sx, sy, sz)
-            direction = (dirx, diry, dirz)
-            tracks = build_muon(detector, entry_xyz, direction, L, args.dedx)
-            n_attempts += 1
+            track_recarray = build_muon_segment(
+                (start_x, start_y, start_z),
+                (direction_x, direction_y, direction_z),
+                track_length_cm,
+                args.track_dEdx_MeV_per_cm)
+            n_accepted_tracks += 1
 
-            for iseed in range(args.n_seeds):
-                seed = args.rng_seed_master + itrk * 10000 + iseed * 17
-                result = run_kernel_chain(tracks=tracks, seed=seed, **common)
-                if result is None:
+            for seed_index in range(args.n_seeds_per_track):
+                kernel_seed = (args.master_rng_seed
+                               + track_index * 10000
+                               + seed_index * 17)
+                kernel_result = run_kernel_chain(
+                    tracks=track_recarray,
+                    kernel_rng_seed=kernel_seed, **kernel_common)
+                if kernel_result is None:
                     continue
-                signals = result['signals']
-                neigh = result['neighboring_pixels']
-                n_e_post = result['n_electrons_post_drift']
-                tracks_after = result['tracks_after']
+                signals = kernel_result['signals']
+                neighboring_pixels = kernel_result['neighboring_pixels']
+                n_electrons_post_drift = kernel_result['n_electrons_post_drift']
+                tracks_after_drift = kernel_result['tracks_after_drift']
 
-                # B: pre-compute per-pixel landed charge
-                py_rng = np.random.default_rng(seed)
-                b_dict = drift_charge_per_pixel_with_rng(
-                    detector, tracks_after, n_e_post, py_rng)
+                # B: drift-landed charge per pixel
+                landed_charge_rng = np.random.default_rng(kernel_seed)
+                drift_landed_per_pixel = landed_charge_per_pixel_with_rng_kicks(
+                    detector, tracks_after_drift,
+                    n_electrons_post_drift, landed_charge_rng)
 
-                hits = build_hit_dict(neigh, signals, id2pixel,
-                                      args.q_min)
+                # C-hit pixel dict from kernel response
+                hit_pixel_dict = build_hit_pixel_dict(
+                    neighboring_pixels, signals, id2pixel,
+                    args.minimum_pixel_charge_threshold)
 
-                # Find tricells
-                tricells = list(find_zshape_tricells(
-                    hits, detector.TIME_SAMPLING, args.q_min_witness))
+                # Find Z-shape tricells
+                tricells_found = list(find_zshape_tricells(
+                    hit_pixel_dict,
+                    args.minimum_witness_charge_threshold))
 
-                # Time-monotonicity filter for forward-direction set
-                # already enforced in finder. Now compute records.
-                for tri in tricells:
-                    ds_recon, L_path = reconstruct_ds_witnesses(
-                        tri, detector, detector.TIME_SAMPLING, id2pixel)
-                    if ds_recon is None:
+                for tricell in tricells_found:
+                    ds_reconstructed_cm, length_between_witnesses_cm = \
+                        reconstruct_ds_from_witnesses(
+                            tricell, detector, detector.TIME_SAMPLING)
+                    if ds_reconstructed_cm is None:
                         continue
 
-                    # Middle pixel coords
-                    ix_C, iy_C = tri['P_C']
-                    x_C = border_x + (ix_C + 0.5) * pitch
-                    y_C = border_y + (iy_C + 0.5) * pitch
+                    i_x_center, i_y_center = tricell['center_pixel_key']
+                    x_center_cm, y_center_cm = pixel_indices_to_center(
+                        detector, i_x_center, i_y_center)
 
-                    # ds_C_3D: geometric clip of input segment
-                    # through P_C's pillar
-                    ds_3D = ds_segment_through_pillar(
-                        (sx, sy, sz),
-                        (ex, ey, sz + L * dirz),
-                        x_C - pitch / 2, x_C + pitch / 2,
-                        y_C - pitch / 2, y_C + pitch / 2)
-                    if ds_3D <= 0:
+                    # Geometric truth ds through the middle pixel's pillar
+                    ds_geometric_truth_cm = segment_length_through_pixel_pillar(
+                        (start_x, start_y, start_z),
+                        (end_x, end_y, end_z),
+                        x_center_cm - pitch_cm / 2,
+                        x_center_cm + pitch_cm / 2,
+                        y_center_cm - pitch_cm / 2,
+                        y_center_cm + pitch_cm / 2)
+                    if ds_geometric_truth_cm <= 0:
                         continue
 
-                    # A: truth charge in middle pixel
-                    Q_A = n_e_post * (ds_3D / L)
+                    q_truth = (n_electrons_post_drift
+                               * (ds_geometric_truth_cm
+                                  / track_length_cm))
+                    q_drift_landed = drift_landed_per_pixel.get(
+                        (i_x_center, i_y_center), 0.0)
+                    q_kernel_response = tricell['center_collected_charge']
 
-                    # B: landed charge on middle pixel
-                    Q_B = b_dict.get((ix_C, iy_C), 0.0)
+                    dQ_per_dx_truth = q_truth / ds_geometric_truth_cm
+                    dQ_per_dx_drift_landed = (q_drift_landed
+                                              / ds_geometric_truth_cm)
+                    dQ_per_dx_kernel_truth_ds = (q_kernel_response
+                                                 / ds_geometric_truth_cm)
+                    dQ_per_dx_kernel_recon_ds = (q_kernel_response
+                                                 / ds_reconstructed_cm)
 
-                    # C: raw response charge on middle pixel
-                    Q_C_raw = tri['Q_C_raw']
-
-                    dQdx_A = Q_A / ds_3D
-                    dQdx_B = Q_B / ds_3D
-                    dQdx_C_raw_truth_ds = Q_C_raw / ds_3D
-                    dQdx_C_raw_recon_ds = Q_C_raw / ds_recon
-
-                    records.append(dict(
-                        track_id=itrk,
-                        seed=iseed,
-                        L_total=L,
-                        theta=theta,
-                        phi=phi,
-                        drift_cm=drift_cm,
-                        w_axis=tri['w_axis'],
-                        v_axis=tri['v_axis'],
-                        direction=tri['direction'],
-                        i_x_C=ix_C,
-                        i_y_C=iy_C,
-                        ds_C_3D=ds_3D,
-                        ds_C_recon=ds_recon,
-                        L_path_witnesses=L_path,
-                        Q_A=Q_A,
-                        Q_B=Q_B,
-                        Q_C_raw=Q_C_raw,
-                        dQdx_A=dQdx_A,
-                        dQdx_B=dQdx_B,
-                        dQdx_C_raw_truth_ds=dQdx_C_raw_truth_ds,
-                        dQdx_C_raw_recon_ds=dQdx_C_raw_recon_ds,
-                        sigma_T=float(tracks_after["tran_diff"][0]),
-                        sigma_L=float(tracks_after["long_diff"][0]),
-                        n_e_post=n_e_post,
+                    tricell_records.append(dict(
+                        track_index=track_index,
+                        seed_index=seed_index,
+                        track_length_cm=track_length_cm,
+                        zenith_rad=zenith_rad,
+                        azimuth_rad=azimuth_rad,
+                        midpoint_drift_cm=midpoint_drift_cm,
+                        column_axis=tricell['column_axis'],
+                        traversal_axis=tricell['traversal_axis'],
+                        drift_direction=tricell['drift_direction'],
+                        i_x_center=i_x_center,
+                        i_y_center=i_y_center,
+                        ds_geometric_truth_cm=ds_geometric_truth_cm,
+                        ds_reconstructed_cm=ds_reconstructed_cm,
+                        length_between_witnesses_cm=length_between_witnesses_cm,
+                        q_truth=q_truth,
+                        q_drift_landed=q_drift_landed,
+                        q_kernel_response=q_kernel_response,
+                        dQ_per_dx_truth=dQ_per_dx_truth,
+                        dQ_per_dx_drift_landed=dQ_per_dx_drift_landed,
+                        dQ_per_dx_kernel_truth_ds=dQ_per_dx_kernel_truth_ds,
+                        dQ_per_dx_kernel_recon_ds=dQ_per_dx_kernel_recon_ds,
+                        sigma_transverse_cm=float(
+                            tracks_after_drift["tran_diff"][0]),
+                        sigma_longitudinal_cm=float(
+                            tracks_after_drift["long_diff"][0]),
+                        n_electrons_post_drift=n_electrons_post_drift,
                     ))
                     n_valid_tricells += 1
 
-            if (itrk + 1) % 25 == 0 or args.verbose:
-                print(f"  L={L:.1f}cm track {itrk+1}/{args.n_tracks}: "
+            if (track_index + 1) % 25 == 0 or args.verbose:
+                print(f"  L={track_length_cm:.1f}cm, "
+                      f"track {track_index + 1}/{args.n_tracks}: "
                       f"{n_valid_tricells} valid tricells so far")
 
-    if not records:
-        print("No valid tricells. Run with larger --n-tracks or check "
-              "q_min.")
+    if not tricell_records:
+        print("No valid tricells. Try more --n-tracks, or relax "
+              "--minimum-pixel-charge-threshold.")
         return
 
     print(f"\nTotal: {n_valid_tricells} valid tricells from "
-          f"{n_attempts} accepted tracks "
-          f"({len(args.lengths) * args.n_tracks} attempted).")
+          f"{n_accepted_tracks} accepted tracks "
+          f"(of {len(args.track_lengths_cm) * args.n_tracks} "
+          f"attempted).")
 
-    # ---- Save raw ----
-    rec_arr = {k: np.array([r[k] for r in records]) for k in records[0]}
-    out_npz = f"{args.outdir}/tricell_results.npz"
-    np.savez(out_npz, **rec_arr)
-    print(f"wrote {out_npz}")
+    # ---- Save raw arrays ----
+    record_arrays = {key: np.array([record[key]
+                                    for record in tricell_records])
+                     for key in tricell_records[0]}
+    output_npz_path = f"{args.outdir}/tricell_results.npz"
+    np.savez(output_npz_path, **record_arrays)
+    print(f"wrote {output_npz_path}")
 
     # ---- Plots ----
-    _make_plots(records, args.outdir, pitch)
+    make_summary_plots(tricell_records, args.outdir, pitch_cm)
 
 
-def _make_plots(records, outdir, pitch):
+# ---------------------------------------------------------------------------
+# Plotting
+# ---------------------------------------------------------------------------
+def make_summary_plots(tricell_records, outdir, pitch_cm):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    dQdx_A = np.array([r['dQdx_A'] for r in records])
-    dQdx_B = np.array([r['dQdx_B'] for r in records])
-    dQdx_C = np.array([r['dQdx_C_raw_truth_ds'] for r in records])
-    dQdx_C_recon = np.array([r['dQdx_C_raw_recon_ds'] for r in records])
-    theta = np.array([r['theta'] for r in records])
-    L_total = np.array([r['L_total'] for r in records])
-    drift_cm = np.array([r['drift_cm'] for r in records])
-    sigma_T = np.array([r['sigma_T'] for r in records])
-    w_axis = np.array([r['w_axis'] for r in records])
-    ds_3D = np.array([r['ds_C_3D'] for r in records])
-    ds_recon = np.array([r['ds_C_recon'] for r in records])
+    dQ_per_dx_truth = np.array(
+        [r['dQ_per_dx_truth'] for r in tricell_records])
+    dQ_per_dx_drift_landed = np.array(
+        [r['dQ_per_dx_drift_landed'] for r in tricell_records])
+    dQ_per_dx_kernel_truth_ds = np.array(
+        [r['dQ_per_dx_kernel_truth_ds'] for r in tricell_records])
+    dQ_per_dx_kernel_recon_ds = np.array(
+        [r['dQ_per_dx_kernel_recon_ds'] for r in tricell_records])
+    zenith_rad = np.array([r['zenith_rad'] for r in tricell_records])
+    track_length_cm = np.array(
+        [r['track_length_cm'] for r in tricell_records])
+    drift_cm = np.array(
+        [r['midpoint_drift_cm'] for r in tricell_records])
+    sigma_transverse_cm = np.array(
+        [r['sigma_transverse_cm'] for r in tricell_records])
+    column_axis = np.array(
+        [r['column_axis'] for r in tricell_records])
+    ds_truth_cm = np.array(
+        [r['ds_geometric_truth_cm'] for r in tricell_records])
+    ds_recon_cm = np.array(
+        [r['ds_reconstructed_cm'] for r in tricell_records])
 
-    safe = lambda num, den: np.where(den != 0, num / den, np.nan)
-    rBA = safe(dQdx_B, dQdx_A)
-    rCA = safe(dQdx_C, dQdx_A)
-    rC_recon_A = safe(dQdx_C_recon, dQdx_A)
-    rCB = safe(dQdx_C, dQdx_B)
+    def safe_ratio(numerator, denominator):
+        return np.where(denominator != 0,
+                        numerator / denominator, np.nan)
 
-    def _save(fig, name):
+    ratio_drift_to_truth = safe_ratio(
+        dQ_per_dx_drift_landed, dQ_per_dx_truth)
+    ratio_kernel_truth_ds_to_truth = safe_ratio(
+        dQ_per_dx_kernel_truth_ds, dQ_per_dx_truth)
+    ratio_kernel_recon_ds_to_truth = safe_ratio(
+        dQ_per_dx_kernel_recon_ds, dQ_per_dx_truth)
+    ratio_kernel_to_drift_landed = safe_ratio(
+        dQ_per_dx_kernel_truth_ds, dQ_per_dx_drift_landed)
+
+    def save_figure(fig, filename):
         fig.tight_layout()
-        path = f"{outdir}/{name}"
+        path = f"{outdir}/{filename}"
         fig.savefig(path, dpi=140)
         print(f"wrote {path}")
         plt.close(fig)
 
-    # 1. dQdx vs truth histogram
-    fig, ax = plt.subplots(figsize=(9, 5))
-    bins = np.linspace(0, 3, 60)
-    ax.hist(rBA, bins=bins, alpha=0.55, label=f"B/A: μ={np.nanmean(rBA):.3f} σ={np.nanstd(rBA):.3f}")
-    ax.hist(rCA, bins=bins, alpha=0.55,
-            label=f"C/A truth-ds: μ={np.nanmean(rCA):.3f} σ={np.nanstd(rCA):.3f}")
-    ax.hist(rC_recon_A, bins=bins, alpha=0.55,
-            label=f"C/A recon-ds: μ={np.nanmean(rC_recon_A):.3f} σ={np.nanstd(rC_recon_A):.3f}")
-    ax.axvline(1.0, color="k", ls="--", lw=0.6)
-    ax.set_xlabel("ratio to truth dQ/dx (A)")
+    # 1. dQ/dx ratios to truth
+    fig, ax = plt.subplots(figsize=(10, 5.5))
+    histogram_bins = np.linspace(0, 3, 60)
+    for ratio_array, label, color in [
+        (ratio_drift_to_truth,
+         "drift-landed / truth", "C0"),
+        (ratio_kernel_truth_ds_to_truth,
+         "kernel response / truth   (using truth ds)", "C1"),
+        (ratio_kernel_recon_ds_to_truth,
+         "kernel response / truth   (using reconstructed ds)", "C2"),
+    ]:
+        ax.hist(ratio_array, bins=histogram_bins, alpha=0.55,
+                label=f"{label}: mean={np.nanmean(ratio_array):.3f}, "
+                      f"std={np.nanstd(ratio_array):.3f}",
+                color=color)
+    ax.axvline(1.0, color="k", ls="--", lw=0.6,
+               label="perfect calibration")
+    ax.set_xlabel("ratio of measured dQ/dx to truth dQ/dx")
     ax.set_ylabel("tricell count")
-    ax.set_title("dQ/dx ratios vs truth — tricell calibration test")
+    ax.set_title("Tricell dQ/dx ratios to truth")
     ax.legend(fontsize=9)
     ax.grid(alpha=0.3)
-    _save(fig, "tricell_dQdx_vs_truth.png")
+    save_figure(fig, "tricell_ratios_to_truth_hist.png")
 
-    # 2. Ratio vs angle
-    fig, ax = plt.subplots(figsize=(9, 5))
-    theta_deg = np.degrees(theta)
-    bins_theta = np.linspace(theta_deg.min(), theta_deg.max(), 8)
-    for ratio, label, color in [
-        (rBA, "B/A", "C0"),
-        (rCA, "C/A truth-ds", "C1"),
-        (rC_recon_A, "C/A recon-ds", "C2"),
+    # 2. Ratios vs zenith angle
+    fig, ax = plt.subplots(figsize=(10, 5.5))
+    zenith_deg = np.degrees(zenith_rad)
+    angle_bins = np.linspace(zenith_deg.min(), zenith_deg.max(), 8)
+    for ratio_array, label, color in [
+        (ratio_drift_to_truth, "drift-landed / truth", "C0"),
+        (ratio_kernel_truth_ds_to_truth,
+         "kernel / truth (truth ds)", "C1"),
+        (ratio_kernel_recon_ds_to_truth,
+         "kernel / truth (reconstructed ds)", "C2"),
     ]:
-        means, stderrs, centres = _binned_stats(theta_deg, ratio, bins_theta)
-        ax.errorbar(centres, means, yerr=stderrs, marker="o",
-                    capsize=3, label=label, color=color)
-    ax.axhline(1.0, color="k", ls="--", lw=0.6)
-    ax.set_xlabel("θ_zenith [deg]")
-    ax.set_ylabel("ratio to dQ/dx truth")
-    ax.set_title("dQ/dx ratio vs track zenith angle")
-    ax.legend()
+        bin_means, bin_stderrs, bin_centers = binned_mean_and_stderr(
+            zenith_deg, ratio_array, angle_bins)
+        ax.errorbar(bin_centers, bin_means, yerr=bin_stderrs,
+                    marker="o", capsize=3, label=label, color=color)
+    ax.axhline(1.0, color="k", ls="--", lw=0.6,
+               label="perfect calibration")
+    ax.set_xlabel("track zenith angle [deg]")
+    ax.set_ylabel("dQ/dx ratio to truth")
+    ax.set_title("Tricell dQ/dx ratio vs track zenith angle")
+    ax.legend(fontsize=9)
     ax.grid(alpha=0.3)
-    _save(fig, "tricell_ratio_vs_angle.png")
+    save_figure(fig, "tricell_ratios_vs_zenith_angle.png")
 
-    # 3. Ratio vs length
-    fig, ax = plt.subplots(figsize=(9, 5))
-    unique_L = sorted(set(L_total))
-    for ratio, label, color in [(rBA, "B/A", "C0"),
-                                 (rCA, "C/A truth-ds", "C1"),
-                                 (rC_recon_A, "C/A recon-ds", "C2")]:
-        means = []
-        stderrs = []
-        for L in unique_L:
-            mask = L_total == L
-            vals = ratio[mask & np.isfinite(ratio)]
-            means.append(np.mean(vals) if len(vals) else np.nan)
-            stderrs.append(np.std(vals) / np.sqrt(max(len(vals), 1))
-                           if len(vals) else np.nan)
-        ax.errorbar(unique_L, means, yerr=stderrs, marker="o", capsize=3,
+    # 3. Ratios vs track length
+    fig, ax = plt.subplots(figsize=(10, 5.5))
+    unique_track_lengths = sorted(set(track_length_cm.tolist()))
+    for ratio_array, label, color in [
+        (ratio_drift_to_truth, "drift-landed / truth", "C0"),
+        (ratio_kernel_truth_ds_to_truth,
+         "kernel / truth (truth ds)", "C1"),
+        (ratio_kernel_recon_ds_to_truth,
+         "kernel / truth (reconstructed ds)", "C2"),
+    ]:
+        means_per_length = []
+        stderrs_per_length = []
+        for length_cm in unique_track_lengths:
+            mask = track_length_cm == length_cm
+            finite_values = ratio_array[mask & np.isfinite(ratio_array)]
+            if len(finite_values):
+                means_per_length.append(float(np.mean(finite_values)))
+                stderrs_per_length.append(
+                    float(np.std(finite_values))
+                    / sqrt(max(len(finite_values), 1)))
+            else:
+                means_per_length.append(np.nan)
+                stderrs_per_length.append(np.nan)
+        ax.errorbar(unique_track_lengths, means_per_length,
+                    yerr=stderrs_per_length, marker="o", capsize=3,
                     label=label, color=color)
-    ax.axhline(1.0, color="k", ls="--", lw=0.6)
-    ax.set_xlabel("track length [cm]")
-    ax.set_ylabel("ratio to dQ/dx truth")
-    ax.set_title("dQ/dx ratio vs track length")
-    ax.legend()
+    ax.axhline(1.0, color="k", ls="--", lw=0.6,
+               label="perfect calibration")
+    ax.set_xlabel("total track length [cm]")
+    ax.set_ylabel("dQ/dx ratio to truth")
+    ax.set_title("Tricell dQ/dx ratio vs total track length")
+    ax.legend(fontsize=9)
     ax.grid(alpha=0.3)
-    _save(fig, "tricell_ratio_vs_length.png")
+    save_figure(fig, "tricell_ratios_vs_track_length.png")
 
-    # 4. Ratio vs drift
-    fig, ax = plt.subplots(figsize=(9, 5))
-    bins_drift = np.linspace(drift_cm.min(), drift_cm.max(), 8)
-    for ratio, label, color in [(rBA, "B/A", "C0"),
-                                 (rCA, "C/A truth-ds", "C1"),
-                                 (rC_recon_A, "C/A recon-ds", "C2")]:
-        means, stderrs, centres = _binned_stats(drift_cm, ratio, bins_drift)
-        ax.errorbar(centres, means, yerr=stderrs, marker="o", capsize=3,
-                    label=label, color=color)
-    ax.axhline(1.0, color="k", ls="--", lw=0.6)
+    # 4. Ratios vs drift distance
+    fig, ax = plt.subplots(figsize=(10, 5.5))
+    drift_bins = np.linspace(drift_cm.min(), drift_cm.max(), 8)
+    for ratio_array, label, color in [
+        (ratio_drift_to_truth, "drift-landed / truth", "C0"),
+        (ratio_kernel_truth_ds_to_truth,
+         "kernel / truth (truth ds)", "C1"),
+        (ratio_kernel_recon_ds_to_truth,
+         "kernel / truth (reconstructed ds)", "C2"),
+    ]:
+        bin_means, bin_stderrs, bin_centers = binned_mean_and_stderr(
+            drift_cm, ratio_array, drift_bins)
+        ax.errorbar(bin_centers, bin_means, yerr=bin_stderrs,
+                    marker="o", capsize=3, label=label, color=color)
+    ax.axhline(1.0, color="k", ls="--", lw=0.6,
+               label="perfect calibration")
     ax.set_xlabel("drift distance at tricell midpoint [cm]")
-    ax.set_ylabel("ratio to dQ/dx truth")
-    ax.set_title("dQ/dx ratio vs drift distance")
-    ax.legend()
+    ax.set_ylabel("dQ/dx ratio to truth")
+    ax.set_title("Tricell dQ/dx ratio vs drift distance")
+    ax.legend(fontsize=9)
     ax.grid(alpha=0.3)
-    _save(fig, "tricell_ratio_vs_drift.png")
+    save_figure(fig, "tricell_ratios_vs_drift_distance.png")
 
-    # 5. ds recon vs truth
+    # 5. ds reconstructed vs truth
     fig, ax = plt.subplots(figsize=(7, 7))
-    ax.scatter(ds_3D, ds_recon, s=4, alpha=0.4)
-    lim = (0, max(ds_3D.max(), ds_recon.max()) * 1.1)
-    ax.plot(lim, lim, "k--", lw=0.6, label="y = x")
-    ax.set_xlim(lim)
-    ax.set_ylim(lim)
-    ax.set_xlabel("ds_C_3D (geometric truth) [cm]")
-    ax.set_ylabel("ds_C_recon (from witness timing) [cm]")
-    ax.set_title("Path length reconstruction vs truth")
-    ax.legend()
+    ax.scatter(ds_truth_cm, ds_recon_cm, s=4, alpha=0.4)
+    plot_limit = max(ds_truth_cm.max(), ds_recon_cm.max()) * 1.1
+    ax.plot([0, plot_limit], [0, plot_limit], "k--", lw=0.6,
+            label="reconstructed = truth")
+    ax.set_xlim(0, plot_limit)
+    ax.set_ylim(0, plot_limit)
+    ax.set_xlabel("ds through middle pixel, geometric truth [cm]")
+    ax.set_ylabel("ds through middle pixel, reconstructed [cm]")
+    ax.set_title("Reconstructed ds vs geometric truth")
+    ax.legend(fontsize=9)
     ax.grid(alpha=0.3)
-    _save(fig, "tricell_ds_recon_vs_truth.png")
+    save_figure(fig, "tricell_ds_reconstructed_vs_truth.png")
 
-    # 6. Far Field: B/A vs σ_T/pitch
-    fig, ax = plt.subplots(figsize=(9, 5))
-    ax.scatter(sigma_T / pitch, rBA, s=4, alpha=0.4)
-    ax.axhline(1.0, color="k", ls="--", lw=0.6)
-    ax.set_xlabel("σ_T / pitch  (transverse diffusion in pitch units)")
-    ax.set_ylabel("dQ/dx_B / dQ/dx_A")
-    ax.set_title("Far Field Effect: charge-on-pad ratio vs diffusion width")
+    # 6. Drift-landed / truth vs σ_transverse / pitch (Far Field view)
+    fig, ax = plt.subplots(figsize=(10, 5.5))
+    ax.scatter(sigma_transverse_cm / pitch_cm, ratio_drift_to_truth,
+               s=4, alpha=0.4)
+    ax.axhline(1.0, color="k", ls="--", lw=0.6,
+               label="perfect calibration")
+    ax.set_xlabel("transverse diffusion width / pixel pitch")
+    ax.set_ylabel("drift-landed dQ/dx  /  truth dQ/dx")
+    ax.set_title("Far Field effect: landed-charge calibration vs "
+                 "diffusion width")
+    ax.legend(fontsize=9)
     ax.grid(alpha=0.3)
-    _save(fig, "tricell_far_field.png")
+    save_figure(fig, "tricell_drift_landed_vs_diffusion_width.png")
 
-    # 7. C/B scatter
-    fig, ax = plt.subplots(figsize=(9, 5))
-    ax.scatter(dQdx_B, dQdx_C, s=4, alpha=0.4)
-    mx = max(dQdx_B.max(), dQdx_C.max())
-    ax.plot([0, mx], [0, mx], "k--", lw=0.6, label="C = B")
-    ax.set_xlabel("dQ/dx_B (drift on pad)")
-    ax.set_ylabel("dQ/dx_C (response readout)")
-    ax.set_title("Response model vs direct drift-on-pad charge")
-    ax.legend()
+    # 7. Kernel response vs drift-landed (per tricell, dQ/dx)
+    fig, ax = plt.subplots(figsize=(8, 7))
+    ax.scatter(dQ_per_dx_drift_landed, dQ_per_dx_kernel_truth_ds,
+               s=4, alpha=0.4)
+    plot_max = max(dQ_per_dx_drift_landed.max(),
+                   dQ_per_dx_kernel_truth_ds.max())
+    ax.plot([0, plot_max], [0, plot_max], "k--", lw=0.6,
+            label="kernel = drift-landed")
+    ax.set_xlabel("drift-landed dQ/dx (physically arrives on pad)")
+    ax.set_ylabel("kernel response dQ/dx (induced-current readout)")
+    ax.set_title("Kernel response vs drift-landed charge")
+    ax.legend(fontsize=9)
     ax.grid(alpha=0.3)
-    _save(fig, "tricell_C_vs_B.png")
+    save_figure(fig, "tricell_kernel_vs_drift_landed.png")
 
-    # 8. w-axis breakdown
-    fig, ax = plt.subplots(figsize=(8, 5))
-    labels = ["B/A", "C/A truth-ds", "C/A recon-ds"]
-    x_axis_means = []
-    y_axis_means = []
-    for ratio in (rBA, rCA, rC_recon_A):
-        mask_x = w_axis == 'x'
-        mask_y = w_axis == 'y'
-        x_axis_means.append(np.nanmean(ratio[mask_x]) if mask_x.sum() else np.nan)
-        y_axis_means.append(np.nanmean(ratio[mask_y]) if mask_y.sum() else np.nan)
-    xpos = np.arange(len(labels))
-    ax.bar(xpos - 0.2, x_axis_means, 0.4, label="w_1 = x column")
-    ax.bar(xpos + 0.2, y_axis_means, 0.4, label="w_1 = y column")
-    ax.axhline(1.0, color="k", ls="--", lw=0.6)
-    ax.set_xticks(xpos)
-    ax.set_xticklabels(labels)
+    # 8. Ratios split by column-axis orientation
+    fig, ax = plt.subplots(figsize=(9, 5.5))
+    label_pairs = [
+        ("drift-landed / truth", ratio_drift_to_truth),
+        ("kernel / truth (truth ds)", ratio_kernel_truth_ds_to_truth),
+        ("kernel / truth (recon ds)", ratio_kernel_recon_ds_to_truth),
+    ]
+    means_x_axis = []
+    means_y_axis = []
+    for label, ratio_array in label_pairs:
+        mask_x = column_axis == 'x'
+        mask_y = column_axis == 'y'
+        means_x_axis.append(
+            float(np.nanmean(ratio_array[mask_x]))
+            if mask_x.sum() else np.nan)
+        means_y_axis.append(
+            float(np.nanmean(ratio_array[mask_y]))
+            if mask_y.sum() else np.nan)
+    bar_positions = np.arange(len(label_pairs))
+    ax.bar(bar_positions - 0.2, means_x_axis, 0.4,
+           label="w_1 = x-column")
+    ax.bar(bar_positions + 0.2, means_y_axis, 0.4,
+           label="w_1 = y-column")
+    ax.axhline(1.0, color="k", ls="--", lw=0.6,
+               label="perfect calibration")
+    ax.set_xticks(bar_positions)
+    ax.set_xticklabels([label for label, _ in label_pairs],
+                       fontsize=9)
     ax.set_ylabel("mean ratio")
-    ax.set_title("Tricell ratios split by w_1 axis")
-    ax.legend()
+    ax.set_title("Tricell dQ/dx ratios split by w_1 column axis")
+    ax.legend(fontsize=9)
     ax.grid(alpha=0.3, axis="y")
-    _save(fig, "tricell_w_axis_breakdown.png")
+    save_figure(fig, "tricell_ratios_by_column_axis.png")
 
-    # 9. Fluctuations: per-(track,tricell) stderr across seeds
-    # group records by (track_id, i_x_C, i_y_C, w_axis)
-    groups = {}
-    for r in records:
-        key = (r['track_id'], r['L_total'], r['i_x_C'], r['i_y_C'],
-               r['w_axis'])
-        groups.setdefault(key, []).append(r)
+    # 9. Per-tricell seed-to-seed fluctuation reliability
+    record_groups_by_tricell = {}
+    for record in tricell_records:
+        group_key = (record['track_index'],
+                     record['track_length_cm'],
+                     record['i_x_center'],
+                     record['i_y_center'],
+                     record['column_axis'])
+        record_groups_by_tricell.setdefault(group_key, []).append(record)
 
-    a_means = []
-    b_stds = []
-    c_stds = []
-    for key, rs in groups.items():
-        if len(rs) < 2:
+    truth_means = []
+    drift_landed_stderrs = []
+    kernel_stderrs = []
+    for group_key, records in record_groups_by_tricell.items():
+        if len(records) < 2:
             continue
-        a_means.append(np.mean([r['dQdx_A'] for r in rs]))
-        b_stds.append(np.std([r['dQdx_B'] for r in rs]))
-        c_stds.append(np.std([r['dQdx_C_raw_truth_ds'] for r in rs]))
+        truth_means.append(np.mean(
+            [r['dQ_per_dx_truth'] for r in records]))
+        drift_landed_stderrs.append(np.std(
+            [r['dQ_per_dx_drift_landed'] for r in records]))
+        kernel_stderrs.append(np.std(
+            [r['dQ_per_dx_kernel_truth_ds'] for r in records]))
 
-    if a_means:
-        fig, ax = plt.subplots(figsize=(9, 5))
-        a_means = np.array(a_means)
-        b_stds = np.array(b_stds)
-        c_stds = np.array(c_stds)
-        ax.scatter(a_means, b_stds / a_means, s=6, alpha=0.5,
-                   label="B stderr / A", color="C0")
-        ax.scatter(a_means, c_stds / a_means, s=6, alpha=0.5,
-                   label="C stderr / A", color="C1")
-        ax.set_xlabel("dQ/dx_A (truth)")
+    if truth_means:
+        fig, ax = plt.subplots(figsize=(10, 5.5))
+        truth_means = np.array(truth_means)
+        drift_landed_stderrs = np.array(drift_landed_stderrs)
+        kernel_stderrs = np.array(kernel_stderrs)
+        ax.scatter(truth_means,
+                   drift_landed_stderrs / truth_means,
+                   s=6, alpha=0.5,
+                   label="drift-landed seed-stderr / truth",
+                   color="C0")
+        ax.scatter(truth_means,
+                   kernel_stderrs / truth_means,
+                   s=6, alpha=0.5,
+                   label="kernel response seed-stderr / truth",
+                   color="C1")
+        ax.set_xlabel("truth dQ/dx")
         ax.set_ylabel("per-tricell relative stderr across seeds")
-        ax.set_title("Practical reliability: per-tricell seed-to-seed spread")
-        ax.legend()
+        ax.set_title("Seed-to-seed fluctuation reliability per tricell")
+        ax.legend(fontsize=9)
         ax.grid(alpha=0.3)
-        _save(fig, "tricell_fluctuations.png")
+        save_figure(fig, "tricell_seed_fluctuation_reliability.png")
 
-    # 10. (C - B)/A scatter vs σ_T/pitch
-    fig, ax = plt.subplots(figsize=(9, 5))
-    delta = (dQdx_C - dQdx_B) / dQdx_A
-    ax.scatter(sigma_T / pitch, delta, s=4, alpha=0.4)
-    ax.axhline(0, color="k", ls="--", lw=0.6)
-    ax.set_xlabel("σ_T / pitch")
-    ax.set_ylabel("(C - B) / A")
-    ax.set_title("Induced-current contribution beyond direct drift charge")
+    # 10. (kernel − drift-landed) / truth vs diffusion width
+    fig, ax = plt.subplots(figsize=(10, 5.5))
+    delta_kernel_minus_drift_landed = (
+        (dQ_per_dx_kernel_truth_ds - dQ_per_dx_drift_landed)
+        / dQ_per_dx_truth)
+    ax.scatter(sigma_transverse_cm / pitch_cm,
+               delta_kernel_minus_drift_landed,
+               s=4, alpha=0.4)
+    ax.axhline(0, color="k", ls="--", lw=0.6,
+               label="kernel = drift-landed")
+    ax.set_xlabel("transverse diffusion width / pixel pitch")
+    ax.set_ylabel("(kernel − drift-landed) / truth")
+    ax.set_title("Induced-current contribution beyond directly-landed "
+                 "charge")
+    ax.legend(fontsize=9)
     ax.grid(alpha=0.3)
-    _save(fig, "tricell_C_minus_B.png")
+    save_figure(fig, "tricell_kernel_minus_drift_landed.png")
 
-    # 11. Calibration bias: dQ_dx_C / A for truth-ds vs recon-ds
-    fig, ax = plt.subplots(figsize=(9, 5))
-    bins = np.linspace(0, 3, 60)
-    ax.hist(rCA, bins=bins, alpha=0.55,
-            label=f"C/A truth-ds: μ={np.nanmean(rCA):.3f} σ={np.nanstd(rCA):.3f}",
+    # 11. Calibration bias: truth-ds denominator vs recon-ds denominator
+    fig, ax = plt.subplots(figsize=(10, 5.5))
+    histogram_bins = np.linspace(0, 3, 60)
+    ax.hist(ratio_kernel_truth_ds_to_truth, bins=histogram_bins,
+            alpha=0.55,
+            label=f"kernel / truth, using TRUTH ds: "
+                  f"mean={np.nanmean(ratio_kernel_truth_ds_to_truth):.3f}",
             color="C1")
-    ax.hist(rC_recon_A, bins=bins, alpha=0.55,
-            label=f"C/A recon-ds: μ={np.nanmean(rC_recon_A):.3f} σ={np.nanstd(rC_recon_A):.3f}",
+    ax.hist(ratio_kernel_recon_ds_to_truth, bins=histogram_bins,
+            alpha=0.55,
+            label=f"kernel / truth, using RECONSTRUCTED ds: "
+                  f"mean={np.nanmean(ratio_kernel_recon_ds_to_truth):.3f}",
             color="C2")
-    ax.axvline(1.0, color="k", ls="--", lw=0.6)
-    ax.set_xlabel("ratio to truth dQ/dx (A)")
+    ax.axvline(1.0, color="k", ls="--", lw=0.6,
+               label="perfect calibration")
+    ax.set_xlabel("ratio of measured dQ/dx to truth dQ/dx")
     ax.set_ylabel("tricell count")
     ax.set_title(
-        "Calibration bias: truth-ds vs recon-ds denominators\n"
-        "(difference = timing-reconstruction contribution to bias)")
-    ax.legend()
+        "Calibration bias from ds reconstruction\n"
+        "(difference between distributions = "
+        "timing-reconstruction contribution to bias)")
+    ax.legend(fontsize=9)
     ax.grid(alpha=0.3)
-    _save(fig, "tricell_calibration_bias.png")
+    save_figure(fig, "tricell_calibration_bias_truth_vs_recon_ds.png")
 
     # ---- Console summary ----
-    print("\n" + "=" * 60)
-    print(f"Records: {len(records)}, "
-          f"tracks with ≥1 tricell: "
-          f"{len(set((r['track_id'], r['L_total']) for r in records))}")
-    print(f"<B/A>           = {np.nanmean(rBA):.3f} ± {np.nanstd(rBA)/np.sqrt(len(records)):.3f}")
-    print(f"<C/A truth-ds>  = {np.nanmean(rCA):.3f} ± {np.nanstd(rCA)/np.sqrt(len(records)):.3f}")
-    print(f"<C/A recon-ds>  = {np.nanmean(rC_recon_A):.3f} ± {np.nanstd(rC_recon_A)/np.sqrt(len(records)):.3f}")
-    print(f"<C/B>           = {np.nanmean(rCB):.3f} ± {np.nanstd(rCB)/np.sqrt(len(records)):.3f}")
-    print(f"<ds_recon/ds_3D>= {np.nanmean(ds_recon/ds_3D):.3f}")
-    print("=" * 60)
+    n_records = len(tricell_records)
+    print("\n" + "=" * 70)
+    print(f"Total tricells:           {n_records}")
+    print(f"Unique (track, length) pairs with ≥1 tricell: "
+          f"{len(set((r['track_index'], r['track_length_cm']) for r in tricell_records))}")
+    print(f"drift-landed / truth                       : "
+          f"mean={np.nanmean(ratio_drift_to_truth):.3f}, "
+          f"std={np.nanstd(ratio_drift_to_truth):.3f}")
+    print(f"kernel / truth (using truth ds)            : "
+          f"mean={np.nanmean(ratio_kernel_truth_ds_to_truth):.3f}, "
+          f"std={np.nanstd(ratio_kernel_truth_ds_to_truth):.3f}")
+    print(f"kernel / truth (using reconstructed ds)    : "
+          f"mean={np.nanmean(ratio_kernel_recon_ds_to_truth):.3f}, "
+          f"std={np.nanstd(ratio_kernel_recon_ds_to_truth):.3f}")
+    print(f"kernel / drift-landed                      : "
+          f"mean={np.nanmean(ratio_kernel_to_drift_landed):.3f}, "
+          f"std={np.nanstd(ratio_kernel_to_drift_landed):.3f}")
+    print(f"ds_reconstructed / ds_geometric_truth      : "
+          f"mean={np.nanmean(ds_recon_cm / ds_truth_cm):.3f}")
+    print("=" * 70)
 
 
-def _binned_stats(x, y, bins):
-    idx = np.digitize(x, bins) - 1
-    means, stderrs, centres = [], [], []
-    for i in range(len(bins) - 1):
-        mask = (idx == i) & np.isfinite(y)
-        vals = y[mask]
-        if len(vals) >= 2:
-            means.append(np.mean(vals))
-            stderrs.append(np.std(vals) / np.sqrt(len(vals)))
+def binned_mean_and_stderr(x_values, y_values, x_bins):
+    """Bin y_values by x_values, return (means, standard_errors, bin_centers)."""
+    bin_indices = np.digitize(x_values, x_bins) - 1
+    means = []
+    standard_errors = []
+    bin_centers = []
+    for bin_index in range(len(x_bins) - 1):
+        mask = (bin_indices == bin_index) & np.isfinite(y_values)
+        values_in_bin = y_values[mask]
+        if len(values_in_bin) >= 2:
+            means.append(float(np.mean(values_in_bin)))
+            standard_errors.append(
+                float(np.std(values_in_bin))
+                / sqrt(len(values_in_bin)))
         else:
             means.append(np.nan)
-            stderrs.append(np.nan)
-        centres.append(0.5 * (bins[i] + bins[i + 1]))
-    return np.array(means), np.array(stderrs), np.array(centres)
+            standard_errors.append(np.nan)
+        bin_centers.append(0.5 * (x_bins[bin_index]
+                                  + x_bins[bin_index + 1]))
+    return (np.array(means),
+            np.array(standard_errors),
+            np.array(bin_centers))
 
 
 if __name__ == "__main__":
