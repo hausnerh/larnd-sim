@@ -29,6 +29,32 @@ charge on the sentinels. Requiring a minimum sentinel-to-center charge
 ratio is hypothesised to reject those corner-clip tricells where ds
 reconstruction is most likely to be wildly off.
 
+The script also applies hard pre-cuts to suppress halo-fringe
+contamination, which dominated the worst-outlier tricells in the
+first run of this script:
+
+  - --minimum-pixel-charge-threshold (default 10000 response units)
+      Pixels with |Q| below this never enter the hit dict. Real-track
+      pixel charge median ~3e5; halo bipolar fringe ~1e3-1e4. The
+      earlier default of 10 let halo fringe pose as tricell hits.
+  - --minimum-target-charge (default 50000)
+      Absolute floor on the tricell target (centre) pixel's charge.
+      Without this, fringe pixels with |Q| ~ 1e4 were repeatedly being
+      misidentified as tricell targets.
+  - --minimum-witness-charge-threshold (default 30000)
+      Absolute floor on witness pixel charge. Catches witnesses that
+      are pure bipolar fringe in their column.
+  - --maximum-sentinel-asymmetry (default 10)
+      max(|Q_w1_top|, |Q_w1_bottom|) / min(|Q_w1_top|, |Q_w1_bottom|)
+      must be below this. Catches tricells where one w_1 sentinel is
+      real-track and the other is fringe.
+  - --minimum-ds-truth-cm (default 0.05 cm ≈ 0.1·pitch)
+      Drops tricells where the input segment barely clipped the
+      target pixel's pillar (sub-millimeter ds_truth).
+
+The sentinel-ratio threshold scan in the plots is then performed on
+the surviving sample.
+
 OUTPUTS
 -------
   tricell_ds_fractional_difference.png
@@ -469,12 +495,38 @@ def main():
     arg_parser.add_argument(
         "--track-dEdx-MeV-per-cm", type=float, default=2.0)
     arg_parser.add_argument(
-        "--minimum-pixel-charge-threshold", type=float, default=10.0)
+        "--minimum-pixel-charge-threshold", type=float, default=10000.0,
+        help="minimum |Q| (response units) for a pixel to enter the "
+             "hit dict. Default 10000, roughly 3 percent of the "
+             "typical real-track pixel charge (~3e5). Was 10 in "
+             "earlier versions which let halo bipolar fringe through.")
     arg_parser.add_argument(
-        "--minimum-witness-charge-threshold", type=float, default=10.0)
+        "--minimum-witness-charge-threshold", type=float, default=30000.0,
+        help="absolute minimum |Q| (response units) required of "
+             "witness pixels. Was 10 in earlier versions. Without a "
+             "stringent witness charge cut, fringe pixels in w_0 / "
+             "w_2 columns get picked as witnesses, giving wildly "
+             "wrong delta_v.")
     arg_parser.add_argument(
-        "--minimum-ds-truth-cm", type=float, default=0.0,
-        help="reject tricells with truth ds below this (cm); 0 = no cut")
+        "--minimum-target-charge", type=float, default=50000.0,
+        help="absolute minimum |Q| required of the tricell target "
+             "(centre) pixel. The single most important cut: the "
+             "worst-outlier tricells had a fringe target pixel with "
+             "q_centre ~ 8000 while the real-track sentinels carried "
+             "~3e5. Default 50000, roughly 17 percent of typical "
+             "real-track centre charge.")
+    arg_parser.add_argument(
+        "--maximum-sentinel-asymmetry", type=float, default=10.0,
+        help="max(|Q_w1_top|, |Q_w1_bottom|) / min(|Q_w1_top|, "
+             "|Q_w1_bottom|) ≤ this. Catches tricells where one "
+             "sentinel is real-track (~3e5) and the other is fringe "
+             "(~3e2), which are the asymmetric-sentinel outliers.")
+    arg_parser.add_argument(
+        "--minimum-ds-truth-cm", type=float, default=0.05,
+        help="reject tricells where the input segment barely clipped "
+             "the target pixel's pillar (truth ds below this). "
+             "Default 0.05 cm ≈ 0.1·pitch; tracks that physically "
+             "deposit < ~600 electrons in the pixel.")
     arg_parser.add_argument(
         "--master-rng-seed", type=int, default=20260519)
     arg_parser.add_argument(
@@ -528,6 +580,14 @@ def main():
     records = []
     n_accepted_tracks = 0
     n_valid_tricells = 0
+    # Per-cut rejection diagnostics
+    cut_rejection_counts = dict(
+        ds_recon_failed=0,
+        ds_truth_below_threshold=0,
+        target_charge_below_threshold=0,
+        sentinel_asymmetric=0,
+    )
+    n_tricells_examined = 0
 
     for track_length_cm in args.track_lengths_cm:
         for track_index in range(args.n_tracks):
@@ -585,15 +645,17 @@ def main():
                     args.minimum_witness_charge_threshold))
 
                 for tricell in tricells_found:
+                    n_tricells_examined += 1
+
                     ds_recon_cm, _ = reconstruct_ds_witness_to_witness(
                         tricell, detector, detector.TIME_SAMPLING)
                     if ds_recon_cm is None:
+                        cut_rejection_counts['ds_recon_failed'] += 1
                         continue
 
                     i_x_center, i_y_center = tricell['centre_pixel_key']
                     x_center_cm, y_center_cm = pixel_indices_to_center(
                         detector, i_x_center, i_y_center)
-
                     ds_truth_cm = segment_length_through_pixel_pillar(
                         (start_x, start_y, start_z),
                         (end_x, end_y, end_z),
@@ -602,19 +664,34 @@ def main():
                         y_center_cm - pitch_cm / 2,
                         y_center_cm + pitch_cm / 2)
                     if ds_truth_cm <= args.minimum_ds_truth_cm:
+                        cut_rejection_counts['ds_truth_below_threshold'] += 1
                         continue
 
-                    # Sentinel charges: top and bottom of the 3 w_1
-                    # pixels (the pixels in the same column as the
-                    # target but adjacent in the v direction).
+                    # Absolute charge cuts.
                     q_centre = abs(tricell['centre_collected_charge'])
                     q_w1_lo = abs(tricell['w1_lo_collected_charge'])
                     q_w1_hi = abs(tricell['w1_hi_collected_charge'])
-                    if q_centre <= 0:
+                    if q_centre < args.minimum_target_charge:
+                        cut_rejection_counts['target_charge_below_threshold'] += 1
                         continue
-                    sentinel_min_ratio = min(q_w1_lo, q_w1_hi) / q_centre
+
+                    # Sentinel asymmetry cut: catches cases where one
+                    # w_1 sentinel is a real-track pixel and the other
+                    # is fringe.
+                    min_sentinel_q = min(q_w1_lo, q_w1_hi)
+                    max_sentinel_q = max(q_w1_lo, q_w1_hi)
+                    if min_sentinel_q <= 0:
+                        cut_rejection_counts['sentinel_asymmetric'] += 1
+                        continue
+                    sentinel_asymmetry = max_sentinel_q / min_sentinel_q
+                    if sentinel_asymmetry > args.maximum_sentinel_asymmetry:
+                        cut_rejection_counts['sentinel_asymmetric'] += 1
+                        continue
+
+                    sentinel_min_ratio = min_sentinel_q / q_centre
                     sentinel_mean_ratio = (
                         0.5 * (q_w1_lo + q_w1_hi) / q_centre)
+                    sentinel_max_ratio = max_sentinel_q / q_centre
 
                     fractional_difference = (
                         (ds_recon_cm - ds_truth_cm) / ds_truth_cm)
@@ -629,6 +706,8 @@ def main():
                         fractional_difference=fractional_difference,
                         sentinel_min_ratio=sentinel_min_ratio,
                         sentinel_mean_ratio=sentinel_mean_ratio,
+                        sentinel_max_ratio=sentinel_max_ratio,
+                        sentinel_asymmetry=sentinel_asymmetry,
                         q_centre=q_centre,
                         q_w1_lo=q_w1_lo,
                         q_w1_hi=q_w1_hi,
@@ -641,12 +720,21 @@ def main():
                       f"track {track_index + 1}/{args.n_tracks}: "
                       f"{n_valid_tricells} valid tricells so far")
 
-    if not records:
-        print("No valid tricells.")
-        return
+    print(f"\nTricells examined            : {n_tricells_examined}")
+    print(f"  rejected by ds_recon failure   : "
+          f"{cut_rejection_counts['ds_recon_failed']}")
+    print(f"  rejected by ds_truth ≤ {args.minimum_ds_truth_cm} cm "
+          f": {cut_rejection_counts['ds_truth_below_threshold']}")
+    print(f"  rejected by q_centre < {args.minimum_target_charge:.0f} "
+          f": {cut_rejection_counts['target_charge_below_threshold']}")
+    print(f"  rejected by sentinel asymmetry > {args.maximum_sentinel_asymmetry} "
+          f": {cut_rejection_counts['sentinel_asymmetric']}")
+    print(f"Surviving valid tricells      : {n_valid_tricells} "
+          f"from {n_accepted_tracks} accepted tracks")
 
-    print(f"\nTotal: {n_valid_tricells} valid tricells from "
-          f"{n_accepted_tracks} accepted tracks.")
+    if not records:
+        print("No valid tricells survived the cuts. Loosen thresholds.")
+        return
 
     # ---- Save raw ----
     record_arrays = {key: np.array([record[key] for record in records])
