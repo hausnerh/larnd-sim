@@ -9,10 +9,20 @@ as a function of a "sentinel pixel" charge threshold.
 
 WHAT THIS SCRIPT DOES
 ---------------------
-Throws synthetic cosmic muons, runs them through the larnd-sim kernel
-chain, identifies Z-shape tricells, and compares the reconstructed ds
-to the geometric truth ds. The track direction is estimated from
-witness peak-time deltas:
+Throws synthetic cosmic muons, runs them through the FULL larnd-sim
+chain (quench → drift → tracks_current_mc → sum_pixel_signals →
+get_adc_values), identifies Z-shape tricells from the readout, and
+compares the reconstructed ds to the geometric truth ds. It also
+reports the dQ/dx that a real calibration analysis would derive from
+the readout — FEE ADC packet charge divided by tricell-reconstructed
+ds — vs the truth dQ/dx from the simulated ionisation.
+
+Per-pixel timing comes from the FEE OUTPUT (the tick of the largest
+ADC packet on that pixel), not the raw response waveform's argmax.
+This makes the selection portable to real data — the same tricell
+finder would work on actual packet streams.
+
+The track direction is estimated from witness peak-time deltas:
 
     delta_w     = 1 * pixel_pitch      (the effective w-extent between
                                         witness peak times, equal to
@@ -69,6 +79,19 @@ OUTPUTS
   tricell_ds_yield_vs_sentinel_threshold.png
                             number of tricells passing the sentinel cut
                             vs the threshold.
+  tricell_dQdx_readout_vs_truth_uncalibrated.png
+                            histogram of dQ/dx_readout / dQ/dx_truth
+                            with the truth ds in the denominator; the
+                            median sets the calibration factor.
+  tricell_dQdx_readout_calibrated_vs_truth.png
+                            same after applying the calibration factor,
+                            with tricell-reconstructed ds in the
+                            denominator (the actual "data-style"
+                            measurement).
+  tricell_dQdx_calibrated_vs_recon_ds.png
+                            calibrated dQ/dx ratio binned by
+                            reconstructed ds — flatness here means the
+                            calibration is ds-independent.
   tricell_ds_accuracy_results.npz
 
 REQUIREMENTS
@@ -193,6 +216,7 @@ def run_kernel_chain(detector, physics, sim,
         device_tracks, device_active, device_neighbors,
         device_radius, device_n_pixels)
     neighboring_pixels = device_neighbors.copy_to_host()
+    neighboring_radius = device_radius.copy_to_host()
 
     long_diff_max = float(np.max(tracks_after_drift["long_diff"]))
     t_span = float(np.max(
@@ -232,7 +256,154 @@ def run_kernel_chain(detector, physics, sim,
 
     return dict(signals=signals,
                 neighboring_pixels=neighboring_pixels,
-                tracks_after_drift=tracks_after_drift)
+                neighboring_radius=neighboring_radius,
+                signal_n_ticks=signal_n_ticks,
+                tracks_after_drift=tracks_after_drift,
+                n_electrons_post_drift=float(
+                    tracks_after_drift["n_electrons"][0]))
+
+
+# ---------------------------------------------------------------------------
+# FEE chain (sum_pixel_signals + get_adc_values) for data-applicable
+# per-pixel timing and packet-derived charge.
+# ---------------------------------------------------------------------------
+def run_fee_chain(detector, sim, detsim, fee,
+                  create_xoroshiro128p_states,
+                  signals, neighboring_pixels, signal_n_ticks,
+                  *, fee_rng_seed=42):
+    """sum_pixel_signals → get_adc_values, mirroring the production
+    pipeline in cli/simulate_pixels.py:1389-1454, 1497-1506.
+
+    Args:
+        signals: per-segment per-halo-pixel per-tick induced current,
+                 shape (n_tracks, max_pixels_per_track, n_ticks)
+        neighboring_pixels: (n_tracks, max_pixels_per_track) pixel IDs
+        signal_n_ticks: number of output ticks in `signals`
+
+    Returns dict:
+        unique_pix: (N_unique,) deduplicated pixel IDs
+        adc_packet_list: (N_unique, MAX_ADC_VALUES) packet ADC values
+                          (zero where no packet was issued)
+        adc_packet_ticks: (N_unique, MAX_ADC_VALUES) packet ticks
+                          (in TIME_SAMPLING units)
+    """
+    from numba import cuda as _cuda
+
+    # ---- Dedupe pixel IDs (host-side) ----
+    flat_pixels = neighboring_pixels.ravel()
+    valid_pixels = flat_pixels[flat_pixels >= 0]
+    if valid_pixels.size == 0:
+        return None
+    unique_pix = np.unique(valid_pixels).astype(np.int32)
+    n_unique = len(unique_pix)
+
+    # ---- pixel_index_map: neighboring_pixels[itrk, ipix] -> idx in unique_pix ----
+    max_pix_val = int(unique_pix.max()) + 1
+    pix_lookup = np.full((max_pix_val,), -1, dtype=np.int32)
+    pix_lookup[unique_pix] = np.arange(n_unique, dtype=np.int32)
+    pixel_index_map = pix_lookup[neighboring_pixels].astype(np.int32)
+    pixel_index_map[neighboring_pixels == -1] = -1
+
+    # ---- track_pixel_map ----
+    max_segments_to_trace = sim.MAX_TRACKS_PER_PIXEL
+    track_pixel_map = np.full((n_unique, max_segments_to_trace), -1,
+                              dtype=np.int32)
+    device_track_pixel_map = _cuda.to_device(track_pixel_map)
+    device_unique_pix = _cuda.to_device(unique_pix)
+    device_neighboring_pixels = _cuda.to_device(neighboring_pixels)
+
+    threads_per_block = 32
+    blocks_per_grid = max(ceil(n_unique / threads_per_block), 1)
+    detsim.get_track_pixel_map[blocks_per_grid, threads_per_block](
+        device_track_pixel_map, device_unique_pix,
+        device_neighboring_pixels)
+    track_pixel_map_host = device_track_pixel_map.copy_to_host()
+
+    # num_backtrack: count of segments per pixel; offset_backtrack: cumsum
+    num_backtrack = (track_pixel_map_host != -1).sum(axis=-1).astype(
+        np.int64)
+    offset_backtrack = (np.cumsum(num_backtrack)
+                        - num_backtrack).astype(np.int64)
+
+    # ---- sum_pixel_signals ----
+    pixels_signals = np.zeros((n_unique, signal_n_ticks),
+                              dtype=np.float64)
+    pixels_tracks_signals = np.zeros(
+        signal_n_ticks * int(num_backtrack.sum()), dtype=np.float64)
+    overflow_flag = np.zeros(n_unique, dtype=np.float32)
+
+    device_pixels_signals = _cuda.to_device(pixels_signals)
+    device_pixels_tracks_signals = _cuda.to_device(pixels_tracks_signals)
+    device_pixel_index_map = _cuda.to_device(pixel_index_map)
+    device_num_backtrack = _cuda.to_device(num_backtrack)
+    device_offset_backtrack = _cuda.to_device(offset_backtrack)
+    device_overflow_flag = _cuda.to_device(overflow_flag)
+    device_signals = _cuda.to_device(signals)
+
+    # track_t0 (in TIME_SAMPLING units, integer ticks). Our t0=0 so 0.
+    track_t0 = np.zeros(signals.shape[0], dtype=np.int64)
+    device_track_t0 = _cuda.to_device(track_t0)
+
+    threads_per_block_3d = (1, 1, 64)
+    blocks_per_grid_3d = (
+        max(ceil(signals.shape[0] / threads_per_block_3d[0]), 1),
+        max(ceil(signals.shape[1] / threads_per_block_3d[1]), 1),
+        max(ceil(signals.shape[2] / threads_per_block_3d[2]), 1),
+    )
+    detsim.sum_pixel_signals[blocks_per_grid_3d, threads_per_block_3d](
+        device_pixels_signals, device_signals, device_track_t0,
+        device_pixel_index_map, device_track_pixel_map,
+        device_pixels_tracks_signals,
+        device_num_backtrack, device_offset_backtrack,
+        device_overflow_flag)
+
+    # ---- get_adc_values ----
+    time_ticks = (np.arange(signal_n_ticks + 1, dtype=np.float64)
+                  * detector.TIME_SAMPLING)
+    device_time_ticks = _cuda.to_device(time_ticks)
+
+    max_adcs = sim.MAX_ADC_VALUES
+    adc_packet_list = np.zeros((n_unique, max_adcs), dtype=np.float64)
+    adc_packet_ticks = np.zeros((n_unique, max_adcs), dtype=np.float64)
+    current_fractions = np.zeros(
+        (n_unique, max_adcs, sim.MAX_TRACKS_PER_PIXEL), dtype=np.float64)
+    device_adc_packet_list = _cuda.to_device(adc_packet_list)
+    device_adc_packet_ticks = _cuda.to_device(adc_packet_ticks)
+    device_current_fractions = _cuda.to_device(current_fractions)
+
+    # Discrimination threshold (electrons; consts.units.e = 1)
+    default_threshold = float(detector.DISCRIMINATION_THRESHOLD)
+    pixel_thresholds = np.full(n_unique, default_threshold,
+                               dtype=np.float64)
+    device_pixel_thresholds = _cuda.to_device(pixel_thresholds)
+
+    fee_threads_per_block = 4
+    fee_blocks_per_grid = max(ceil(n_unique / fee_threads_per_block), 1)
+    fee_n_rng = max(fee_threads_per_block * fee_blocks_per_grid, 1024)
+    fee_rng_states = create_xoroshiro128p_states(fee_n_rng,
+                                                 seed=fee_rng_seed)
+
+    fee.get_adc_values[fee_blocks_per_grid, fee_threads_per_block](
+        device_pixels_signals,
+        device_pixels_tracks_signals,
+        device_num_backtrack,
+        device_offset_backtrack,
+        device_time_ticks,
+        device_adc_packet_list,
+        device_adc_packet_ticks,
+        0.0,                              # time_padding
+        fee_rng_states,
+        device_current_fractions,
+        device_pixel_thresholds)
+
+    adc_packet_list = device_adc_packet_list.copy_to_host()
+    adc_packet_ticks = device_adc_packet_ticks.copy_to_host()
+
+    return dict(
+        unique_pix=unique_pix,
+        adc_packet_list=adc_packet_list,
+        adc_packet_ticks=adc_packet_ticks,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -293,8 +464,36 @@ def segment_length_through_pixel_pillar(segment_start_xyz, segment_end_xyz,
 # ---------------------------------------------------------------------------
 # Tricell finder + ds reconstruction (witness-to-witness, consistent span)
 # ---------------------------------------------------------------------------
-def build_hit_pixel_dict(neighboring_pixels, signals, id2pixel_fn,
+def build_hit_pixel_dict(neighboring_pixels, signals,
+                         fee_output, id2pixel_fn,
                          minimum_pixel_charge_threshold):
+    """Build a per-pixel hit dict combining:
+      - the kernel response charge (sum(signals[ipix, :]) -- used for
+        halo-fringe cuts because the cuts were calibrated on this scale)
+      - the FEE-derived packet charges + packet ticks (data-applicable
+        timing and the actual readout charge)
+
+    For each pixel that passes |kernel_response| > threshold, we look
+    up its packet stream from the FEE output and record:
+      peak_tick           : tick of the LARGEST FEE packet (proxies the
+                             discriminator trigger time of the dominant
+                             charge deposit; the data equivalent of
+                             argmax-of-waveform but on packets only)
+      first_packet_tick   : tick of the first non-zero FEE packet
+      collected_charge_kernel : sum(signals[ipix, :])  (response units)
+      collected_charge_readout: sum(adc_packet_list[unique_pix_idx, :])
+                                 (electrons, by the FEE units convention)
+      n_packets           : count of nonzero packets
+
+    Pixels in the halo that produced no FEE packets are skipped.
+    """
+    # Build lookup: pixel_id -> index in unique_pix
+    unique_pix = fee_output['unique_pix']
+    adc_packet_list = fee_output['adc_packet_list']
+    adc_packet_ticks = fee_output['adc_packet_ticks']
+    pixel_id_to_unique_idx = {int(pid): idx
+                              for idx, pid in enumerate(unique_pix)}
+
     hit_dict = {}
     n_halo_pixels = neighboring_pixels.shape[1]
     for halo_index in range(n_halo_pixels):
@@ -302,15 +501,43 @@ def build_hit_pixel_dict(neighboring_pixels, signals, id2pixel_fn,
         if pixel_id < 0:
             continue
         i_x, i_y, plane_id = id2pixel_fn(pixel_id)
+
+        # Halo-fringe cut on RAW response charge (preserves earlier
+        # threshold calibration).
         signal_trace = signals[0, halo_index, :]
-        collected_charge = float(signal_trace.sum())
-        if abs(collected_charge) < minimum_pixel_charge_threshold:
+        collected_charge_kernel = float(signal_trace.sum())
+        if abs(collected_charge_kernel) < minimum_pixel_charge_threshold:
             continue
-        peak_tick = int(np.argmax(signal_trace))
+
+        # FEE packet info for this pixel (if it produced packets)
+        unique_idx = pixel_id_to_unique_idx.get(pixel_id, -1)
+        if unique_idx < 0:
+            # Pixel was filtered out somewhere (shouldn't happen here)
+            continue
+        packet_charges = adc_packet_list[unique_idx]
+        packet_ticks = adc_packet_ticks[unique_idx]
+        nonzero_packet_mask = packet_charges != 0
+        n_packets = int(nonzero_packet_mask.sum())
+        if n_packets == 0:
+            # No FEE packets issued for this pixel - skip; we can't
+            # provide data-equivalent timing.
+            continue
+        # Largest-packet tick (proxy for primary charge arrival time)
+        largest_packet_index = int(np.argmax(np.abs(packet_charges)))
+        peak_tick = int(packet_ticks[largest_packet_index])
+        first_packet_tick = int(packet_ticks[
+            np.argmax(nonzero_packet_mask)])
+        collected_charge_readout = float(
+            packet_charges[nonzero_packet_mask].sum())
+
         hit_dict[(int(i_x), int(i_y))] = dict(
             halo_index=halo_index,
-            collected_charge=collected_charge,
+            unique_pix_idx=unique_idx,
+            collected_charge=collected_charge_kernel,
+            collected_charge_readout=collected_charge_readout,
             peak_tick=peak_tick,
+            first_packet_tick=first_packet_tick,
+            n_packets=n_packets,
             pixel_id=pixel_id,
         )
     return hit_dict
@@ -406,12 +633,22 @@ def find_zshape_tricells(hit_pixel_dict, minimum_witness_charge_threshold):
                     drift_direction=direction_label,
                     centre_pixel_key=(i_x_center, i_y_center),
                     centre_collected_charge=centre_record['collected_charge'],
+                    centre_collected_charge_readout=centre_record[
+                        'collected_charge_readout'],
                     w1_lo_key=lo_key,
                     w1_lo_collected_charge=lo_record['collected_charge'],
+                    w1_lo_collected_charge_readout=lo_record[
+                        'collected_charge_readout'],
                     w1_hi_key=hi_key,
                     w1_hi_collected_charge=hi_record['collected_charge'],
+                    w1_hi_collected_charge_readout=hi_record[
+                        'collected_charge_readout'],
                     w0_witness_key=witness_w0['key'],
+                    w0_witness_collected_charge_readout=witness_w0[
+                        'record']['collected_charge_readout'],
                     w2_witness_key=witness_w2['key'],
+                    w2_witness_collected_charge_readout=witness_w2[
+                        'record']['collected_charge_readout'],
                     peak_tick_w0_witness=witness_w0['peak_tick'],
                     peak_tick_w1_lo=lo_record['peak_tick'],
                     peak_tick_w1_centre=centre_record['peak_tick'],
@@ -570,7 +807,7 @@ def main():
     consts.load_properties(args.detector, args.pixel_layout,
                            args.response, args.sim_properties)
     from larndsim.consts import detector, physics, sim
-    from larndsim import detsim, drifting, quenching, pixels_from_track
+    from larndsim import detsim, drifting, quenching, pixels_from_track, fee
     id2pixel = pixels_from_track.id2pixel.py_func
 
     response_table = detector.load_response(args.response)
@@ -664,9 +901,20 @@ def main():
                     continue
                 signals = kernel_result['signals']
                 neighboring_pixels = kernel_result['neighboring_pixels']
+                signal_n_ticks = kernel_result['signal_n_ticks']
+                n_electrons_post_drift = kernel_result[
+                    'n_electrons_post_drift']
+
+                fee_output = run_fee_chain(
+                    detector, sim, detsim, fee,
+                    create_xoroshiro128p_states,
+                    signals, neighboring_pixels, signal_n_ticks,
+                    fee_rng_seed=kernel_seed + 1)
+                if fee_output is None:
+                    continue
 
                 hit_pixel_dict = build_hit_pixel_dict(
-                    neighboring_pixels, signals, id2pixel,
+                    neighboring_pixels, signals, fee_output, id2pixel,
                     args.minimum_pixel_charge_threshold)
                 tricells_found = list(find_zshape_tricells(
                     hit_pixel_dict,
@@ -725,6 +973,21 @@ def main():
                     fractional_difference = (
                         (ds_recon_cm - ds_truth_cm) / ds_truth_cm)
 
+                    # FEE / readout-derived dQ/dx.  This is what a data
+                    # calibration would compute: integrated readout
+                    # packet charge on the centre pixel divided by the
+                    # tricell-reconstructed ds.
+                    q_centre_readout = abs(
+                        tricell['centre_collected_charge_readout'])
+                    dQdx_readout_per_dx_recon = (
+                        q_centre_readout / ds_recon_cm)
+                    dQdx_readout_per_dx_truth = (
+                        q_centre_readout / ds_truth_cm)
+                    # Truth: constant for fixed-dEdx muon (n_electrons
+                    # after quench+drift attenuation, per cm of track).
+                    dQdx_truth_per_dx = (n_electrons_post_drift
+                                         / track_length_cm)
+
                     records.append(dict(
                         track_index=track_index,
                         seed_index=seed_index,
@@ -741,15 +1004,22 @@ def main():
                         q_w1_lo=q_w1_lo,
                         q_w1_hi=q_w1_hi,
                         column_axis=tricell['column_axis'],
-                        # Diagnostic: the per-axis deltas that fed
-                        # the ds reconstruction. Lets us refit the
-                        # formula offline.
+                        # Diagnostic: per-axis deltas that fed ds recon
                         delta_w_cm=recon_info['delta_w_cm'],
                         delta_v_cm=recon_info['delta_v_cm'],
                         delta_drift_cm=recon_info['delta_drift_cm'],
-                        delta_t_witness_us=recon_info['delta_t_witness_us'],
+                        delta_t_witness_us=recon_info[
+                            'delta_t_witness_us'],
                         length_witness_to_witness_cm=recon_info[
                             'length_witness_to_witness_cm'],
+                        # FEE / readout dQ/dx (data-applicable)
+                        q_centre_readout=q_centre_readout,
+                        n_electrons_post_drift=n_electrons_post_drift,
+                        dQdx_readout_per_dx_recon=(
+                            dQdx_readout_per_dx_recon),
+                        dQdx_readout_per_dx_truth=(
+                            dQdx_readout_per_dx_truth),
+                        dQdx_truth_per_dx=dQdx_truth_per_dx,
                     ))
                     n_valid_tricells += 1
 
@@ -891,6 +1161,110 @@ def make_summary_plots(records, outdir):
     ax.set_title("Tricell yield vs sentinel-charge threshold")
     ax.grid(alpha=0.3, which="both")
     save_figure(fig, "tricell_ds_yield_vs_sentinel_threshold.png")
+
+    # ===== Readout-derived dQ/dx vs truth dQ/dx (calibration-style) =====
+    dQdx_readout_recon_ds = np.array(
+        [r['dQdx_readout_per_dx_recon'] for r in records])
+    dQdx_readout_truth_ds = np.array(
+        [r['dQdx_readout_per_dx_truth'] for r in records])
+    dQdx_truth = np.array(
+        [r['dQdx_truth_per_dx'] for r in records])
+
+    # Fit calibration factor: median(dQdx_readout / dQdx_truth) for
+    # a tight subsample (high sentinel ratio, sentinel asymmetry ≈ 1)
+    # so the calibration isn't pulled by tricell mis-reco.
+    tight_mask = (sentinel_min_ratio > 0.5)
+    if tight_mask.sum() < 50:
+        tight_mask = sentinel_min_ratio > 0.2
+    calibration_factor_truth_ds = float(np.median(
+        dQdx_readout_truth_ds[tight_mask] / dQdx_truth[tight_mask]))
+
+    # 4. Calibration-style histogram: readout/truth using truth ds
+    fig, ax = plt.subplots(figsize=(10, 5.5))
+    raw_ratio = dQdx_readout_truth_ds / dQdx_truth
+    histogram_bins_cal = np.linspace(
+        np.percentile(raw_ratio, 1) * 0.5,
+        np.percentile(raw_ratio, 99) * 1.1, 80)
+    ax.hist(raw_ratio, bins=histogram_bins_cal, alpha=0.55,
+            label=(f"all tricells: median="
+                   f"{np.median(raw_ratio):.4f}"),
+            color="C0")
+    ax.hist(raw_ratio[tight_mask], bins=histogram_bins_cal, alpha=0.65,
+            label=(f"tight subsample (sentinel ratio > 0.5): "
+                   f"median={calibration_factor_truth_ds:.4f}"),
+            color="C1")
+    ax.axvline(calibration_factor_truth_ds, color="k", ls="--", lw=0.8,
+               label=(f"fitted calibration "
+                      f"factor = {calibration_factor_truth_ds:.4f}"))
+    ax.set_xlabel(
+        "dQ/dx_readout / dQ/dx_truth  (using truth ds in denominator)")
+    ax.set_ylabel("tricell count")
+    ax.set_title(
+        "Readout-derived dQ/dx vs truth dQ/dx (uncalibrated)\n"
+        "Width of the distribution reflects readout-only fluctuations; "
+        "the median sets the calibration factor.")
+    ax.legend(fontsize=9)
+    ax.grid(alpha=0.3)
+    save_figure(fig, "tricell_dQdx_readout_vs_truth_uncalibrated.png")
+
+    # 5. Calibrated readout dQ/dx vs truth, using tricell-recon ds
+    calibrated_readout_recon_ds = (dQdx_readout_recon_ds
+                                   / calibration_factor_truth_ds)
+    calibrated_ratio = calibrated_readout_recon_ds / dQdx_truth
+    fig, ax = plt.subplots(figsize=(10, 5.5))
+    histogram_bins_calib = np.linspace(
+        np.percentile(calibrated_ratio, 1) * 0.9,
+        np.percentile(calibrated_ratio, 99) * 1.1, 80)
+    for sentinel_cut, color, label_prefix in [
+        (0.0, "C0", "all tricells"),
+        (0.10, "C1", "sentinel ≥ 0.10"),
+        (0.20, "C2", "sentinel ≥ 0.20"),
+    ]:
+        mask = sentinel_min_ratio >= sentinel_cut
+        if mask.sum() == 0:
+            continue
+        sub = calibrated_ratio[mask]
+        ax.hist(sub, bins=histogram_bins_calib, alpha=0.45,
+                label=(f"{label_prefix}: N={mask.sum()}, "
+                       f"median={np.median(sub):.3f}, "
+                       f"mean={np.mean(sub):.3f}"),
+                color=color)
+    ax.axvline(1.0, color="k", ls="--", lw=0.6,
+               label="perfect calibration")
+    ax.set_xlabel(
+        "(calibrated dQ/dx_readout) / dQ/dx_truth  "
+        "using tricell-reconstructed ds in denominator")
+    ax.set_ylabel("tricell count")
+    ax.set_title(
+        "Calibrated readout dQ/dx vs truth dQ/dx\n"
+        f"(calibration constant {calibration_factor_truth_ds:.4f} "
+        "fitted from high-sentinel-ratio subsample with truth ds)\n"
+        "Deviation from 1.0 here mixes ds-reconstruction error and "
+        "any residual charge-collection bias.")
+    ax.legend(fontsize=9)
+    ax.grid(alpha=0.3)
+    save_figure(fig, "tricell_dQdx_readout_calibrated_vs_truth.png")
+
+    # 6. Calibrated dQ/dx ratio vs reconstructed ds (data-only view)
+    fig, ax = plt.subplots(figsize=(10, 5.5))
+    ds_recon_cm_arr = np.array([r['ds_recon_cm'] for r in records])
+    bins_ds = np.linspace(np.percentile(ds_recon_cm_arr, 1),
+                          np.percentile(ds_recon_cm_arr, 99), 10)
+    bin_means, bin_stderrs, bin_centres = binned_mean_and_stderr(
+        ds_recon_cm_arr, calibrated_ratio, bins_ds)
+    ax.errorbar(bin_centres, bin_means, yerr=bin_stderrs,
+                marker="o", capsize=3, color="C2",
+                label="(calibrated readout dQ/dx) / dQ/dx_truth")
+    ax.axhline(1.0, color="k", ls="--", lw=0.6,
+               label="perfect calibration")
+    ax.set_xlabel("reconstructed ds (tricell) [cm]")
+    ax.set_ylabel("calibrated dQ/dx ratio")
+    ax.set_title("Calibrated readout dQ/dx vs reconstructed ds\n"
+                 "(data-only view: would be flat if calibration is "
+                 "ds-independent)")
+    ax.legend(fontsize=9)
+    ax.grid(alpha=0.3)
+    save_figure(fig, "tricell_dQdx_calibrated_vs_recon_ds.png")
 
     # ---- Console summary ----
     print("\n" + "=" * 70)
