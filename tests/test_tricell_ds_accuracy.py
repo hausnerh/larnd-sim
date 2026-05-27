@@ -44,28 +44,32 @@ charge on the sentinels. Requiring a minimum sentinel-to-center charge
 ratio is hypothesised to reject those corner-clip tricells where ds
 reconstruction is most likely to be wildly off.
 
-Pre-cuts (all overrideable; defaults tuned to keep maximum yield
-while suppressing halo-fringe contamination):
+Pre-cuts: ALL applied on FEE-readout quantities so the same
+selection can be applied verbatim to real data.
 
-  - --minimum-pixel-charge-threshold (default 3000)
-      Pixels with |Q| below this never enter the hit dict. Above the
-      fringe floor (~1e3) but well below any real-track pixel (≥1e4).
-  - --minimum-target-charge (default 25000)
-      Absolute floor on the tricell target (centre) pixel's charge.
-      Comfortably above the fringe-target outlier regime (~8000)
-      while admitting low-ds tricells.
-  - --minimum-witness-charge-threshold (default 10000)
-      Absolute floor on witness pixel charge.
+  - --minimum-pixel-charge-threshold (default 5000 e⁻)
+      Sum of FEE ADC packets on a pixel must exceed this for the
+      pixel to enter the hit dict. FEE discriminator threshold is
+      5000 e⁻ — so any pixel with at least one packet satisfies this
+      by construction.
+  - --minimum-target-charge (default 15000 e⁻)
+      FEE-readout sum on the tricell target pixel must exceed this
+      (≈ 3 packets worth).
+  - --minimum-witness-charge-threshold (default 10000 e⁻)
+      FEE-readout sum on each witness pixel must exceed this.
   - --maximum-sentinel-asymmetry (default 20)
-      max(|Q_w1_top|, |Q_w1_bottom|) / min(|Q_w1_top|, |Q_w1_bottom|)
-      below this. Loose enough to keep asymmetric-but-real cases.
+      max(Q_w1_top, Q_w1_bottom) / min(Q_w1_top, Q_w1_bottom) below
+      this — uses FEE-readout charges, dimensionless ratio so the
+      scale doesn't matter.
   - --minimum-ds-truth-cm (default 0, off)
-      Truth ds is a diagnostic-only quantity. The charge cuts above
-      already suppress corner-clippers via dQ ∝ ds. The flag is kept
-      as an optional knob.
+      Truth ds is the only sim-only quantity, kept as an optional
+      diagnostic knob. The charge cuts above already suppress
+      corner-clippers via dQ ∝ ds without needing this.
 
-The sentinel-ratio threshold scan in the plots is then performed on
-the surviving sample.
+All selection and threshold-scan logic in the plots uses these
+same FEE-readout quantities; the kernel response sum is saved as a
+diagnostic (`collected_charge_raw_kernel`) but never used for
+selection.
 
 OUTPUTS
 -------
@@ -467,27 +471,26 @@ def segment_length_through_pixel_pillar(segment_start_xyz, segment_end_xyz,
 def build_hit_pixel_dict(neighboring_pixels, signals,
                          fee_output, id2pixel_fn,
                          minimum_pixel_charge_threshold):
-    """Build a per-pixel hit dict combining:
-      - the kernel response charge (sum(signals[ipix, :]) -- used for
-        halo-fringe cuts because the cuts were calibrated on this scale)
-      - the FEE-derived packet charges + packet ticks (data-applicable
-        timing and the actual readout charge)
+    """Build a per-pixel hit dict from the FEE-readout packet stream.
 
-    For each pixel that passes |kernel_response| > threshold, we look
-    up its packet stream from the FEE output and record:
-      peak_tick           : tick of the LARGEST FEE packet (proxies the
-                             discriminator trigger time of the dominant
-                             charge deposit; the data equivalent of
-                             argmax-of-waveform but on packets only)
-      first_packet_tick   : tick of the first non-zero FEE packet
-      collected_charge_kernel : sum(signals[ipix, :])  (response units)
-      collected_charge_readout: sum(adc_packet_list[unique_pix_idx, :])
-                                 (electrons, by the FEE units convention)
-      n_packets           : count of nonzero packets
+    Every quantity used for downstream cuts is RECO-LEVEL: derivable
+    from real-data packets alone. The kernel response sum is also
+    saved as a diagnostic but is NOT used for any selection.
 
-    Pixels in the halo that produced no FEE packets are skipped.
+    Per-pixel fields:
+      collected_charge        : sum of ADC packet charges (FEE readout;
+                                 the data-applicable charge). Used for
+                                 all halo-fringe and tricell cuts.
+      collected_charge_raw    : sum(signals[ipix, :]); kernel response
+                                 (diagnostic only — would not exist on
+                                 real data).
+      peak_tick               : tick of the largest ADC packet.
+      first_packet_tick       : tick of the first nonzero ADC packet.
+      n_packets               : count of nonzero packets.
+
+    Pixels in the halo that produce zero FEE packets are skipped --
+    in data we would not see them.
     """
-    # Build lookup: pixel_id -> index in unique_pix
     unique_pix = fee_output['unique_pix']
     adc_packet_list = fee_output['adc_packet_list']
     adc_packet_ticks = fee_output['adc_packet_ticks']
@@ -502,39 +505,38 @@ def build_hit_pixel_dict(neighboring_pixels, signals,
             continue
         i_x, i_y, plane_id = id2pixel_fn(pixel_id)
 
-        # Halo-fringe cut on RAW response charge (preserves earlier
-        # threshold calibration).
-        signal_trace = signals[0, halo_index, :]
-        collected_charge_kernel = float(signal_trace.sum())
-        if abs(collected_charge_kernel) < minimum_pixel_charge_threshold:
-            continue
-
-        # FEE packet info for this pixel (if it produced packets)
         unique_idx = pixel_id_to_unique_idx.get(pixel_id, -1)
         if unique_idx < 0:
-            # Pixel was filtered out somewhere (shouldn't happen here)
             continue
         packet_charges = adc_packet_list[unique_idx]
         packet_ticks = adc_packet_ticks[unique_idx]
         nonzero_packet_mask = packet_charges != 0
         n_packets = int(nonzero_packet_mask.sum())
         if n_packets == 0:
-            # No FEE packets issued for this pixel - skip; we can't
-            # provide data-equivalent timing.
+            # Pixel produced no FEE packets — invisible in data.
             continue
-        # Largest-packet tick (proxy for primary charge arrival time)
+        # FEE-readout total charge for this pixel
+        collected_charge_readout = float(
+            packet_charges[nonzero_packet_mask].sum())
+        # Apply the halo-fringe cut on the READOUT charge (data-only)
+        if abs(collected_charge_readout) < minimum_pixel_charge_threshold:
+            continue
+        # Raw kernel response — saved for diagnostics only
+        signal_trace = signals[0, halo_index, :]
+        collected_charge_raw = float(signal_trace.sum())
+
+        # Largest-packet tick = data analog of "discriminator trigger
+        # for the dominant charge arrival"
         largest_packet_index = int(np.argmax(np.abs(packet_charges)))
         peak_tick = int(packet_ticks[largest_packet_index])
         first_packet_tick = int(packet_ticks[
             np.argmax(nonzero_packet_mask)])
-        collected_charge_readout = float(
-            packet_charges[nonzero_packet_mask].sum())
 
         hit_dict[(int(i_x), int(i_y))] = dict(
             halo_index=halo_index,
             unique_pix_idx=unique_idx,
-            collected_charge=collected_charge_kernel,
-            collected_charge_readout=collected_charge_readout,
+            collected_charge=collected_charge_readout,       # cuts use this
+            collected_charge_raw=collected_charge_raw,        # diagnostic
             peak_tick=peak_tick,
             first_packet_tick=first_packet_tick,
             n_packets=n_packets,
@@ -632,23 +634,24 @@ def find_zshape_tricells(hit_pixel_dict, minimum_witness_charge_threshold):
                     traversal_axis=tricell_orientation['traversal_axis'],
                     drift_direction=direction_label,
                     centre_pixel_key=(i_x_center, i_y_center),
-                    centre_collected_charge=centre_record['collected_charge'],
-                    centre_collected_charge_readout=centre_record[
-                        'collected_charge_readout'],
+                    centre_collected_charge=(
+                        centre_record['collected_charge']),
+                    centre_collected_charge_raw=(
+                        centre_record['collected_charge_raw']),
                     w1_lo_key=lo_key,
                     w1_lo_collected_charge=lo_record['collected_charge'],
-                    w1_lo_collected_charge_readout=lo_record[
-                        'collected_charge_readout'],
+                    w1_lo_collected_charge_raw=(
+                        lo_record['collected_charge_raw']),
                     w1_hi_key=hi_key,
                     w1_hi_collected_charge=hi_record['collected_charge'],
-                    w1_hi_collected_charge_readout=hi_record[
-                        'collected_charge_readout'],
+                    w1_hi_collected_charge_raw=(
+                        hi_record['collected_charge_raw']),
                     w0_witness_key=witness_w0['key'],
-                    w0_witness_collected_charge_readout=witness_w0[
-                        'record']['collected_charge_readout'],
+                    w0_witness_collected_charge=(
+                        witness_w0['record']['collected_charge']),
                     w2_witness_key=witness_w2['key'],
-                    w2_witness_collected_charge_readout=witness_w2[
-                        'record']['collected_charge_readout'],
+                    w2_witness_collected_charge=(
+                        witness_w2['record']['collected_charge']),
                     peak_tick_w0_witness=witness_w0['peak_tick'],
                     peak_tick_w1_lo=lo_record['peak_tick'],
                     peak_tick_w1_centre=centre_record['peak_tick'],
@@ -759,25 +762,25 @@ def main():
     arg_parser.add_argument(
         "--track-dEdx-MeV-per-cm", type=float, default=2.0)
     arg_parser.add_argument(
-        "--minimum-pixel-charge-threshold", type=float, default=3000.0,
-        help="minimum |Q| (response units) for a pixel to enter the "
-             "hit dict. Default 3000 ≈ 1 percent of typical real-"
-             "track centre charge (~3e5); above the fringe floor "
-             "(~1e3) so still keeps halo out. Earlier defaults of "
-             "10000 were unnecessarily strict.")
+        "--minimum-pixel-charge-threshold", type=float, default=5000.0,
+        help="minimum |Q| (FEE readout charge, electrons) for a pixel "
+             "to enter the hit dict. The FEE discriminator threshold "
+             "is DISCRIMINATION_THRESHOLD = 5000 e⁻, so by construction "
+             "any pixel with a packet has ≥ 5000 e⁻ accumulated. "
+             "Default 5000 (effectively keeps any pixel with at least "
+             "one issued packet).")
     arg_parser.add_argument(
         "--minimum-witness-charge-threshold", type=float, default=10000.0,
-        help="absolute minimum |Q| (response units) required of "
-             "witness pixels. Default 10000 ≈ 3 percent of typical "
-             "real-track centre charge. Earlier 30000 was over-strict "
-             "given p10 of real surviving witness charges sits at "
-             "~2e4 (rejects too many real-track witnesses).")
+        help="absolute minimum |Q| (FEE readout charge, electrons) "
+             "required of witness pixels. Default 10000 ≈ 2 "
+             "discriminator-threshold worth.")
     arg_parser.add_argument(
-        "--minimum-target-charge", type=float, default=25000.0,
-        help="absolute minimum |Q| required of the tricell target "
-             "(centre) pixel. Default 25000 ≈ 8 percent of typical "
-             "real-track centre charge. Comfortably above the "
-             "fringe-target outliers that had q_centre ≈ 8000.")
+        "--minimum-target-charge", type=float, default=15000.0,
+        help="absolute minimum |Q| (FEE readout charge, electrons) "
+             "required of the tricell target (centre) pixel. Default "
+             "15000 ≈ 3 discriminator-threshold worth. The cut is "
+             "meaningful for fringe rejection because the FEE itself "
+             "rarely lets ≥ 3 packets get through on a fringe pixel.")
     arg_parser.add_argument(
         "--maximum-sentinel-asymmetry", type=float, default=20.0,
         help="max(|Q_w1_top|, |Q_w1_bottom|) / min(|Q_w1_top|, "
@@ -944,12 +947,16 @@ def main():
                         cut_rejection_counts['ds_truth_below_threshold'] += 1
                         continue
 
-                    # Absolute charge cuts.
+                    # Absolute charge cuts (all on FEE-readout charge,
+                    # so the same cut definitions apply to real data).
                     q_centre = abs(tricell['centre_collected_charge'])
                     q_w1_lo = abs(tricell['w1_lo_collected_charge'])
                     q_w1_hi = abs(tricell['w1_hi_collected_charge'])
+                    q_centre_raw_kernel = abs(
+                        tricell['centre_collected_charge_raw'])
                     if q_centre < args.minimum_target_charge:
-                        cut_rejection_counts['target_charge_below_threshold'] += 1
+                        cut_rejection_counts[
+                            'target_charge_below_threshold'] += 1
                         continue
 
                     # Sentinel asymmetry cut: catches cases where one
@@ -973,16 +980,14 @@ def main():
                     fractional_difference = (
                         (ds_recon_cm - ds_truth_cm) / ds_truth_cm)
 
-                    # FEE / readout-derived dQ/dx.  This is what a data
-                    # calibration would compute: integrated readout
-                    # packet charge on the centre pixel divided by the
-                    # tricell-reconstructed ds.
-                    q_centre_readout = abs(
-                        tricell['centre_collected_charge_readout'])
-                    dQdx_readout_per_dx_recon = (
-                        q_centre_readout / ds_recon_cm)
-                    dQdx_readout_per_dx_truth = (
-                        q_centre_readout / ds_truth_cm)
+                    # FEE / readout-derived dQ/dx -- the data-style
+                    # measurement: integrated readout packet charge on
+                    # the centre pixel divided by tricell-recon ds.
+                    # q_centre IS the FEE readout charge (in the
+                    # FEE charge units, comparable to electrons after
+                    # FEE gain).
+                    dQdx_readout_per_dx_recon = q_centre / ds_recon_cm
+                    dQdx_readout_per_dx_truth = q_centre / ds_truth_cm
                     # Truth: constant for fixed-dEdx muon (n_electrons
                     # after quench+drift attenuation, per cm of track).
                     dQdx_truth_per_dx = (n_electrons_post_drift
@@ -1012,8 +1017,9 @@ def main():
                             'delta_t_witness_us'],
                         length_witness_to_witness_cm=recon_info[
                             'length_witness_to_witness_cm'],
-                        # FEE / readout dQ/dx (data-applicable)
-                        q_centre_readout=q_centre_readout,
+                        # FEE / readout dQ/dx (data-applicable; q_centre
+                        # is already the FEE-readout charge)
+                        q_centre_raw_kernel=q_centre_raw_kernel,
                         n_electrons_post_drift=n_electrons_post_drift,
                         dQdx_readout_per_dx_recon=(
                             dQdx_readout_per_dx_recon),
