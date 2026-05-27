@@ -428,7 +428,8 @@ def reconstruct_ds_witness_to_witness(tricell, detector, time_sampling_us):
       L = sqrt(delta_w² + delta_v² + delta_drift²)
       ds_middle_pixel = L * pixel_pitch / |delta_v|
 
-    Returns (ds_cm, L_cm) or (None, None) if delta_v == 0.
+    Returns dict with ds_cm, L_cm, and all the input deltas for
+    downstream diagnostics; or None if delta_v == 0.
     """
     pitch_cm = detector.PIXEL_PITCH
     v_drift = detector.V_DRIFT
@@ -450,16 +451,24 @@ def reconstruct_ds_witness_to_witness(tricell, detector, time_sampling_us):
         delta_v_cm = x_w2 - x_w0
 
     # Witness columns w_0 and w_2 are always exactly 2 pitches apart
-    # in the column direction (the index of the w_0 column is
-    # w_1_index − 1 and w_2 is w_1_index + 1, both centered).
+    # in the column direction.
     delta_w_cm = 2.0 * pitch_cm
 
     if delta_v_cm == 0:
-        return None, None
+        return None
     length_cm = sqrt(
         delta_w_cm ** 2 + delta_v_cm ** 2 + delta_drift_cm ** 2)
     ds_middle_pixel_cm = length_cm * pitch_cm / abs(delta_v_cm)
-    return ds_middle_pixel_cm, length_cm
+    return dict(
+        ds_recon_cm=ds_middle_pixel_cm,
+        length_witness_to_witness_cm=length_cm,
+        delta_w_cm=delta_w_cm,
+        delta_v_cm=delta_v_cm,
+        delta_drift_cm=delta_drift_cm,
+        delta_t_witness_us=delta_t_us,
+        w0_witness_xy_cm=(x_w0, y_w0),
+        w2_witness_xy_cm=(x_w2, y_w2),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -647,11 +656,12 @@ def main():
                 for tricell in tricells_found:
                     n_tricells_examined += 1
 
-                    ds_recon_cm, _ = reconstruct_ds_witness_to_witness(
+                    recon_info = reconstruct_ds_witness_to_witness(
                         tricell, detector, detector.TIME_SAMPLING)
-                    if ds_recon_cm is None:
+                    if recon_info is None:
                         cut_rejection_counts['ds_recon_failed'] += 1
                         continue
+                    ds_recon_cm = recon_info['ds_recon_cm']
 
                     i_x_center, i_y_center = tricell['centre_pixel_key']
                     x_center_cm, y_center_cm = pixel_indices_to_center(
@@ -712,6 +722,15 @@ def main():
                         q_w1_lo=q_w1_lo,
                         q_w1_hi=q_w1_hi,
                         column_axis=tricell['column_axis'],
+                        # Diagnostic: the per-axis deltas that fed
+                        # the ds reconstruction. Lets us refit the
+                        # formula offline.
+                        delta_w_cm=recon_info['delta_w_cm'],
+                        delta_v_cm=recon_info['delta_v_cm'],
+                        delta_drift_cm=recon_info['delta_drift_cm'],
+                        delta_t_witness_us=recon_info['delta_t_witness_us'],
+                        length_witness_to_witness_cm=recon_info[
+                            'length_witness_to_witness_cm'],
                     ))
                     n_valid_tricells += 1
 
