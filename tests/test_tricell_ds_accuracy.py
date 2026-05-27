@@ -1298,5 +1298,27 @@ def make_summary_plots(records, outdir):
     print("=" * 70)
 
 
+def binned_mean_and_stderr(x_values, y_values, x_bins):
+    """Bin y by x and return (means, stderrs, bin_centres) per bin."""
+    bin_indices = np.digitize(x_values, x_bins) - 1
+    means = []
+    stderrs = []
+    bin_centres = []
+    for bin_index in range(len(x_bins) - 1):
+        mask = (bin_indices == bin_index) & np.isfinite(y_values)
+        values_in_bin = y_values[mask]
+        if len(values_in_bin) >= 2:
+            means.append(float(np.mean(values_in_bin)))
+            stderrs.append(
+                float(np.std(values_in_bin)) / sqrt(len(values_in_bin)))
+        else:
+            means.append(np.nan)
+            stderrs.append(np.nan)
+        bin_centres.append(
+            0.5 * (x_bins[bin_index] + x_bins[bin_index + 1]))
+    return (np.array(means), np.array(stderrs),
+            np.array(bin_centres))
+
+
 if __name__ == "__main__":
     main()
