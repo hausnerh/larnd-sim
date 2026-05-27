@@ -525,10 +525,20 @@ def build_hit_pixel_dict(neighboring_pixels, signals,
         signal_trace = signals[0, halo_index, :]
         collected_charge_raw = float(signal_trace.sum())
 
-        # Largest-packet tick = data analog of "discriminator trigger
-        # for the dominant charge arrival"
+        # Two candidate timing definitions, both from real data:
+        #   - first_packet_tick: time of the FIRST discriminator trigger
+        #     on this pixel (the rising-edge of integrated charge —
+        #     closest to when significant charge first arrived).
+        #   - largest_packet_tick: time of the largest ADC packet
+        #     (which window collected the most charge — depends on
+        #     FEE integration timing and is often a poor proxy for
+        #     spatial reconstruction).
+        # For tricell ds-recon the first-packet tick is more directly
+        # tied to the substep contribution time; use it as the
+        # primary `peak_tick`. Both are saved in the per-pixel record
+        # so the choice can be revisited offline.
         largest_packet_index = int(np.argmax(np.abs(packet_charges)))
-        peak_tick = int(packet_ticks[largest_packet_index])
+        largest_packet_tick = int(packet_ticks[largest_packet_index])
         first_packet_tick = int(packet_ticks[
             np.argmax(nonzero_packet_mask)])
 
@@ -537,8 +547,9 @@ def build_hit_pixel_dict(neighboring_pixels, signals,
             unique_pix_idx=unique_idx,
             collected_charge=collected_charge_readout,       # cuts use this
             collected_charge_raw=collected_charge_raw,        # diagnostic
-            peak_tick=peak_tick,
-            first_packet_tick=first_packet_tick,
+            peak_tick=first_packet_tick,                     # data-style ts
+            largest_packet_tick=largest_packet_tick,         # diagnostic
+            first_packet_tick=first_packet_tick,             # diagnostic
             n_packets=n_packets,
             pixel_id=pixel_id,
         )
