@@ -468,6 +468,49 @@ def segment_length_through_pixel_pillar(segment_start_xyz, segment_end_xyz,
 # ---------------------------------------------------------------------------
 # Tricell finder + ds reconstruction (witness-to-witness, consistent span)
 # ---------------------------------------------------------------------------
+def per_pixel_charge_centroid_time(packet_ticks, packet_charges):
+    """Charge-weighted centroid of packet times for one pixel.
+
+    Captures the moment when the bulk of induced charge is arriving
+    on the pad — close to the substep-closest-approach time for that
+    pad — instead of the leading-edge or peak-window time.
+    """
+    valid = packet_charges > 0
+    if not np.any(valid):
+        return None
+    return float(np.sum(packet_ticks[valid] * packet_charges[valid])
+                 / np.sum(packet_charges[valid]))
+
+
+def per_pixel_50pct_time(packet_ticks, packet_charges):
+    """Tick at which 50% of the total integrated charge has been
+    accumulated on the pixel (median arrival time across the packet
+    stream). Linear interpolation between the two bracketing packets.
+
+    More robust than the centroid against a single outlier packet.
+    """
+    valid = packet_charges > 0
+    if not np.any(valid):
+        return None
+    # Sort packets chronologically.
+    sort_idx = np.argsort(packet_ticks[valid])
+    t = packet_ticks[valid][sort_idx]
+    q = packet_charges[valid][sort_idx]
+    cumulative_charge = np.cumsum(q)
+    half_charge = 0.5 * cumulative_charge[-1]
+    idx = int(np.searchsorted(cumulative_charge, half_charge))
+    if idx == 0:
+        return float(t[0])
+    if idx >= len(t):
+        return float(t[-1])
+    c_before = cumulative_charge[idx - 1]
+    c_after = cumulative_charge[idx]
+    interp_frac = ((half_charge - c_before)
+                   / (c_after - c_before)
+                   if c_after > c_before else 0.0)
+    return float(t[idx - 1] + interp_frac * (t[idx] - t[idx - 1]))
+
+
 def build_hit_pixel_dict(neighboring_pixels, signals,
                          fee_output, id2pixel_fn,
                          minimum_pixel_charge_threshold):
@@ -525,29 +568,43 @@ def build_hit_pixel_dict(neighboring_pixels, signals,
         signal_trace = signals[0, halo_index, :]
         collected_charge_raw = float(signal_trace.sum())
 
-        # Two candidate timing definitions, both from real data:
-        #   - first_packet_tick: time of the FIRST discriminator trigger
-        #     on this pixel (the rising-edge of integrated charge —
-        #     closest to when significant charge first arrived).
-        #   - largest_packet_tick: time of the largest ADC packet
-        #     (which window collected the most charge — depends on
-        #     FEE integration timing and is often a poor proxy for
-        #     spatial reconstruction).
-        # For tricell ds-recon the first-packet tick is more directly
-        # tied to the substep contribution time; use it as the
-        # primary `peak_tick`. Both are saved in the per-pixel record
-        # so the choice can be revisited offline.
+        # Four candidate timing definitions, all derivable from the
+        # data packet stream:
+        #   - first_packet_tick    : time of the FIRST discriminator
+        #     trigger (leading edge of integrated charge; dominated by
+        #     earliest-arriving substep — collapses across witnesses
+        #     for vertical tracks).
+        #   - largest_packet_tick  : tick of the largest ADC packet
+        #     (window with the most charge — depends on FEE
+        #     integration timing; poor spatial reconstruction).
+        #   - centroid_tick        : charge-weighted centroid over all
+        #     packets. Tracks the bulk-charge arrival, which for a
+        #     given pixel is dominated by the closest-approach
+        #     substep. This is the primary `peak_tick`.
+        #   - tick_50pct           : tick at which 50% of total charge
+        #     has accumulated. More robust to outlier packets than
+        #     the centroid.
         largest_packet_index = int(np.argmax(np.abs(packet_charges)))
-        largest_packet_tick = int(packet_ticks[largest_packet_index])
-        first_packet_tick = int(packet_ticks[
+        largest_packet_tick = float(packet_ticks[largest_packet_index])
+        first_packet_tick = float(packet_ticks[
             np.argmax(nonzero_packet_mask)])
+        centroid_tick = per_pixel_charge_centroid_time(
+            packet_ticks, packet_charges)
+        tick_50pct = per_pixel_50pct_time(
+            packet_ticks, packet_charges)
+        # Primary timing: centroid (best track of bulk-charge arrival).
+        # Fallback to first_packet_tick if centroid is None (zero-q).
+        peak_tick = (centroid_tick
+                     if centroid_tick is not None else first_packet_tick)
 
         hit_dict[(int(i_x), int(i_y))] = dict(
             halo_index=halo_index,
             unique_pix_idx=unique_idx,
             collected_charge=collected_charge_readout,       # cuts use this
             collected_charge_raw=collected_charge_raw,        # diagnostic
-            peak_tick=first_packet_tick,                     # data-style ts
+            peak_tick=peak_tick,                             # data-style ts
+            centroid_tick=centroid_tick,                     # diagnostic
+            tick_50pct=tick_50pct,                           # diagnostic
             largest_packet_tick=largest_packet_tick,         # diagnostic
             first_packet_tick=first_packet_tick,             # diagnostic
             n_packets=n_packets,
@@ -663,11 +720,29 @@ def find_zshape_tricells(hit_pixel_dict, minimum_witness_charge_threshold):
                     w2_witness_key=witness_w2['key'],
                     w2_witness_collected_charge=(
                         witness_w2['record']['collected_charge']),
+                    # Primary timing per pixel (used by ds-recon below)
                     peak_tick_w0_witness=witness_w0['peak_tick'],
                     peak_tick_w1_lo=lo_record['peak_tick'],
                     peak_tick_w1_centre=centre_record['peak_tick'],
                     peak_tick_w1_hi=hi_record['peak_tick'],
                     peak_tick_w2_witness=witness_w2['peak_tick'],
+                    # Alternative per-pixel timings for offline reproc
+                    w0_witness_centroid_tick=(
+                        witness_w0['record']['centroid_tick']),
+                    w2_witness_centroid_tick=(
+                        witness_w2['record']['centroid_tick']),
+                    w0_witness_50pct_tick=(
+                        witness_w0['record']['tick_50pct']),
+                    w2_witness_50pct_tick=(
+                        witness_w2['record']['tick_50pct']),
+                    w0_witness_first_packet_tick=(
+                        witness_w0['record']['first_packet_tick']),
+                    w2_witness_first_packet_tick=(
+                        witness_w2['record']['first_packet_tick']),
+                    w0_witness_largest_packet_tick=(
+                        witness_w0['record']['largest_packet_tick']),
+                    w2_witness_largest_packet_tick=(
+                        witness_w2['record']['largest_packet_tick']),
                 )
 
 
@@ -1037,6 +1112,25 @@ def main():
                         dQdx_readout_per_dx_truth=(
                             dQdx_readout_per_dx_truth),
                         dQdx_truth_per_dx=dQdx_truth_per_dx,
+                        # Alternative witness timings — save for offline
+                        # reprocessing (recompute ds with different
+                        # timing extractors and compare).
+                        w0_centroid_tick=tricell[
+                            'w0_witness_centroid_tick'],
+                        w2_centroid_tick=tricell[
+                            'w2_witness_centroid_tick'],
+                        w0_50pct_tick=tricell[
+                            'w0_witness_50pct_tick'],
+                        w2_50pct_tick=tricell[
+                            'w2_witness_50pct_tick'],
+                        w0_first_tick=tricell[
+                            'w0_witness_first_packet_tick'],
+                        w2_first_tick=tricell[
+                            'w2_witness_first_packet_tick'],
+                        w0_largest_tick=tricell[
+                            'w0_witness_largest_packet_tick'],
+                        w2_largest_tick=tricell[
+                            'w2_witness_largest_packet_tick'],
                     ))
                     n_valid_tricells += 1
 
