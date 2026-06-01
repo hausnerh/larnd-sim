@@ -37,6 +37,22 @@ The track direction is estimated from witness peak-time deltas:
     L           = sqrt(delta_w² + delta_v² + delta_drift²)
     ds_C_recon  = L * pixel_pitch / |delta_v|
 
+The witness peak times come from the FEE ADC packet ticks, which are
+in MICROSECONDS (run_fee_chain builds time_ticks = arange *
+TIME_SAMPLING, matching production simulate_pixels.py). An earlier
+version multiplied the witness Δt by TIME_SAMPLING a second time,
+shrinking delta_drift 10× and collapsing ds for near-vertical
+(drift-dominated) tracks; that is now fixed. Because delta_w = 1·pitch
+was tuned UNDER that bug, it must be re-checked against post-fix data
+(physically it should be 2·pitch, pad-center-to-pad-center).
+
+The per-pixel timing estimator is selectable via
+--primary-timing-method {centroid,peak_rate,first,largest,median};
+all five are saved to the npz regardless, so the choice can be
+revisited offline. 'peak_rate' is the charge-arrival-rate (inverse
+inter-packet spacing) estimator — the data-portable form of "find the
+maximum of the Δq profile".
+
 The "sentinel" pixels are the top and bottom of the three contiguous
 w_1 pixels — the two w_1 pixels adjacent to the calibration target. A
 track that just clips a corner of the middle pixel won't deposit much
@@ -288,8 +304,10 @@ def run_fee_chain(detector, sim, detsim, fee,
         unique_pix: (N_unique,) deduplicated pixel IDs
         adc_packet_list: (N_unique, MAX_ADC_VALUES) packet ADC values
                           (zero where no packet was issued)
-        adc_packet_ticks: (N_unique, MAX_ADC_VALUES) packet ticks
-                          (in TIME_SAMPLING units)
+        adc_packet_ticks: (N_unique, MAX_ADC_VALUES) packet times
+                          in MICROSECONDS (time_ticks is built as
+                          arange * TIME_SAMPLING, so these are already
+                          scaled to µs — not integer tick indices).
     """
     from numba import cuda as _cuda
 
@@ -511,14 +529,93 @@ def per_pixel_50pct_time(packet_ticks, packet_charges):
     return float(t[idx - 1] + interp_frac * (t[idx] - t[idx - 1]))
 
 
+def per_pixel_peak_charge_rate_time(packet_ticks, packet_charges):
+    """Time of peak charge-arrival RATE on a pixel.
+
+    Data-portable realisation of the user's "look for the maximum of
+    the Δq profile" idea, corrected for how LArPix actually stores
+    packets.
+
+    Each FEE packet is (q_n, t_n). In fee.get_adc_values the
+    accumulator `q_sum` is RESET after every packet (fee.py:707), so
+    q_n is the charge integrated since the previous reset — already a
+    per-packet increment (the "Δq"), NOT a running total. Two facts
+    then make charge RATE the right discriminator:
+
+      * q_n is larger when the instantaneous induced current during
+        the fixed ~1.8 µs integration window is larger, i.e. q_n
+        peaks near the track's closest approach to the pad;
+      * packets are emitted closer together in time when charge
+        arrives faster (the inter-packet gap is set by how quickly
+        q_sum re-crosses threshold, on top of the ~2.8 µs reset+busy
+        dead time).
+
+    So the charge-arrival rate between consecutive packets,
+
+        rate_n = q_n / (t_n - t_{n-1}),
+
+    is doubly peaked at closest approach (numerator up, denominator
+    down). We return the midpoint time of the maximum-rate interval.
+
+    NOTE on resolution: packet times are quantised to >= ~2.8 µs by
+    the reset+busy dead time, and a typical witness emits only a
+    handful of packets. So this estimator can only resolve Δt down to
+    the packet spacing — it does NOT manufacture sub-packet timing.
+    For witnesses dominated by diffusion halo (near-vertical tracks)
+    there is no sharp closest-approach current peak to find and this
+    will track the other estimators; the cure there is a quality cut,
+    not a cleverer single-tick estimator.
+
+    Ticks are in µs (see run_fee_chain). Returns a time in µs, or the
+    single packet's tick if only one packet, or None if no positive
+    packet.
+    """
+    valid = packet_charges > 0
+    if not np.any(valid):
+        return None
+    t = packet_ticks[valid]
+    q = packet_charges[valid]
+    order = np.argsort(t)
+    t = t[order]
+    q = q[order]
+    if len(t) == 1:
+        return float(t[0])
+    inter_packet_dt = np.diff(t)
+    # Guard against zero/negative spacing (packets sharing a tick).
+    inter_packet_dt = np.where(inter_packet_dt > 0,
+                               inter_packet_dt, np.inf)
+    charge_rate = q[1:] / inter_packet_dt          # rate over interval n
+    peak_interval = int(np.argmax(charge_rate))
+    return float(0.5 * (t[peak_interval] + t[peak_interval + 1]))
+
+
+PRIMARY_TIMING_METHODS = (
+    "centroid", "peak_rate", "first", "largest", "median")
+
+
 def build_hit_pixel_dict(neighboring_pixels, signals,
                          fee_output, id2pixel_fn,
-                         minimum_pixel_charge_threshold):
+                         minimum_pixel_charge_threshold,
+                         primary_timing_method="centroid"):
     """Build a per-pixel hit dict from the FEE-readout packet stream.
 
     Every quantity used for downstream cuts is RECO-LEVEL: derivable
     from real-data packets alone. The kernel response sum is also
     saved as a diagnostic but is NOT used for any selection.
+
+    `primary_timing_method` selects which packet-timing estimator
+    becomes the per-pixel `peak_tick` that drives witness ordering and
+    ds reconstruction. All five estimators are always saved per pixel,
+    so the choice can be revisited offline from the npz without
+    re-running the kernel. Options (see PRIMARY_TIMING_METHODS):
+      centroid  : charge-weighted mean packet time (default — status
+                  quo, isolates the Δt units-bug fix when compared to
+                  prior runs).
+      peak_rate : time of peak charge-arrival rate (per_pixel_peak_
+                  charge_rate_time).
+      first     : first nonzero packet tick.
+      largest   : tick of the largest |packet|.
+      median    : 50%-integrated-charge tick.
 
     Per-pixel fields:
       collected_charge        : sum of ADC packet charges (FEE readout;
@@ -527,13 +624,21 @@ def build_hit_pixel_dict(neighboring_pixels, signals,
       collected_charge_raw    : sum(signals[ipix, :]); kernel response
                                  (diagnostic only — would not exist on
                                  real data).
-      peak_tick               : tick of the largest ADC packet.
-      first_packet_tick       : tick of the first nonzero ADC packet.
+      peak_tick               : the selected primary timing (µs).
+      centroid_tick           : charge-weighted centroid (µs).
+      peak_rate_tick          : peak charge-rate time (µs).
+      tick_50pct              : 50%-charge time (µs).
+      first_packet_tick       : first nonzero packet tick (µs).
+      largest_packet_tick     : largest-packet tick (µs).
       n_packets               : count of nonzero packets.
 
     Pixels in the halo that produce zero FEE packets are skipped --
     in data we would not see them.
     """
+    if primary_timing_method not in PRIMARY_TIMING_METHODS:
+        raise ValueError(
+            f"primary_timing_method must be one of "
+            f"{PRIMARY_TIMING_METHODS}, got {primary_timing_method!r}")
     unique_pix = fee_output['unique_pix']
     adc_packet_list = fee_output['adc_packet_list']
     adc_packet_ticks = fee_output['adc_packet_ticks']
@@ -592,18 +697,31 @@ def build_hit_pixel_dict(neighboring_pixels, signals,
             packet_ticks, packet_charges)
         tick_50pct = per_pixel_50pct_time(
             packet_ticks, packet_charges)
-        # Primary timing: centroid (best track of bulk-charge arrival).
-        # Fallback to first_packet_tick if centroid is None (zero-q).
-        peak_tick = (centroid_tick
-                     if centroid_tick is not None else first_packet_tick)
+        peak_rate_tick = per_pixel_peak_charge_rate_time(
+            packet_ticks, packet_charges)
+
+        # Select the primary timing per the requested method, with a
+        # graceful fallback to first_packet_tick if the estimator
+        # returns None (e.g. zero-charge edge case).
+        timing_candidates = dict(
+            centroid=centroid_tick,
+            peak_rate=peak_rate_tick,
+            first=first_packet_tick,
+            largest=largest_packet_tick,
+            median=tick_50pct,
+        )
+        peak_tick = timing_candidates[primary_timing_method]
+        if peak_tick is None:
+            peak_tick = first_packet_tick
 
         hit_dict[(int(i_x), int(i_y))] = dict(
             halo_index=halo_index,
             unique_pix_idx=unique_idx,
             collected_charge=collected_charge_readout,       # cuts use this
             collected_charge_raw=collected_charge_raw,        # diagnostic
-            peak_tick=peak_tick,                             # data-style ts
+            peak_tick=peak_tick,                             # primary ts
             centroid_tick=centroid_tick,                     # diagnostic
+            peak_rate_tick=peak_rate_tick,                   # diagnostic
             tick_50pct=tick_50pct,                           # diagnostic
             largest_packet_tick=largest_packet_tick,         # diagnostic
             first_packet_tick=first_packet_tick,             # diagnostic
@@ -731,6 +849,10 @@ def find_zshape_tricells(hit_pixel_dict, minimum_witness_charge_threshold):
                         witness_w0['record']['centroid_tick']),
                     w2_witness_centroid_tick=(
                         witness_w2['record']['centroid_tick']),
+                    w0_witness_peak_rate_tick=(
+                        witness_w0['record']['peak_rate_tick']),
+                    w2_witness_peak_rate_tick=(
+                        witness_w2['record']['peak_rate_tick']),
                     w0_witness_50pct_tick=(
                         witness_w0['record']['tick_50pct']),
                     w2_witness_50pct_tick=(
@@ -746,12 +868,12 @@ def find_zshape_tricells(hit_pixel_dict, minimum_witness_charge_threshold):
                 )
 
 
-def reconstruct_ds_witness_to_witness(tricell, detector, time_sampling_us):
+def reconstruct_ds_witness_to_witness(tricell, detector):
     """Direction estimate from witness peak-time deltas.
 
       delta_w     = 1 * pixel_pitch
                      (the EFFECTIVE w-extent between witness peak
-                     times. Empirically this is what the data wants,
+                     times. Empirically this is what the data wanted,
                      not 2 * pitch as a naive pad-center-to-pad-center
                      argument would suggest. The witnesses' peak times
                      correspond to the track's closest approach to
@@ -759,17 +881,27 @@ def reconstruct_ds_witness_to_witness(tricell, detector, time_sampling_us):
                      approach to a witness pad lies near the column
                      boundary rather than at the pad center, giving
                      an effective Δw of one pitch — the width of the
-                     w_1 column the track actually traverses.)
+                     w_1 column the track actually traverses.
+
+                     CAVEAT: this 1·pitch value was tuned while a Δt
+                     units bug (below) was shrinking delta_drift 10×.
+                     With the drift term restored it MUST be
+                     re-evaluated against fresh data — the physically
+                     correct pad-center-to-pad-center value is
+                     2·pitch.)
       delta_v     = v_center_w2 − v_center_w0
       delta_drift = V_DRIFT * (t_w2_peak − t_w0_peak)
       L = sqrt(delta_w² + delta_v² + delta_drift²)
       ds_middle_pixel = L * pixel_pitch / |delta_v|
 
-    Earlier versions used delta_w = 2 * pitch (pad-center-to-pad-
-    center) and produced a robust +12.7% median over-estimate of ds.
-    The +12.7% bias is consistent with delta_v and delta_drift
-    measuring the inside-w_1 portion of the track while delta_w was
-    measuring the full 2-pitch witness span.
+    UNITS: the per-pixel peak ticks come from `adc_packet_ticks`,
+    which are already in MICROSECONDS (run_fee_chain builds
+    `time_ticks = arange * TIME_SAMPLING`, mirroring production
+    cli/simulate_pixels.py:210). So the witness time difference is
+    taken directly in µs — NO extra * TIME_SAMPLING. An earlier
+    version multiplied by TIME_SAMPLING here, double-converting and
+    making delta_drift 10× too small; that suppressed the drift term
+    and collapsed ds for near-vertical (drift-dominated) tricells.
 
     Returns dict with ds_cm and the input deltas for diagnostics;
     or None if delta_v == 0.
@@ -783,9 +915,9 @@ def reconstruct_ds_witness_to_witness(tricell, detector, time_sampling_us):
     x_w0, y_w0 = pixel_indices_to_center(detector, i_x_w0, i_y_w0)
     x_w2, y_w2 = pixel_indices_to_center(detector, i_x_w2, i_y_w2)
 
-    delta_t_us = ((tricell['peak_tick_w2_witness']
-                   - tricell['peak_tick_w0_witness'])
-                  * time_sampling_us)
+    # peak ticks are already in µs — take the difference directly.
+    delta_t_us = (tricell['peak_tick_w2_witness']
+                  - tricell['peak_tick_w0_witness'])
     delta_drift_cm = v_drift * delta_t_us
 
     if traversal_axis == 'y':
@@ -882,6 +1014,15 @@ def main():
              "natural dQ ∝ ds relation. Kept as a knob for "
              "diagnostic use.")
     arg_parser.add_argument(
+        "--primary-timing-method", default="centroid",
+        choices=PRIMARY_TIMING_METHODS,
+        help="which packet-timing estimator drives witness ordering "
+             "and ds reconstruction. Default 'centroid' (status quo, so "
+             "the Δt units-bug fix is isolated when comparing to prior "
+             "runs). Use 'peak_rate' to try the charge-arrival-rate "
+             "estimator. ALL methods are always saved in the npz, so "
+             "this can also be re-evaluated offline without re-running.")
+    arg_parser.add_argument(
         "--master-rng-seed", type=int, default=20260519)
     arg_parser.add_argument(
         "--outdir", default=".")
@@ -921,6 +1062,9 @@ def main():
     print(f"Scan: {args.n_tracks} tracks × "
           f"{len(args.track_lengths_cm)} lengths × "
           f"{args.n_seeds_per_track} seeds = {n_total_runs} kernel runs")
+    print(f"Primary per-pixel timing method: "
+          f"{args.primary_timing_method} "
+          f"(all methods saved to npz)")
 
     master_rng = np.random.default_rng(args.master_rng_seed)
     kernel_common = dict(
@@ -1004,7 +1148,8 @@ def main():
 
                 hit_pixel_dict = build_hit_pixel_dict(
                     neighboring_pixels, signals, fee_output, id2pixel,
-                    args.minimum_pixel_charge_threshold)
+                    args.minimum_pixel_charge_threshold,
+                    primary_timing_method=args.primary_timing_method)
                 tricells_found = list(find_zshape_tricells(
                     hit_pixel_dict,
                     args.minimum_witness_charge_threshold))
@@ -1013,7 +1158,7 @@ def main():
                     n_tricells_examined += 1
 
                     recon_info = reconstruct_ds_witness_to_witness(
-                        tricell, detector, detector.TIME_SAMPLING)
+                        tricell, detector)
                     if recon_info is None:
                         cut_rejection_counts['ds_recon_failed'] += 1
                         continue
@@ -1119,6 +1264,10 @@ def main():
                             'w0_witness_centroid_tick'],
                         w2_centroid_tick=tricell[
                             'w2_witness_centroid_tick'],
+                        w0_peak_rate_tick=tricell[
+                            'w0_witness_peak_rate_tick'],
+                        w2_peak_rate_tick=tricell[
+                            'w2_witness_peak_rate_tick'],
                         w0_50pct_tick=tricell[
                             'w0_witness_50pct_tick'],
                         w2_50pct_tick=tricell[
