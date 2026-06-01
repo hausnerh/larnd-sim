@@ -157,6 +157,14 @@ OUTPUTS
                             calibrated dQ/dx ratio binned by
                             reconstructed ds — flatness here means the
                             calibration is ds-independent.
+  tricell_ds_bias_vs_zenith.png
+                            ds fractional difference (median, mean,
+                            RMS) binned by track zenith, with per-bin
+                            yield. Exposes the dominant residual: low-
+                            zenith (drift-aligned) tracks over-estimate
+                            ds, pad-plane-aligned tracks are ~unbiased.
+                            Flattening this slope is the next
+                            calibration target.
   tricell_witness_halo_validation.png
                             sim-only validation of CUT 1: witness FEE
                             charge and packet count split by the
@@ -1854,6 +1862,75 @@ def make_summary_plots(records, outdir,
     ax.legend(fontsize=9)
     ax.grid(alpha=0.3)
     save_figure(fig, "tricell_dQdx_calibrated_vs_recon_ds.png")
+
+    # ===== ds bias vs zenith (the dominant residual structure) =====
+    # After the Δt units fix the ds bias is no longer a flat offset —
+    # it slopes with zenith: drift-dominated (drift-aligned) tracks
+    # over-estimate ds, pad-plane-aligned tracks are ~unbiased. This
+    # is the mixed-coordinate-sourcing residual (pad-center Δv,Δw vs
+    # FEE-timing Δdrift) that no constant Δw can remove. The witness-
+    # quality cuts are expected to trim the high-bias (low-zenith) end.
+    zenith_deg = np.degrees(
+        np.array([r['zenith_rad'] for r in records]))
+    zenith_bins = np.linspace(10.0, 80.0, 15)
+    zenith_bin_centers = 0.5 * (zenith_bins[:-1] + zenith_bins[1:])
+    median_bias_per_bin = []
+    mean_bias_per_bin = []
+    stderr_bias_per_bin = []
+    rms_bias_per_bin = []
+    count_per_zenith_bin = []
+    zenith_bin_index = np.digitize(zenith_deg, zenith_bins) - 1
+    for bin_number in range(len(zenith_bins) - 1):
+        in_bin = zenith_bin_index == bin_number
+        values_in_bin = fractional_difference[in_bin]
+        count_per_zenith_bin.append(int(in_bin.sum()))
+        if in_bin.sum() >= 2:
+            median_bias_per_bin.append(float(np.median(values_in_bin)))
+            mean_bias_per_bin.append(float(np.mean(values_in_bin)))
+            stderr_bias_per_bin.append(
+                float(np.std(values_in_bin)) / sqrt(int(in_bin.sum())))
+            rms_bias_per_bin.append(
+                float(np.sqrt(np.mean(values_in_bin ** 2))))
+        else:
+            median_bias_per_bin.append(np.nan)
+            mean_bias_per_bin.append(np.nan)
+            stderr_bias_per_bin.append(np.nan)
+            rms_bias_per_bin.append(np.nan)
+    median_bias_per_bin = np.array(median_bias_per_bin)
+    mean_bias_per_bin = np.array(mean_bias_per_bin)
+    stderr_bias_per_bin = np.array(stderr_bias_per_bin)
+    rms_bias_per_bin = np.array(rms_bias_per_bin)
+    count_per_zenith_bin = np.array(count_per_zenith_bin)
+
+    fig, ax = plt.subplots(figsize=(10, 5.5))
+    ax_count = ax.twinx()
+    ax_count.bar(zenith_bin_centers, count_per_zenith_bin,
+                 width=(zenith_bins[1] - zenith_bins[0]) * 0.9,
+                 alpha=0.12, color="C0", zorder=0)
+    ax_count.set_ylabel("tricells per bin", color="C0")
+    ax_count.tick_params(axis="y", labelcolor="C0")
+    ax.errorbar(zenith_bin_centers, mean_bias_per_bin,
+                yerr=stderr_bias_per_bin, marker="o", ms=4, capsize=3,
+                color="C1", label="mean ± stderr", zorder=3)
+    ax.plot(zenith_bin_centers, median_bias_per_bin, marker="s", ms=4,
+            color="C2", label="median", zorder=3)
+    ax.plot(zenith_bin_centers, rms_bias_per_bin, marker="^", ms=4,
+            color="C3", label="RMS", zorder=3)
+    ax.axhline(0.0, color="k", ls="--", lw=0.6, label="perfect ds")
+    ax.set_zorder(ax_count.get_zorder() + 1)
+    ax.patch.set_visible(False)
+    ax.set_xlabel("track zenith [deg]  "
+                  "(10° = drift-aligned, 80° = pad-plane-aligned)")
+    ax.set_ylabel("(ds_recon − ds_truth) / ds_truth")
+    ax.set_title(
+        "Tricell ds bias vs zenith\n"
+        "Drift-dominated (low-zenith) tracks over-estimate ds; "
+        "pad-plane-aligned tracks ~unbiased.\n"
+        "The mixed-coordinate-sourcing residual — flatten this to "
+        "improve the calibration.")
+    ax.legend(fontsize=9, loc="upper right")
+    ax.grid(alpha=0.3)
+    save_figure(fig, "tricell_ds_bias_vs_zenith.png")
 
     # ===== Witness-quality validation (CUT 1: halo-vs-track) =====
     # Sim-only check that the reco-only witness cuts (charge floor +
