@@ -82,6 +82,37 @@ selection can be applied verbatim to real data.
       diagnostic knob. The charge cuts above already suppress
       corner-clippers via dQ ∝ ds without needing this.
 
+WITNESS-QUALITY CUTS (staged; default OFF so each can be turned on one
+at a time and its effect on bias/RMS/yield is attributable). Witness
+quality is the dominant ds-reconstruction error source: the whole
+track direction — hence Δdrift, hence ds — is built from the two
+witnesses, so a witness that is actually an induced-fringe pad
+corrupts everything. All three cuts are computable from FEE packets
+alone, so they port verbatim to real data.
+
+  - --minimum-witness-packets (default 1, off)
+      CUT 1, halo-vs-track. A pad the track CROSSES collects the full
+      deposited charge → several packets clustered in time → reliable
+      timing. A pad seeing only a neighbour's induced positive lobe
+      (within MAX_RADIUS=2) emits 0–1 packets. Requiring ≥ 2 (try 3)
+      packets per witness, on top of the charge floor set above the
+      induced-lobe scale, selects real-collection witnesses. Polarity
+      is NOT used — the negative induced lobe never crosses threshold,
+      so it is invisible to the readout. Validated in sim against the
+      geometric ds-through-witness-pillar truth label (NOT polarity).
+  - --maximum-direction-disagreement-deg (default 180, off)
+      CUT 2, direction cross-check (highest single value). The three
+      w_1 pads give an INDEPENDENT (x, y, z=t·V_DRIFT) direction; the
+      two witnesses give another. Require them to agree within a few
+      degrees, else drop — a fringe witness with a bogus peak tick
+      throws the two apart. Recommended 10–15°.
+  - --maximum-implied-drift-cm (default 0, off) and
+    --implied-zenith-min-deg / --implied-zenith-max-deg (default 0/90)
+      CUT 3, physical plausibility. Reject reconstructions whose
+      implied |Δdrift| exceeds the drift window or whose implied zenith
+      falls outside the expected band — catches late induced-lobe
+      timing outliers.
+
 All selection and threshold-scan logic in the plots uses these
 same FEE-readout quantities; the kernel response sum is saved as a
 diagnostic (`collected_charge_raw_kernel`) but never used for
@@ -112,6 +143,20 @@ OUTPUTS
                             calibrated dQ/dx ratio binned by
                             reconstructed ds — flatness here means the
                             calibration is ds-independent.
+  tricell_witness_halo_validation.png
+                            sim-only validation of CUT 1: witness FEE
+                            charge and packet count split by the
+                            geometric truth label (ds through the
+                            witness pad pillar > 0 ⇒ track-crossing,
+                            = 0 ⇒ induced-only). Confirms the reco-only
+                            charge+packet cuts keep real-collection
+                            witnesses and reject induced-only fringe.
+  tricell_direction_disagreement.png
+                            validation of CUT 2: angle between the
+                            witness-to-witness and three-w_1-pad track
+                            directions, split by witness truth label.
+                            A clean core + rejectable (mostly induced-
+                            only) tail confirms the cut works.
   tricell_ds_accuracy_results.npz
 
 REQUIREMENTS
@@ -835,9 +880,17 @@ def find_zshape_tricells(hit_pixel_dict, minimum_witness_charge_threshold):
                     w0_witness_key=witness_w0['key'],
                     w0_witness_collected_charge=(
                         witness_w0['record']['collected_charge']),
+                    w0_witness_collected_charge_raw=(
+                        witness_w0['record']['collected_charge_raw']),
+                    w0_witness_n_packets=(
+                        witness_w0['record']['n_packets']),
                     w2_witness_key=witness_w2['key'],
                     w2_witness_collected_charge=(
                         witness_w2['record']['collected_charge']),
+                    w2_witness_collected_charge_raw=(
+                        witness_w2['record']['collected_charge_raw']),
+                    w2_witness_n_packets=(
+                        witness_w2['record']['n_packets']),
                     # Primary timing per pixel (used by ds-recon below)
                     peak_tick_w0_witness=witness_w0['peak_tick'],
                     peak_tick_w1_lo=lo_record['peak_tick'],
@@ -947,6 +1000,97 @@ def reconstruct_ds_witness_to_witness(tricell, detector):
     )
 
 
+def witness_direction_cross_check_deg(tricell, detector):
+    """Independent drift-vs-v slope estimates, compared for agreement.
+
+    The track's slope in the (v, drift) plane — how far it drifts per
+    unit of travel along the traversal axis v — is measured two ways,
+    both from data-derivable pad v-coordinates and FEE peak ticks
+    (drift = t_peak · V_DRIFT):
+
+      * witnesses : Δv = v(w_2 witness) − v(w_0 witness),
+                    Δdrift = V_DRIFT · (t_w2 − t_w0)
+      * three w_1 pads : Δv = v(w_1 hi) − v(w_1 lo) = 2·pitch,
+                         Δdrift = V_DRIFT · (t_hi − t_lo)
+
+    For a straight track these slopes are equal, so the two 2-vectors
+    (Δv, Δdrift) are parallel. A large angle flags a corrupted
+    witness — e.g. an induced-fringe pad whose peak tick does not mark
+    a real closest-approach — and is the single most powerful
+    witness-quality discriminant.
+
+    WHY (v, drift) AND NOT FULL 3D: the three w_1 pads all sit in the
+    SAME w-column, so their w-coordinate is identical and their
+    direction carries NO w-information (Δw ≡ 0). The witness-to-witness
+    vector, by contrast, spans 2·pitch in w. Comparing full 3D vectors
+    would therefore register a large, geometry-driven disagreement on
+    EVERY tricell. The w-baseline is supplied solely by the witnesses
+    and cannot be cross-checked here; the genuinely independent,
+    comparable quantity is the drift-vs-v slope.
+
+    Sign-agnostic (|cos|): the track may be traversed in either time
+    order, so anti-parallel is treated as agreement.
+
+    Returns the disagreement angle in degrees, or None if either slope
+    vector is degenerate (zero length).
+    """
+    v_drift = detector.V_DRIFT
+    traversal_axis = tricell['traversal_axis']
+
+    def v_coordinate(pixel_key):
+        i_x, i_y = pixel_key
+        x_cm, y_cm = pixel_indices_to_center(detector, i_x, i_y)
+        return y_cm if traversal_axis == 'y' else x_cm
+
+    delta_v_witness = (v_coordinate(tricell['w2_witness_key'])
+                       - v_coordinate(tricell['w0_witness_key']))
+    delta_drift_witness = v_drift * (tricell['peak_tick_w2_witness']
+                                     - tricell['peak_tick_w0_witness'])
+    witness_slope_vec = np.array(
+        [delta_v_witness, delta_drift_witness], dtype=float)
+
+    delta_v_w1 = (v_coordinate(tricell['w1_hi_key'])
+                  - v_coordinate(tricell['w1_lo_key']))
+    delta_drift_w1 = v_drift * (tricell['peak_tick_w1_hi']
+                                - tricell['peak_tick_w1_lo'])
+    w1_slope_vec = np.array([delta_v_w1, delta_drift_w1], dtype=float)
+
+    norm_witness = float(np.linalg.norm(witness_slope_vec))
+    norm_w1 = float(np.linalg.norm(w1_slope_vec))
+    if norm_witness == 0.0 or norm_w1 == 0.0:
+        return None
+    cos_angle = abs(float(np.dot(witness_slope_vec, w1_slope_vec))
+                    / (norm_witness * norm_w1))
+    cos_angle = min(1.0, max(0.0, cos_angle))
+    return float(np.degrees(acos(cos_angle)))
+
+
+def implied_geometry_from_recon(recon_info):
+    """Data-derivable plausibility quantities of the reconstructed
+    direction:
+
+      implied_drift_cm   : |Δdrift| between the two witnesses (cm).
+      implied_zenith_deg : angle of the witness-to-witness direction
+                           from the drift axis, acos(|Δdrift| / L).
+                           In this script's convention the drift axis
+                           is the zenith axis, so this is the implied
+                           track zenith.
+
+    A near-vertical (drift-dominated) reconstruction gives a small
+    zenith; a near-horizontal one gives ~90°. Returns None if the
+    witness-to-witness length is zero.
+    """
+    length_cm = recon_info['length_witness_to_witness_cm']
+    implied_drift_cm = abs(recon_info['delta_drift_cm'])
+    if length_cm == 0.0:
+        return None
+    cos_zenith = min(1.0, implied_drift_cm / length_cm)
+    return dict(
+        implied_drift_cm=implied_drift_cm,
+        implied_zenith_deg=float(np.degrees(acos(cos_zenith))),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -1013,6 +1157,48 @@ def main():
              "cuts above already filter out corner-clippers via the "
              "natural dQ ∝ ds relation. Kept as a knob for "
              "diagnostic use.")
+    # --- Witness-quality cuts (staged; default OFF/permissive so each
+    #     can be enabled one at a time and its effect on bias, RMS, and
+    #     yield is individually attributable). All three are computed
+    #     from FEE packets alone, so they port verbatim to real data.
+    arg_parser.add_argument(
+        "--minimum-witness-packets", type=int, default=1,
+        help="CUT 1 (halo-vs-track): minimum number of FEE ADC packets "
+             "required on EACH witness pixel. A pad the track actually "
+             "crosses collects the full deposited charge → several "
+             "packets clustered in time; a pad seeing only a neighbour's "
+             "induced positive lobe emits 0–1 (often sub-threshold) "
+             "packets. Combined with --minimum-witness-charge-threshold "
+             "(set above the induced-lobe scale) this selects pads the "
+             "track's charge truly reached. Default 1 (off — any visible "
+             "witness already has ≥ 1 packet). Try 2, then 3.")
+    arg_parser.add_argument(
+        "--maximum-direction-disagreement-deg", type=float, default=180.0,
+        help="CUT 2 (direction cross-check): reject a tricell if the "
+             "witness-to-witness direction and the independent "
+             "three-w_1-pad direction disagree by more than this angle "
+             "(degrees, sign-agnostic). The single most powerful "
+             "witness-quality discriminant — a fringe witness with a "
+             "bogus peak tick throws the two directions apart. Default "
+             "180 (off). Recommended 10–15.")
+    arg_parser.add_argument(
+        "--maximum-implied-drift-cm", type=float, default=0.0,
+        help="CUT 3a (plausibility): reject a tricell if the implied "
+             "|Δdrift| between witnesses exceeds this (cm). Catches "
+             "timing outliers (late induced-lobe peaks) that imply a "
+             "drift longer than physically possible. Default 0 (off); "
+             "a physical bound is the drift-window length.")
+    arg_parser.add_argument(
+        "--implied-zenith-min-deg", type=float, default=0.0,
+        help="CUT 3b (plausibility): reject a tricell whose implied "
+             "zenith (angle of the reconstructed direction from the "
+             "drift axis) is below this. Default 0 (off).")
+    arg_parser.add_argument(
+        "--implied-zenith-max-deg", type=float, default=90.0,
+        help="CUT 3b (plausibility): reject a tricell whose implied "
+             "zenith exceeds this. Default 90 (off). The generator "
+             "draws zenith in [10°, 80°]; a band like [5, 85] rejects "
+             "unphysical near-horizontal/near-vertical reconstructions.")
     arg_parser.add_argument(
         "--primary-timing-method", default="centroid",
         choices=PRIMARY_TIMING_METHODS,
@@ -1084,6 +1270,10 @@ def main():
         ds_truth_below_threshold=0,
         target_charge_below_threshold=0,
         sentinel_asymmetric=0,
+        witness_too_few_packets=0,
+        direction_disagreement=0,
+        implied_drift_too_large=0,
+        implied_zenith_out_of_band=0,
     )
     n_tricells_examined = 0
 
@@ -1157,12 +1347,60 @@ def main():
                 for tricell in tricells_found:
                     n_tricells_examined += 1
 
+                    # CUT 1 (halo-vs-track): require enough FEE packets
+                    # on each witness. A track-crossing pad collects
+                    # the full deposited charge (several clustered
+                    # packets); an induced-fringe pad emits 0–1. Both
+                    # witness charges already passed the charge floor
+                    # in find_zshape_tricells.
+                    if (tricell['w0_witness_n_packets']
+                            < args.minimum_witness_packets
+                            or tricell['w2_witness_n_packets']
+                            < args.minimum_witness_packets):
+                        cut_rejection_counts['witness_too_few_packets'] += 1
+                        continue
+
                     recon_info = reconstruct_ds_witness_to_witness(
                         tricell, detector)
                     if recon_info is None:
                         cut_rejection_counts['ds_recon_failed'] += 1
                         continue
                     ds_recon_cm = recon_info['ds_recon_cm']
+
+                    # CUT 2 (direction cross-check): the witness-to-
+                    # witness direction and the independent three-w_1-
+                    # pad direction must agree within tolerance.
+                    direction_disagreement_deg = (
+                        witness_direction_cross_check_deg(
+                            tricell, detector))
+                    if (direction_disagreement_deg is not None
+                            and direction_disagreement_deg
+                            > args.maximum_direction_disagreement_deg):
+                        cut_rejection_counts['direction_disagreement'] += 1
+                        continue
+
+                    # CUT 3 (plausibility): implied drift / zenith of
+                    # the reconstructed direction must be physical.
+                    implied_geom = implied_geometry_from_recon(recon_info)
+                    implied_drift_cm = (
+                        implied_geom['implied_drift_cm']
+                        if implied_geom is not None else np.nan)
+                    implied_zenith_deg = (
+                        implied_geom['implied_zenith_deg']
+                        if implied_geom is not None else np.nan)
+                    if implied_geom is not None:
+                        if (args.maximum_implied_drift_cm > 0.0
+                                and implied_drift_cm
+                                > args.maximum_implied_drift_cm):
+                            cut_rejection_counts[
+                                'implied_drift_too_large'] += 1
+                            continue
+                        if (implied_zenith_deg < args.implied_zenith_min_deg
+                                or implied_zenith_deg
+                                > args.implied_zenith_max_deg):
+                            cut_rejection_counts[
+                                'implied_zenith_out_of_band'] += 1
+                            continue
 
                     i_x_center, i_y_center = tricell['centre_pixel_key']
                     x_center_cm, y_center_cm = pixel_indices_to_center(
@@ -1177,6 +1415,36 @@ def main():
                     if ds_truth_cm <= args.minimum_ds_truth_cm:
                         cut_rejection_counts['ds_truth_below_threshold'] += 1
                         continue
+
+                    # Geometric ds through each WITNESS pad pillar — the
+                    # polarity-agnostic truth label for the halo-vs-
+                    # track validation plot. ds > 0 ⇒ the muon segment
+                    # actually crosses that witness pad (real
+                    # collection); ds = 0 ⇒ induced-only / diffusion-
+                    # edge witness. SIM-VALIDATION ONLY — never used as
+                    # a cut (a real analysis has no access to it).
+                    i_x_w0_wit, i_y_w0_wit = tricell['w0_witness_key']
+                    i_x_w2_wit, i_y_w2_wit = tricell['w2_witness_key']
+                    x_w0_wit_cm, y_w0_wit_cm = pixel_indices_to_center(
+                        detector, i_x_w0_wit, i_y_w0_wit)
+                    x_w2_wit_cm, y_w2_wit_cm = pixel_indices_to_center(
+                        detector, i_x_w2_wit, i_y_w2_wit)
+                    ds_truth_w0_witness_cm = (
+                        segment_length_through_pixel_pillar(
+                            (start_x, start_y, start_z),
+                            (end_x, end_y, end_z),
+                            x_w0_wit_cm - pitch_cm / 2,
+                            x_w0_wit_cm + pitch_cm / 2,
+                            y_w0_wit_cm - pitch_cm / 2,
+                            y_w0_wit_cm + pitch_cm / 2))
+                    ds_truth_w2_witness_cm = (
+                        segment_length_through_pixel_pillar(
+                            (start_x, start_y, start_z),
+                            (end_x, end_y, end_z),
+                            x_w2_wit_cm - pitch_cm / 2,
+                            x_w2_wit_cm + pitch_cm / 2,
+                            y_w2_wit_cm - pitch_cm / 2,
+                            y_w2_wit_cm + pitch_cm / 2))
 
                     # Absolute charge cuts (all on FEE-readout charge,
                     # so the same cut definitions apply to real data).
@@ -1240,6 +1508,30 @@ def main():
                         q_w1_lo=q_w1_lo,
                         q_w1_hi=q_w1_hi,
                         column_axis=tricell['column_axis'],
+                        # --- Witness-quality diagnostics (CUT 1/2/3) ---
+                        w0_witness_collected_charge=abs(
+                            tricell['w0_witness_collected_charge']),
+                        w2_witness_collected_charge=abs(
+                            tricell['w2_witness_collected_charge']),
+                        w0_witness_collected_charge_raw=(
+                            tricell['w0_witness_collected_charge_raw']),
+                        w2_witness_collected_charge_raw=(
+                            tricell['w2_witness_collected_charge_raw']),
+                        w0_witness_n_packets=(
+                            tricell['w0_witness_n_packets']),
+                        w2_witness_n_packets=(
+                            tricell['w2_witness_n_packets']),
+                        # Geometric truth labels for halo-vs-track
+                        # validation (SIM-ONLY — never used as a cut).
+                        ds_truth_w0_witness_cm=ds_truth_w0_witness_cm,
+                        ds_truth_w2_witness_cm=ds_truth_w2_witness_cm,
+                        # CUT 2 / CUT 3 reconstructed-direction quantities
+                        direction_disagreement_deg=(
+                            direction_disagreement_deg
+                            if direction_disagreement_deg is not None
+                            else np.nan),
+                        implied_drift_cm=implied_drift_cm,
+                        implied_zenith_deg=implied_zenith_deg,
                         # Diagnostic: per-axis deltas that fed ds recon
                         delta_w_cm=recon_info['delta_w_cm'],
                         delta_v_cm=recon_info['delta_v_cm'],
@@ -1289,8 +1581,18 @@ def main():
                       f"{n_valid_tricells} valid tricells so far")
 
     print(f"\nTricells examined            : {n_tricells_examined}")
+    print(f"  rejected by witness packets < {args.minimum_witness_packets} "
+          f": {cut_rejection_counts['witness_too_few_packets']}")
     print(f"  rejected by ds_recon failure   : "
           f"{cut_rejection_counts['ds_recon_failed']}")
+    print(f"  rejected by direction disagree > "
+          f"{args.maximum_direction_disagreement_deg}° "
+          f": {cut_rejection_counts['direction_disagreement']}")
+    print(f"  rejected by implied drift > {args.maximum_implied_drift_cm} cm "
+          f": {cut_rejection_counts['implied_drift_too_large']}")
+    print(f"  rejected by implied zenith ∉ "
+          f"[{args.implied_zenith_min_deg}, {args.implied_zenith_max_deg}]° "
+          f": {cut_rejection_counts['implied_zenith_out_of_band']}")
     print(f"  rejected by ds_truth ≤ {args.minimum_ds_truth_cm} cm "
           f": {cut_rejection_counts['ds_truth_below_threshold']}")
     print(f"  rejected by q_centre < {args.minimum_target_charge:.0f} "
@@ -1311,13 +1613,21 @@ def main():
     np.savez(output_npz_path, **record_arrays)
     print(f"wrote {output_npz_path}")
 
-    make_summary_plots(records, args.outdir)
+    make_summary_plots(
+        records, args.outdir,
+        witness_charge_floor=args.minimum_witness_charge_threshold,
+        witness_packet_floor=args.minimum_witness_packets,
+        direction_disagreement_cut_deg=(
+            args.maximum_direction_disagreement_deg))
 
 
 # ---------------------------------------------------------------------------
 # Plotting
 # ---------------------------------------------------------------------------
-def make_summary_plots(records, outdir):
+def make_summary_plots(records, outdir,
+                       witness_charge_floor=None,
+                       witness_packet_floor=None,
+                       direction_disagreement_cut_deg=None):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -1525,6 +1835,140 @@ def make_summary_plots(records, outdir):
     ax.legend(fontsize=9)
     ax.grid(alpha=0.3)
     save_figure(fig, "tricell_dQdx_calibrated_vs_recon_ds.png")
+
+    # ===== Witness-quality validation (CUT 1: halo-vs-track) =====
+    # Sim-only check that the reco-only witness cuts (charge floor +
+    # n_packets) keep the pads the track actually crossed and reject
+    # the induced-only fringe pads. The truth label is the geometric
+    # ds through each witness pad pillar — POLARITY-AGNOSTIC, and never
+    # used as a cut (the negative induced lobe is invisible to the
+    # readout, so net-integral/polarity is not a data-applicable
+    # discriminant). Each tricell contributes its two witnesses.
+    have_witness_diagnostics = (
+        len(records) > 0
+        and 'w0_witness_collected_charge' in records[0])
+    if have_witness_diagnostics:
+        witness_charge = np.concatenate([
+            np.array([r['w0_witness_collected_charge'] for r in records]),
+            np.array([r['w2_witness_collected_charge'] for r in records]),
+        ])
+        witness_n_packets = np.concatenate([
+            np.array([r['w0_witness_n_packets'] for r in records]),
+            np.array([r['w2_witness_n_packets'] for r in records]),
+        ])
+        witness_ds_truth = np.concatenate([
+            np.array([r['ds_truth_w0_witness_cm'] for r in records]),
+            np.array([r['ds_truth_w2_witness_cm'] for r in records]),
+        ])
+        track_crossing_mask = witness_ds_truth > 0.0
+        induced_only_mask = ~track_crossing_mask
+
+        fig, (ax_charge, ax_packets) = plt.subplots(
+            1, 2, figsize=(13, 5.5))
+
+        # Panel A: witness FEE charge, split by truth label.
+        positive_charge = witness_charge[witness_charge > 0]
+        if positive_charge.size > 0:
+            charge_bins = np.linspace(
+                0.0, np.percentile(positive_charge, 99), 60)
+        else:
+            charge_bins = np.linspace(0.0, 1.0, 60)
+        ax_charge.hist(
+            witness_charge[track_crossing_mask], bins=charge_bins,
+            alpha=0.55, color="C2",
+            label=(f"track-crossing (ds>0): "
+                   f"N={int(track_crossing_mask.sum())}"))
+        ax_charge.hist(
+            witness_charge[induced_only_mask], bins=charge_bins,
+            alpha=0.55, color="C3",
+            label=(f"induced-only (ds=0): "
+                   f"N={int(induced_only_mask.sum())}"))
+        if witness_charge_floor is not None:
+            ax_charge.axvline(
+                witness_charge_floor, color="k", ls="--", lw=0.9,
+                label=f"charge floor = {witness_charge_floor:.0f} e⁻")
+        ax_charge.set_xlabel("witness FEE charge  Σq_packets  [e⁻]")
+        ax_charge.set_ylabel("witness count")
+        ax_charge.set_title("Witness charge by geometric truth label")
+        ax_charge.legend(fontsize=8)
+        ax_charge.grid(alpha=0.3)
+
+        # Panel B: witness packet count, split by truth label.
+        max_packets = int(max(witness_n_packets.max(), 1))
+        packet_bins = np.arange(0.5, max_packets + 1.5, 1.0)
+        ax_packets.hist(
+            witness_n_packets[track_crossing_mask], bins=packet_bins,
+            alpha=0.55, color="C2",
+            label="track-crossing (ds>0)")
+        ax_packets.hist(
+            witness_n_packets[induced_only_mask], bins=packet_bins,
+            alpha=0.55, color="C3",
+            label="induced-only (ds=0)")
+        if (witness_packet_floor is not None
+                and witness_packet_floor > 1):
+            ax_packets.axvline(
+                witness_packet_floor - 0.5, color="k", ls="--", lw=0.9,
+                label=f"packet floor = {witness_packet_floor}")
+        ax_packets.set_xlabel("witness FEE packet count  n_packets")
+        ax_packets.set_ylabel("witness count")
+        ax_packets.set_title("Witness packets by geometric truth label")
+        ax_packets.legend(fontsize=8)
+        ax_packets.grid(alpha=0.3)
+
+        fig.suptitle(
+            "Witness halo-vs-track validation (sim truth label is "
+            "geometric ds through the witness pad pillar; cuts are "
+            "reco-only).\nGood separation ⇒ the charge+packet cuts keep "
+            "real-collection witnesses and reject induced-only fringe.",
+            fontsize=10)
+        save_figure(fig, "tricell_witness_halo_validation.png")
+
+        # ===== Witness-quality validation (CUT 2: direction) =====
+        # Direction-disagreement distribution: should have a clean core
+        # (good tricells) plus a rejectable tail (corrupted witnesses).
+        # Split by whether BOTH witnesses are track-crossing vs at
+        # least one induced-only, to confirm the tail is fringe-driven.
+        direction_disagreement = np.array(
+            [r['direction_disagreement_deg'] for r in records])
+        both_cross_mask = (
+            np.array([r['ds_truth_w0_witness_cm'] for r in records]) > 0.0
+        ) & (
+            np.array([r['ds_truth_w2_witness_cm'] for r in records]) > 0.0)
+        finite_mask = np.isfinite(direction_disagreement)
+        if finite_mask.any():
+            fig, ax = plt.subplots(figsize=(10, 5.5))
+            disagreement_bins = np.linspace(
+                0.0, min(90.0, float(np.nanmax(
+                    direction_disagreement[finite_mask])) + 1.0), 60)
+            ax.hist(
+                direction_disagreement[finite_mask & both_cross_mask],
+                bins=disagreement_bins, alpha=0.55, color="C2",
+                label=("both witnesses track-crossing: "
+                       f"N={int((finite_mask & both_cross_mask).sum())}"))
+            ax.hist(
+                direction_disagreement[finite_mask & ~both_cross_mask],
+                bins=disagreement_bins, alpha=0.55, color="C3",
+                label=("≥1 witness induced-only: "
+                       f"N={int((finite_mask & ~both_cross_mask).sum())}"))
+            if (direction_disagreement_cut_deg is not None
+                    and direction_disagreement_cut_deg < 180.0):
+                ax.axvline(
+                    direction_disagreement_cut_deg, color="k", ls="--",
+                    lw=0.9,
+                    label=(f"cut = "
+                           f"{direction_disagreement_cut_deg:.0f}°"))
+            ax.set_xlabel(
+                "angle between witness-to-witness and three-w_1-pad "
+                "directions [deg]")
+            ax.set_ylabel("tricell count")
+            ax.set_title(
+                "Direction cross-check (CUT 2): witness-derived vs "
+                "w_1-pad-derived track direction\n"
+                "clean core = consistent tricells; tail = corrupted "
+                "witnesses (mostly induced-only)")
+            ax.legend(fontsize=9)
+            ax.grid(alpha=0.3)
+            save_figure(fig, "tricell_direction_disagreement.png")
 
     # ---- Console summary ----
     print("\n" + "=" * 70)
