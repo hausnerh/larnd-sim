@@ -42,9 +42,23 @@ in MICROSECONDS (run_fee_chain builds time_ticks = arange *
 TIME_SAMPLING, matching production simulate_pixels.py). An earlier
 version multiplied the witness Δt by TIME_SAMPLING a second time,
 shrinking delta_drift 10× and collapsing ds for near-vertical
-(drift-dominated) tracks; that is now fixed. Because delta_w = 1·pitch
-was tuned UNDER that bug, it must be re-checked against post-fix data
-(physically it should be 2·pitch, pad-center-to-pad-center).
+(drift-dominated) tracks; that is now fixed.
+
+POST-FIX Δw RE-FIT (run 3a197bf data, N≈2270 tricells): with the drift
+term restored, delta_w = 1·pitch gives a near-centered result —
+median(ds_recon/ds_truth) = 1.019 (centroid). Re-fitting delta_w to
+zero the median wants delta_w ≈ 0 (centroid) / 0.3·pitch (peak_rate),
+NOT 2·pitch — so the naive pad-center-to-pad-center value is firmly
+ruled out, and 1·pitch is retained (physically the inside-w_1 column
+width, and within ~2% of optimal). The reason a single delta_w cannot
+do better: the residual is ZENITH-STRUCTURED, not a constant offset —
+median fractional difference runs +9% for near-vertical (drift-
+dominated, |Δdrift|≈4 cm) tracks down to −1% for near-horizontal ones.
+delta_w only matters when Δdrift is small (horizontal), so tuning it
+trades the two ends against each other instead of removing the
+structure. That structure is the mixed-coordinate-sourcing effect
+(pad-center Δv,Δw vs FEE-timing Δdrift); the principled fix is to
+source all three witness coordinates consistently — deferred.
 
 The per-pixel timing estimator is selectable via
 --primary-timing-method {centroid,peak_rate,first,largest,median};
@@ -936,12 +950,15 @@ def reconstruct_ds_witness_to_witness(tricell, detector):
                      an effective Δw of one pitch — the width of the
                      w_1 column the track actually traverses.
 
-                     CAVEAT: this 1·pitch value was tuned while a Δt
-                     units bug (below) was shrinking delta_drift 10×.
-                     With the drift term restored it MUST be
-                     re-evaluated against fresh data — the physically
-                     correct pad-center-to-pad-center value is
-                     2·pitch.)
+                     POST-UNITS-FIX RE-FIT (3a197bf data): with the
+                     drift term restored, 1·pitch gives median
+                     ds_recon/ds_truth = 1.019. Re-fitting to zero the
+                     median wants delta_w ≈ 0–0.3·pitch, NOT 2·pitch —
+                     pad-center-to-pad-center is ruled out. 1·pitch is
+                     kept (within ~2% of optimal, physical column
+                     width). The residual is zenith-structured (+9%
+                     vertical → −1% horizontal), which no constant
+                     delta_w can remove; see module docstring.)
       delta_v     = v_center_w2 − v_center_w0
       delta_drift = V_DRIFT * (t_w2_peak − t_w0_peak)
       L = sqrt(delta_w² + delta_v² + delta_drift²)
@@ -979,8 +996,10 @@ def reconstruct_ds_witness_to_witness(tricell, detector):
         delta_v_cm = x_w2 - x_w0
 
     # See docstring: effective Δw is 1·pitch (inside-w_1 column width),
-    # not 2·pitch (pad center-to-center). Verified against data, brings
-    # median ds_recon / ds_truth from 1.127 → 1.041.
+    # not 2·pitch (pad center-to-center). Post-units-fix data (3a197bf)
+    # gives median ds_recon/ds_truth = 1.019 here; a re-fit prefers
+    # ≈0–0.3·pitch, ruling out 2·pitch. Residual bias is zenith-
+    # structured, not removable by any constant Δw.
     delta_w_cm = pitch_cm
 
     if delta_v_cm == 0:
