@@ -114,18 +114,23 @@ alone, so they port verbatim to real data.
       is NOT used — the negative induced lobe never crosses threshold,
       so it is invisible to the readout. Validated in sim against the
       geometric ds-through-witness-pillar truth label (NOT polarity).
-  - --maximum-direction-disagreement-deg (default 180, off)
-      CUT 2, direction cross-check (highest single value). The three
-      w_1 pads give an INDEPENDENT (x, y, z=t·V_DRIFT) direction; the
-      two witnesses give another. Require them to agree within a few
-      degrees, else drop — a fringe witness with a bogus peak tick
-      throws the two apart. Recommended 10–15°.
-  - --maximum-implied-drift-cm (default 0, off) and
-    --implied-zenith-min-deg / --implied-zenith-max-deg (default 0/90)
-      CUT 3, physical plausibility. Reject reconstructions whose
-      implied |Δdrift| exceeds the drift window or whose implied zenith
-      falls outside the expected band — catches late induced-lobe
-      timing outliers.
+  - --maximum-direction-disagreement-deg (default 10, ON)
+      CUT 2, direction cross-check (highest single value, the
+      production default). The three w_1 pads give an INDEPENDENT
+      (x, y, z=t·V_DRIFT) direction; the two witnesses give another.
+      Require them to agree within a few degrees, else drop — a fringe
+      witness with a bogus peak tick throws the two apart. Staged scan:
+      ds fractional-difference RMS 0.149 → 0.094 at ≤10°. CUT 1 is left
+      OFF because it costs ~25% yield for negligible additional RMS gain
+      once CUT 2 is on. Set 180 to disable CUT 2.
+  - --maximum-implied-drift-cm (default 30) and
+    --implied-zenith-min-deg / --implied-zenith-max-deg (default 2/88)
+      CUT 3, physical plausibility — a loose safety net. Reject
+      reconstructions whose implied |Δdrift| exceeds the drift window or
+      whose implied zenith falls outside a wide band — catches late
+      induced-lobe timing outliers. On a clean sim sample it rejects ~0;
+      it is kept on to guard real-data outliers. Set 0 / 0 / 90 to
+      disable.
 
 All selection and threshold-scan logic in the plots uses these
 same FEE-readout quantities; the kernel response sum is saved as a
@@ -179,6 +184,18 @@ OUTPUTS
                             directions, split by witness truth label.
                             A clean core + rejectable (mostly induced-
                             only) tail confirms the cut works.
+  tricell_calibration_constant_uncertainty.png
+                            the money plot: per-tricell calibration ratio
+                            r = (q_centre/ds) / dQdx_truth for three ds
+                            sources overlaid — PRODUCTION (global line-fit
+                            pitch, what NDLAr reconstruction uses today),
+                            TRICELL (local 5-pixel ds), and TRUTH-DS
+                            (SIM-ONLY ceiling). A narrower distribution =
+                            a tighter calibration constant. Demonstrates
+                            whether the local tricell ds beats the global
+                            track fit; legend reports median, fractional
+                            RMS, the constant's standard error, and the
+                            track count needed for 1% precision.
   tricell_ds_accuracy_results.npz
 
 REQUIREMENTS
@@ -1027,6 +1044,87 @@ def reconstruct_ds_witness_to_witness(tricell, detector):
     )
 
 
+def fit_global_track_direction(hit_pixel_dict, detector):
+    """Global 3D line fit over ALL the track's hit pixels (production ds).
+
+    This emulates the path-length (dx) that NDLAr production
+    reconstruction assigns to a pixel today, so the local 5-pixel
+    tricell ds can be compared against the method actually in use rather
+    than against a naive baseline.
+
+    METHOD (standard LArTPC calorimetric dQ/dx). Reconstruct the global
+    track direction, then take the per-pixel path length as the pad
+    pitch projected onto that direction: dx = pitch / |cos theta|, with
+    cos theta the direction cosine along the traversal (v) axis. Here
+    the direction is obtained from a principal-axis (PCA) line fit to
+    the 3D hit cloud: for every hit pixel (i_x, i_y) build a point
+        x, y = pixel_indices_to_center(detector, i_x, i_y)
+        z     = peak_tick * V_DRIFT            (drift coordinate, cm)
+    mean-center the cloud and take the principal right-singular vector
+    (largest singular value) as the unit track direction. This is the
+    "tracklet"-style global line fit: a single straight direction shared
+    by the whole track, in contrast to the tricell's local 5-pixel
+    estimate.
+
+    PROVENANCE / REFERENCE (why this is "the production method"). The
+    global-line-fit-pitch dQ/dx is the standard LArTPC calorimetry
+    recipe: fit the track direction, then project the readout pitch onto
+    it. For ND-LAr / Module-0 / the 2x2 prototype the reference
+    implementation is the DUNE pixel-readout reconstruction chain, whose
+    "tracklet" stage fits a principal-axis (PCA) line to the 3D hits and
+    assigns dQ/dx along it:
+      - DUNE ndlar_flow reconstruction chain (ND-LAr / 2x2):
+            https://github.com/DUNE/ndlar_flow
+      - Module-0 predecessor (module0_flow):
+            https://github.com/peter-madigan/module0_flow
+      - Pixelated-LArTPC cosmic dQ/dx via a fitted track (line fit +
+        pitch-along-track):                     arXiv:2512.10830
+      - Standard LArTPC charge/dE-dx-per-length calibration (pitch
+        projected on the reconstructed track):  arXiv:1907.11736
+                                                 (ArgoNeuT)
+    NOTE: the exact ndlar_flow source file/line for the tracklet fit was
+    not pinned down at authoring time (repo browse needed auth); the
+    citation is the framework + repos + methodology papers, not a single
+    line. Confirm the precise tracklet-reco path on the GPU node (which
+    has the repo checked out) and tighten this citation if available.
+
+    Unweighted PCA is used as the baseline (every hit pixel counts
+    equally); charge-weighting the fit is a noted optional refinement.
+    The fit faithfully includes induced-fringe hit pixels that passed
+    the build_hit_pixel_dict charge floor, exactly as production would.
+
+    Returns the unit direction [dir_x, dir_y, dir_drift] (np.ndarray),
+    or None if fewer than 3 hit pixels or the fit is degenerate.
+    """
+    v_drift = detector.V_DRIFT
+    points = []
+    for (i_x, i_y), record in hit_pixel_dict.items():
+        x_cm, y_cm = pixel_indices_to_center(detector, i_x, i_y)
+        z_cm = record['peak_tick'] * v_drift
+        points.append((x_cm, y_cm, z_cm))
+
+    if len(points) < 3:
+        return None
+
+    point_cloud = np.asarray(points, dtype=float)
+    centered = point_cloud - point_cloud.mean(axis=0)
+    if not np.all(np.isfinite(centered)):
+        return None
+    try:
+        _, singular_values, right_vectors = np.linalg.svd(
+            centered, full_matrices=False)
+    except np.linalg.LinAlgError:
+        return None
+    if singular_values.size == 0 or singular_values[0] <= 1e-9:
+        return None
+
+    direction = right_vectors[0]
+    norm = np.linalg.norm(direction)
+    if not np.isfinite(norm) or norm <= 1e-9:
+        return None
+    return direction / norm
+
+
 def witness_direction_cross_check_deg(tricell, detector):
     """Independent drift-vs-v slope estimates, compared for agreement.
 
@@ -1118,6 +1216,21 @@ def implied_geometry_from_recon(recon_info):
     )
 
 
+def load_records_from_npz(path):
+    """Reload per-tricell records from a saved results npz.
+
+    np.savez stored one parallel array per record field (see the save in
+    main()); this reverses that into the list-of-dicts shape the summary
+    helpers expect. Each value comes back as a numpy scalar, which the
+    calibration helpers handle via float(...). Enables the offline
+    --from-npz re-analysis path with no CUDA.
+    """
+    data = np.load(path, allow_pickle=True)
+    field_names = list(data.files)
+    columns = [data[name] for name in field_names]
+    return [dict(zip(field_names, row)) for row in zip(*columns)]
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -1197,35 +1310,42 @@ def main():
              "induced positive lobe emits 0–1 (often sub-threshold) "
              "packets. Combined with --minimum-witness-charge-threshold "
              "(set above the induced-lobe scale) this selects pads the "
-             "track's charge truly reached. Default 1 (off — any visible "
-             "witness already has ≥ 1 packet). Try 2, then 3.")
+             "track's charge truly reached. Default 1 (OFF by "
+             "recommendation: the staged scan showed it costs ~25%% yield "
+             "for negligible ds-RMS gain, since CUT 2 already removes the "
+             "fringe-witness tail). Try 2, then 3 if a sample needs it.")
     arg_parser.add_argument(
-        "--maximum-direction-disagreement-deg", type=float, default=180.0,
+        "--maximum-direction-disagreement-deg", type=float, default=10.0,
         help="CUT 2 (direction cross-check): reject a tricell if the "
              "witness-to-witness direction and the independent "
              "three-w_1-pad direction disagree by more than this angle "
              "(degrees, sign-agnostic). The single most powerful "
              "witness-quality discriminant — a fringe witness with a "
              "bogus peak tick throws the two directions apart. Default "
-             "180 (off). Recommended 10–15.")
+             "10 (ON — the production default; staged scan: ds-RMS "
+             "0.149→0.094 at ≤10°). Set 180 to disable; 8 is tighter.")
     arg_parser.add_argument(
-        "--maximum-implied-drift-cm", type=float, default=0.0,
+        "--maximum-implied-drift-cm", type=float, default=30.0,
         help="CUT 3a (plausibility): reject a tricell if the implied "
              "|Δdrift| between witnesses exceeds this (cm). Catches "
              "timing outliers (late induced-lobe peaks) that imply a "
-             "drift longer than physically possible. Default 0 (off); "
-             "a physical bound is the drift-window length.")
+             "drift longer than physically possible. Default 30 (≈ the "
+             "drift-window length — a loose safety net; rejects ~0 on a "
+             "clean sim sample but guards real-data outliers). Set 0 to "
+             "disable.")
     arg_parser.add_argument(
-        "--implied-zenith-min-deg", type=float, default=0.0,
+        "--implied-zenith-min-deg", type=float, default=2.0,
         help="CUT 3b (plausibility): reject a tricell whose implied "
              "zenith (angle of the reconstructed direction from the "
-             "drift axis) is below this. Default 0 (off).")
+             "drift axis) is below this. Default 2 (wide safety net). "
+             "Set 0 to disable.")
     arg_parser.add_argument(
-        "--implied-zenith-max-deg", type=float, default=90.0,
+        "--implied-zenith-max-deg", type=float, default=88.0,
         help="CUT 3b (plausibility): reject a tricell whose implied "
-             "zenith exceeds this. Default 90 (off). The generator "
-             "draws zenith in [10°, 80°]; a band like [5, 85] rejects "
-             "unphysical near-horizontal/near-vertical reconstructions.")
+             "zenith exceeds this. Default 88 (wide safety net; the "
+             "generator draws zenith in [10°, 80°]). Set 90 to disable. "
+             "A tighter band like [5, 85] rejects more unphysical "
+             "near-horizontal/near-vertical reconstructions.")
     arg_parser.add_argument(
         "--primary-timing-method", default="centroid",
         choices=PRIMARY_TIMING_METHODS,
@@ -1239,8 +1359,25 @@ def main():
         "--master-rng-seed", type=int, default=20260519)
     arg_parser.add_argument(
         "--outdir", default=".")
+    arg_parser.add_argument(
+        "--from-npz", default=None,
+        help="Offline re-analysis: skip the GPU simulation, load saved "
+             "per-tricell records from this tricell_ds_accuracy_results.npz "
+             "and regenerate the summary table + plots. Works on a machine "
+             "with no CUDA because ds_production_cm (the global line-fit "
+             "pitch) is saved per tricell. Lets you iterate on the "
+             "calibration plot/table without re-running the simulation.")
     arg_parser.add_argument("--verbose", action="store_true")
     args = arg_parser.parse_args()
+
+    # Offline path: rebuild the table/plots straight from a saved npz,
+    # no CUDA needed. Branch BEFORE importing numba.cuda so it runs on a
+    # GPU-less dev box.
+    if args.from_npz is not None:
+        records = load_records_from_npz(args.from_npz)
+        print(f"loaded {len(records)} records from {args.from_npz}")
+        make_summary_plots(records, args.outdir)
+        return
 
     from numba import cuda
     if not cuda.is_available():
@@ -1370,6 +1507,16 @@ def main():
                 tricells_found = list(find_zshape_tricells(
                     hit_pixel_dict,
                     args.minimum_witness_charge_threshold))
+
+                # PRODUCTION ds (global line-fit pitch): fit ONE 3D line
+                # through ALL the track's hit pixels. This is the NDLAr
+                # production-style direction (see fit_global_track_direction
+                # for provenance). It needs every hit pixel — which are NOT
+                # in the per-tricell records — so it MUST be computed here
+                # and saved per tricell; it cannot be recovered offline.
+                global_track_direction = fit_global_track_direction(
+                    hit_pixel_dict, detector)
+                n_hits_in_global_fit = len(hit_pixel_dict)
 
                 for tricell in tricells_found:
                     n_tricells_examined += 1
@@ -1519,6 +1666,23 @@ def main():
                     dQdx_truth_per_dx = (n_electrons_post_drift
                                          / track_length_cm)
 
+                    # PRODUCTION ds for THIS pixel: same pitch/projection
+                    # formula as the tricell (apples-to-apples), but the
+                    # direction comes from the GLOBAL line fit over all
+                    # the track's hits instead of the local 5-pixel
+                    # witnesses. ds = pitch / |dir_v|, with dir_v the
+                    # direction cosine along the traversal (v) axis.
+                    ds_production_cm = float('nan')
+                    global_dir_v_component = float('nan')
+                    if global_track_direction is not None:
+                        v_index = (0 if tricell['traversal_axis'] == 'x'
+                                   else 1)
+                        global_dir_v_component = abs(
+                            global_track_direction[v_index])
+                        if global_dir_v_component > 1e-6:
+                            ds_production_cm = (
+                                pitch_cm / global_dir_v_component)
+
                     records.append(dict(
                         track_index=track_index,
                         seed_index=seed_index,
@@ -1576,6 +1740,14 @@ def main():
                         dQdx_readout_per_dx_truth=(
                             dQdx_readout_per_dx_truth),
                         dQdx_truth_per_dx=dQdx_truth_per_dx,
+                        # PRODUCTION ds (global line-fit pitch) — the
+                        # NDLAr-production baseline the tricell ds is
+                        # measured against in the calibration plot. NaN
+                        # if the global fit failed (<3 hits / degenerate)
+                        # or the track runs ⟂ to the traversal axis.
+                        ds_production_cm=ds_production_cm,
+                        n_hits_in_global_fit=n_hits_in_global_fit,
+                        global_dir_v_component=global_dir_v_component,
                         # Alternative witness timings — save for offline
                         # reprocessing (recompute ds with different
                         # timing extractors and compare).
@@ -1645,7 +1817,152 @@ def main():
         witness_charge_floor=args.minimum_witness_charge_threshold,
         witness_packet_floor=args.minimum_witness_packets,
         direction_disagreement_cut_deg=(
-            args.maximum_direction_disagreement_deg))
+            args.maximum_direction_disagreement_deg),
+        pitch_cm=pitch_cm)
+
+
+# ---------------------------------------------------------------------------
+# Calibration-constant uncertainty (production line-fit ds vs tricell ds)
+# ---------------------------------------------------------------------------
+# Method labels and the ds field each draws its per-tricell path length
+# from. "production" = global line-fit pitch (NDLAr-production style);
+# "tricell" = local 5-pixel ds; "truth" = SIM-ONLY ceiling.
+CALIBRATION_METHOD_DS_FIELD = dict(
+    production='ds_production_cm',
+    tricell='ds_recon_cm',
+    truth='ds_truth_cm')
+CALIBRATION_METHOD_LABEL = dict(
+    production='production (line fit)',
+    tricell='tricell (5-pixel)',
+    truth='truth-ds (SIM-ONLY)')
+CALIBRATION_METHOD_ORDER = ['production', 'tricell', 'truth']
+
+
+def _nan_calibration_summary(ratio_array=None, n=0):
+    return dict(
+        median_ratio=float('nan'),
+        fractional_rms=float('nan'),
+        standard_error=float('nan'),
+        tracks_for_one_percent=float('nan'),
+        ratio_array=(ratio_array if ratio_array is not None
+                     else np.array([])),
+        N=int(n))
+
+
+def compute_calibration_ratio_summary(records):
+    """Per-method calibration-constant precision from saved records alone.
+
+    For each ds method we form the per-tricell calibration ratio
+        r = (q_centre / ds) / dQdx_truth_per_dx
+    i.e. how the readout dQ/dx built with that method's ds compares to
+    the truth dQ/dx. A calibration constant is the sample statistic of
+    r across many tricells; its uncertainty is the spread of r. Per
+    method we report:
+        median_ratio           = median(r)                  (the constant)
+        fractional_rms         = RMS(r - median) / median    (rel. spread)
+        standard_error         = fractional_rms / sqrt(N)    (precision)
+        tracks_for_one_percent = (fractional_rms / 0.01) ** 2
+    A SMALLER fractional_rms ⇒ a TIGHTER calibration constant.
+
+    Uses only saved record fields (q_centre, dQdx_truth_per_dx, and each
+    method's ds), so it runs identically on GPU records and on
+    npz-reloaded records — no CUDA, no matplotlib.
+
+    Methods compared:
+      production : ds_production_cm (global line-fit pitch; data-style)
+      tricell    : ds_recon_cm      (local 5-pixel ds;   data-style)
+      truth      : ds_truth_cm      (SIM-ONLY ceiling; never a method)
+
+    Guards: a method is reported as NaN if its ds field is absent, if
+    fewer than 2 tricells have a usable (|ds|>1e-6, finite q and dQdx,
+    dQdx>0) ratio, or if the resulting median ratio is non-positive.
+    """
+    summary = {}
+    if not records:
+        for method in CALIBRATION_METHOD_ORDER:
+            summary[method] = _nan_calibration_summary()
+        return summary
+
+    q_centre = np.array(
+        [float(r['q_centre']) for r in records], dtype=float)
+    dQdx_truth = np.array(
+        [float(r['dQdx_truth_per_dx']) for r in records], dtype=float)
+
+    for method in CALIBRATION_METHOD_ORDER:
+        ds_field = CALIBRATION_METHOD_DS_FIELD[method]
+        if ds_field not in records[0]:
+            summary[method] = _nan_calibration_summary()
+            continue
+        ds_values = np.array(
+            [float(r[ds_field]) for r in records], dtype=float)
+        usable = (np.isfinite(ds_values) & (np.abs(ds_values) > 1e-6)
+                  & np.isfinite(q_centre) & np.isfinite(dQdx_truth)
+                  & (dQdx_truth > 0))
+        ratio = (q_centre[usable] / ds_values[usable]) / dQdx_truth[usable]
+        ratio = ratio[np.isfinite(ratio)]
+        n = int(ratio.size)
+        if n < 2:
+            summary[method] = _nan_calibration_summary(ratio, n)
+            continue
+        median_ratio = float(np.median(ratio))
+        if not np.isfinite(median_ratio) or median_ratio <= 0:
+            summary[method] = _nan_calibration_summary(ratio, n)
+            continue
+        fractional_rms = float(
+            np.sqrt(np.mean((ratio - median_ratio) ** 2)) / median_ratio)
+        summary[method] = dict(
+            median_ratio=median_ratio,
+            fractional_rms=fractional_rms,
+            standard_error=fractional_rms / sqrt(n),
+            tracks_for_one_percent=(fractional_rms / 0.01) ** 2,
+            ratio_array=ratio,
+            N=n)
+    return summary
+
+
+def print_calibration_table(summary):
+    """Print the calibration-constant uncertainty table (no matplotlib).
+
+    Emitted straight from the summary dict so it shows up in the run log
+    even on a machine without a plotting backend. The headline compares
+    the production (global line-fit) and tricell (local 5-pixel)
+    fractional RMS: the smaller wins.
+    """
+    print("")
+    print("CALIBRATION-CONSTANT UNCERTAINTY  (r = (q/ds)/dQdx_truth)")
+    print(f"{'method':<24}{'median(r)':>11}{'fracRMS':>9}"
+          f"{'sigma_const':>13}{'N_for_1%':>11}")
+    for method in CALIBRATION_METHOD_ORDER:
+        s = summary.get(method, _nan_calibration_summary())
+        print(f"{CALIBRATION_METHOD_LABEL[method]:<24}"
+              f"{s['median_ratio']:>11.4f}{s['fractional_rms']:>9.3f}"
+              f"{s['standard_error']:>13.4f}"
+              f"{s['tracks_for_one_percent']:>11.0f}"
+              f"   (N={s['N']})")
+
+    production = summary.get('production', _nan_calibration_summary())
+    tricell = summary.get('tricell', _nan_calibration_summary())
+    production_rms = production['fractional_rms']
+    tricell_rms = tricell['fractional_rms']
+    if (np.isfinite(production_rms) and np.isfinite(tricell_rms)
+            and production_rms > 0):
+        print(f"=> tricell fracRMS / production fracRMS = "
+              f"{tricell_rms / production_rms:.2f}")
+        print(f"   tricell needs {tricell['tracks_for_one_percent']:.0f} "
+              f"tracks for 1% vs "
+              f"{production['tracks_for_one_percent']:.0f} for production.")
+        if tricell_rms < production_rms:
+            print("   => TRICELL gives the tighter calibration constant "
+                  "(local 5-pixel ds beats the global track fit).")
+        elif tricell_rms > production_rms:
+            print("   => production is tighter; the tricell ds does NOT "
+                  "improve on the global track fit here.")
+        else:
+            print("   => production ≈ tricell; no measurable improvement.")
+    else:
+        print("=> comparison unavailable (a method had <2 usable "
+              "tricells; loosen cuts or run more tracks).")
+    print("")
 
 
 # ---------------------------------------------------------------------------
@@ -1654,10 +1971,32 @@ def main():
 def make_summary_plots(records, outdir,
                        witness_charge_floor=None,
                        witness_packet_floor=None,
-                       direction_disagreement_cut_deg=None):
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
+                       direction_disagreement_cut_deg=None,
+                       pitch_cm=None):
+    # The calibration-constant uncertainty table is computed and printed
+    # FIRST, from saved record fields only, so it appears in the run log
+    # even on a machine without matplotlib (e.g. the offline --from-npz
+    # path on a dev box). Plotting is best-effort below.
+    calibration_summary = compute_calibration_ratio_summary(records)
+    print_calibration_table(calibration_summary)
+
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError:
+        print("matplotlib not available — skipping plots "
+              "(calibration table above was emitted from the records).")
+        return
+
+    # Pad pitch for the money-plot annotation. Offline (no detector
+    # handy) fall back to the reconstructed Δw, which IS one pad pitch.
+    if pitch_cm is None and records:
+        delta_w_values = np.array(
+            [float(r['delta_w_cm']) for r in records
+             if np.isfinite(float(r.get('delta_w_cm', np.nan)))])
+        if delta_w_values.size:
+            pitch_cm = float(np.median(delta_w_values))
 
     fractional_difference = np.array(
         [r['fractional_difference'] for r in records])
@@ -2065,6 +2404,77 @@ def make_summary_plots(records, outdir,
             ax.legend(fontsize=9)
             ax.grid(alpha=0.3)
             save_figure(fig, "tricell_direction_disagreement.png")
+
+    # ----- Money plot: calibration-constant uncertainty -----
+    # Three overlaid histograms of the per-tricell calibration ratio
+    # r = (q_centre/ds) / dQdx_truth, one per ds source. A narrower
+    # distribution ⇒ a tighter calibration constant. The question the
+    # plot answers: does the LOCAL tricell ds (C2) beat the GLOBAL
+    # line-fit pitch PRODUCTION ds (C1) that NDLAr reconstruction uses
+    # today? truth-ds (C0) is the SIM-ONLY ceiling.
+    method_color = dict(production="C1", tricell="C2", truth="C0")
+    ratio_arrays = {
+        method: calibration_summary[method]['ratio_array']
+        for method in CALIBRATION_METHOD_ORDER
+        if calibration_summary[method]['N'] >= 2}
+    if ratio_arrays:
+        pooled = np.concatenate(list(ratio_arrays.values()))
+        bin_low, bin_high = np.percentile(pooled, [1.0, 99.0])
+        if not (np.isfinite(bin_low) and np.isfinite(bin_high)
+                and bin_high > bin_low):
+            bin_low, bin_high = float(pooled.min()), float(pooled.max())
+        if bin_high <= bin_low:
+            bin_high = bin_low + 1.0
+        shared_bins = np.linspace(bin_low, bin_high, 51)
+
+        fig, ax = plt.subplots(figsize=(9, 5.5))
+        for method in CALIBRATION_METHOD_ORDER:
+            s = calibration_summary[method]
+            if s['N'] < 2:
+                continue
+            ax.hist(
+                s['ratio_array'], bins=shared_bins, histtype="step",
+                lw=2.0, color=method_color[method],
+                label=(f"{CALIBRATION_METHOD_LABEL[method]}: "
+                       f"median={s['median_ratio']:.4f}, "
+                       f"fracRMS={s['fractional_rms']:.3f}, "
+                       f"σ_const={s['standard_error']:.4f}, "
+                       f"N(1%)={s['tracks_for_one_percent']:.0f} "
+                       f"(N={s['N']})"))
+
+        production_summary = calibration_summary['production']
+        if np.isfinite(production_summary['median_ratio']):
+            ax.axvline(
+                production_summary['median_ratio'], color="C1", ls="--",
+                lw=1.0, label="production median")
+
+        production_rms = production_summary['fractional_rms']
+        tricell_rms = calibration_summary['tricell']['fractional_rms']
+        if (np.isfinite(production_rms) and np.isfinite(tricell_rms)
+                and production_rms > 0):
+            ratio_text = (
+                f"tricell/production fracRMS = "
+                f"{tricell_rms / production_rms:.2f}  "
+                + ("(tricell tighter ✓)" if tricell_rms < production_rms
+                   else "(production tighter)"))
+        else:
+            ratio_text = "comparison unavailable"
+
+        pitch_text = (f"  [pad pitch = {pitch_cm:.4f} cm]"
+                      if pitch_cm is not None else "")
+        ax.set_xlabel(
+            "calibration ratio  r = (q_centre / ds) / dQdx_truth")
+        ax.set_ylabel("tricell count")
+        ax.set_title(
+            "Calibration-constant uncertainty: local tricell ds vs "
+            "global line-fit (production) ds\n"
+            "narrower = tighter calibration constant.  "
+            + ratio_text + pitch_text
+            + "\n(truth-ds is a SIM-ONLY ceiling; "
+            "production = NDLAr-style global line-fit pitch)")
+        ax.legend(fontsize=8, loc="upper right")
+        ax.grid(alpha=0.3)
+        save_figure(fig, "tricell_calibration_constant_uncertainty.png")
 
     # ---- Console summary ----
     print("\n" + "=" * 70)
