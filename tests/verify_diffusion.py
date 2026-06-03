@@ -155,10 +155,15 @@ def plane_z(detector, plane=0):
 
 
 def active_volume(detector, plane=0, margin=1.0):
-    """(x0, x1, y0, y1) of the anode face, inset by `margin` cm."""
+    """(x0, x1, y0, y1) of the anode face, inset by `margin` cm.
+
+    Uses min/max because TPC_BORDERS rows are not guaranteed ascending (the z
+    border in particular is stored descending for cathode_direction<0); applying
+    the same robust convention to x/y keeps the inset correct either way.
+    """
     b = detector.TPC_BORDERS[plane]
-    return (b[0][0] + margin, b[0][1] - margin,
-            b[1][0] + margin, b[1][1] - margin)
+    return (min(b[0]) + margin, max(b[0]) - margin,
+            min(b[1]) + margin, max(b[1]) - margin)
 
 
 def depth_to_z(detector, drift_cm, plane=0):
@@ -446,10 +451,22 @@ def simulate_event(ctx, tracks, seed=12345, with_fee=False):
 # ===========================================================================
 # Measurements (each a few lines)
 # ===========================================================================
-def drift_distance_of(tracks, detector, plane=0):
-    """Per-segment drift distance |z - z_anode| (cm)."""
-    z_anode, _, _ = plane_z(detector, plane)
-    return np.abs(tracks["z"] - z_anode)
+def drift_distance_of(tracks, detector):
+    """Per-segment drift distance |z - z_anode| (cm), from the KERNEL-assigned plane.
+
+    drift() assigns each segment a pixel_plane and computes its drift time from
+    THAT plane's anode (drifting.py:44-48); module0 has two TPCs with anodes at
+    different z, so a fixed plane=0 anode would mis-measure any segment that landed
+    in TPC 1. Segments outside all TPC boxes are never drifted (pixel_plane stays
+    detector.DEFAULT_PLANE_INDEX, t=0); we return NaN for those so they can be
+    dropped rather than polluting the t-vs-d fit with (d>0, t=0) outliers.
+    """
+    planes = np.asarray(tracks["pixel_plane"]).astype(np.int64)
+    nplanes = detector.TPC_BORDERS.shape[0]
+    valid = (planes >= 0) & (planes < nplanes)
+    z_anode = np.full(planes.shape, np.nan)
+    z_anode[valid] = detector.TPC_BORDERS[planes[valid], 2, 0]
+    return np.abs(np.asarray(tracks["z"]) - z_anode)  # NaN where un-drifted
 
 
 def collected_charge(signals):
@@ -469,17 +486,40 @@ def active_pixel_count(signals, frac=1e-3):
     return int((prof > frac * prof.max()).sum()) if prof.max() > 0 else 0
 
 
-def transverse_rms(ctx, signals, neigh, plane=0):
-    """Charge-weighted RMS of pixel x-positions (cm)."""
-    prof = pixel_charge_profile(signals)
+def pixel_xy_from_id(detector, pid):
+    """Decode pixel IDs -> physical (x, y) pad centers, mirroring detsim.
+
+    Inverse of pixels_from_track.pixel2id (id = ix + Nx*(iy + Ny*plane)) followed
+    by detsim.get_pixel_coordinates: pix = i * PITCH + TPC_BORDERS[plane][axis][0].
+    Decoding the plane from the ID (not assuming plane 0) keeps the transverse
+    measurement correct across module0's two TPCs.
+    """
+    nx, ny = detector.N_PIXELS
+    pid = np.asarray(pid, dtype=np.int64)
+    ix = pid % nx
+    iy = (pid // nx) % ny
+    plane = pid // (nx * ny)
+    plane = np.clip(plane, 0, detector.TPC_BORDERS.shape[0] - 1)
+    x0 = detector.TPC_BORDERS[plane, 0, 0]
+    y0 = detector.TPC_BORDERS[plane, 1, 0]
+    return x0 + ix * detector.PIXEL_PITCH, y0 + iy * detector.PIXEL_PITCH
+
+
+def transverse_rms(ctx, signals, neigh):
+    """Charge-weighted RMS of pixel x-positions (cm).
+
+    Weights each (segment, pixel) cell by |time-integrated signal|; flattening
+    keeps neigh[seg, p] aligned with signals[seg, p, :]. For the point-source
+    handle there is one segment, so this is the per-pad collected profile.
+    """
+    s = to_host(signals)
+    per_cell = s.sum(axis=2).reshape(-1) if s.ndim == 3 else s.reshape(-1)
     ids = to_host(neigh).reshape(-1)
-    prof_flat = to_host(signals).sum(axis=2).reshape(-1) if signals.ndim == 3 else prof
-    mass = np.abs(prof_flat)
+    mass = np.abs(per_cell)
     keep = (ids != -1) & (mass > 0)
     if keep.sum() == 0:
         return np.nan
-    ix = ids[keep] % ctx.detector.N_PIXELS[0]
-    xs = ctx.detector.TPC_BORDERS[plane][0][0] + (ix + 0.5) * ctx.detector.PIXEL_PITCH
+    xs, _ = pixel_xy_from_id(ctx.detector, ids[keep])
     w = mass[keep]
     mean = np.average(xs, weights=w)
     return float(sqrt(np.average((xs - mean) ** 2, weights=w)))
@@ -871,20 +911,21 @@ def accumulate_muons(ctx, n_muons, rng, seed0=1000):
     cols = {k: [] for k in ("drift_cm", "t", "n_e_in", "n_e_out", "collected")}
     for ev in range(n_muons):
         raw = build_muon_event(ctx.detector, rng)
-        n_in = raw["n_electrons"].astype(float).copy()
-        # n_electrons starts at 0 until quench; estimate input from Box on dE
         out = simulate_event(ctx, raw, seed=seed0 + ev)
         if out is None:
             continue
         drifted = out["tracks"]
+        d = drift_distance_of(drifted, ctx.detector)
+        keep = np.isfinite(d)            # drop segments drift() never processed
+        if not keep.any():
+            continue
         n_in_q = recomb_input_electrons(ctx, raw)
-        cols["drift_cm"].append(drift_distance_of(drifted, ctx.detector))
-        cols["t"].append(drifted["t"])
-        cols["n_e_in"].append(n_in_q)
-        cols["n_e_out"].append(drifted["n_electrons"].astype(float))
-        per_seg = pixel_charge_profile(out["signals"])  # not per-seg; use total
-        cols["collected"].append(np.full(drifted.shape[0],
-                                         collected_charge(out["signals"]) / drifted.shape[0]))
+        collected = collected_charge(out["signals"]) / drifted.shape[0]
+        cols["drift_cm"].append(d[keep])
+        cols["t"].append(drifted["t"][keep])
+        cols["n_e_in"].append(n_in_q[keep])
+        cols["n_e_out"].append(drifted["n_electrons"].astype(float)[keep])
+        cols["collected"].append(np.full(int(keep.sum()), collected))
     return {k: np.concatenate(v) for k, v in cols.items() if v}
 
 
@@ -906,6 +947,8 @@ def accumulate_point_scan(ctx, depths, seed0=5000):
         if out is None:
             continue
         drifted = out["tracks"]
+        if not np.isfinite(drift_distance_of(drifted, ctx.detector)[0]):
+            continue  # point fell outside the TPC box -> never drifted; skip
         cols["drift_cm"].append(depth)
         cols["long_diff"].append(float(drifted["long_diff"][0]))
         cols["tran_diff"].append(float(drifted["tran_diff"][0]))
@@ -918,9 +961,9 @@ def accumulate_point_scan(ctx, depths, seed0=5000):
     return {k: np.array(v) for k, v in cols.items()}
 
 
-def psf_sigma_squared(ctx, signals, neigh, plane=0):
+def psf_sigma_squared(ctx, signals, neigh):
     """Variance (cm^2) of the per-pixel transverse charge profile."""
-    rms = transverse_rms(ctx, signals, neigh, plane)
+    rms = transverse_rms(ctx, signals, neigh)
     return rms ** 2 if np.isfinite(rms) else np.nan
 
 
