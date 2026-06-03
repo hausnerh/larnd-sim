@@ -485,7 +485,7 @@ def transverse_rms(ctx, signals, neigh, plane=0):
     return float(sqrt(np.average((xs - mean) ** 2, weights=w)))
 
 
-def waveform_time_rms(ctx, signals, neigh):
+def waveform_time_rms(ctx, signals):
     """Time RMS (us) of the busiest pixel's waveform."""
     prof = np.abs(pixel_charge_profile(signals))
     if prof.max() <= 0:
