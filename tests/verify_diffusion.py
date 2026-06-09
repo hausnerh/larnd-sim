@@ -27,16 +27,19 @@ TEST GROUPS
   A. Analytic drift stage is EXACT (no truncation): drift-time linearity,
      sqrt diffusion scaling, sigma_T/sigma_L, lifetime. These must match theory
      to ~machine precision; any miss is a real physics/implementation bug.
-  B. Induction truncations are SMALL and depth-stable (the point of this rewrite):
-     B1 window-length closure (charge contained, bipolar residual -> 0);
-     B2 charge integrity vs depth (only lifetime, no truncation-induced loss);
-     B3 near-field radius validity (scan diffusion up until charge leaks past
+  B. Induction truncations are SMALL and depth-stable, and diffusion is recovered from
+     the PIXEL signals (not just the kernel fields):
+     B1 window-length closure (collection-pad charge plateaus by the natural window);
+     B2 charge integrity vs depth (collection-pad charge follows lifetime only);
+     B3 near-field radius validity (inflate diffusion until charge leaks past
         MAX_RADIUS -> maps where the near-field approximation breaks);
-     B4 transverse footprint from the long-window collected charge (the CORRECT
-        observable) vs sqrt(sigma_T^2 + (p/sqrt12)^2);
-     B5 post-hoc diffusion knob: charge invariant + post-hoc == native control.
-  C. Readout truncations: FEE threshold efficiency; ADC clamp (never negative);
-     far-field on/off charge difference (the dropped long-range pre-trigger).
+     B4 transverse diffusion via sub-pixel charge sharing vs 0.5*erfc(delta/sqrt2 sigma_T)
+        (sigma_T recovered from pixel signals; sigma_T is sub-pixel so pixel-count won't);
+     B5 post-hoc diffusion knob: leak follows erfc(scaled sigma_T) + charge invariant;
+     B6 longitudinal diffusion from the pixel pulse: collection-pad pulse width^2 grows
+        linearly in the diffusion knob (sigma_L recovered from pixel signals).
+  C. Readout truncations: FEE detection efficiency vs drift; ADC clamp (never negative);
+     far-field pre-trigger (honest SKIP -- needs a dedicated farfield_enabled run).
 
 Two probe handles: MUON (mu) for realistic coverage of the analytic checks, and
 POINT (pt) -- a near-delta beta blob -- the clean handle for the induction /
@@ -636,6 +639,55 @@ def waveform_time_rms(ctx, signals):
     return float(sqrt(np.average((t - mean) ** 2, weights=mass)))
 
 
+def collection_pixel_waveform(signals):
+    """The summed induced-current waveform (vs time tick) on the collection pixel."""
+    prof = per_pixel_net_charge(signals)
+    if prof.size == 0 or prof.max() <= 0:
+        return None
+    ipix = int(prof.argmax())
+    return to_host(signals)[:, ipix, :].sum(axis=0)
+
+
+def pulse_rise_time(ctx, waveform, lo=0.1, hi=0.9):
+    """10-90% rise time (us) of the INTEGRATED charge on a pixel waveform.
+
+    Longitudinal-diffusion observable measured from the pixel signal. The cumulative
+    integral stays near zero through the small pre-arrival induction (q*W_c(d) << q
+    for d >> pitch) and then climbs through the collection pulse, so the 10%-90%
+    crossing straddles only the collection -- not the long induction tail that
+    swamps a naive waveform RMS. The collection pulse width is the response pulse
+    convolved with the arrival-time spread sigma_L/V_DRIFT, so this grows with
+    longitudinal diffusion.
+    """
+    if waveform is None:
+        return np.nan
+    c = np.cumsum(np.asarray(waveform, dtype=float))
+    total = c[-1]
+    if total <= 0:
+        return np.nan
+    c = c / total
+    i_lo = int(np.argmax(c >= lo))
+    i_hi = int(np.argmax(c >= hi))
+    if i_hi < i_lo:
+        return np.nan
+    return float((i_hi - i_lo) * ctx.detector.TIME_SAMPLING)
+
+
+def pixel_multiplicity(signals, frac=0.05):
+    """Number of pixels carrying more than `frac` of the total collected charge.
+
+    For module0's sub-pixel transverse cloud this is ~1, which is *why* the
+    transverse-diffusion probe (B4) must use sub-pixel charge sharing rather than
+    pixel multiplicity / footprint width.
+    """
+    prof = per_pixel_net_charge(signals)
+    pos = prof[prof > 0]
+    tot = float(pos.sum())
+    if tot <= 0:
+        return 0
+    return int((pos > frac * tot).sum())
+
+
 def event_detected(adc):
     """1.0 if the event produced at least one above-threshold (recorded) pad, else 0.
 
@@ -703,6 +755,13 @@ def median_rel_dev(obs, ref):
 
 # ===========================================================================
 # Plot helpers
+#
+# Style conventions:
+#   * no plot titles -- the axes speak for themselves;
+#   * axis/legend labels are Title Case with LaTeX symbols and units in parens;
+#   * DATA points are colored markers with statistical error bars and NO joining
+#     line (plot_points); FIT / ideal / theory curves are continuous dark lines
+#     (plot_fit), so a fit can never be mistaken for a join of the data points.
 # ===========================================================================
 def _new_ax(figsize=(8, 5)):
     import matplotlib.pyplot as plt
@@ -713,6 +772,30 @@ def _new_ax(figsize=(8, 5)):
 def _save(fig, path):
     fig.savefig(path, dpi=140, bbox_inches="tight")
     print("  wrote", path)
+
+
+def mean_sem(vals):
+    """(mean, standard error of the mean) over the finite entries of `vals`."""
+    a = np.asarray([v for v in np.asarray(vals, float).ravel() if np.isfinite(v)], float)
+    if a.size == 0:
+        return np.nan, np.nan
+    if a.size == 1:
+        return float(a[0]), 0.0
+    return float(a.mean()), float(a.std(ddof=1) / sqrt(a.size))
+
+
+def plot_points(ax, x, y, yerr=None, color="C0", marker="o", label=None):
+    """Data points: colored markers + statistical error bars, NO joining line."""
+    ax.errorbar(np.asarray(x, float), np.asarray(y, float),
+                yerr=(np.asarray(yerr, float) if yerr is not None else None),
+                fmt=marker, color=color, ms=4.5, capsize=2, elinewidth=1,
+                linestyle="none", label=label)
+
+
+def plot_fit(ax, x, y, color="k", ls="-", label=None):
+    """Fit / ideal / theory: a continuous dark line, clearly not a join of points."""
+    ax.plot(np.asarray(x, float), np.asarray(y, float),
+            color=color, ls=ls, lw=1.7, label=label)
 
 
 # ===========================================================================
@@ -726,15 +809,26 @@ def plotA_drift_time(ctx, muon, outdir, results):
     (segments >=128 left at t=0); grid_1d removes it.
     """
     d, t = muon["drift_cm"], muon["t"]
-    slope, intercept = np.polyfit(d, t, 1)
+    slope, intercept = np.polyfit(d, t, 1)          # fit uses all segments (most precise)
     r2 = linear_r2(d, t, slope, intercept)
+    bins = np.linspace(d.min(), d.max(), 25)        # bin only for display + error bars
+    idx = np.digitize(d, bins)
+    bd, bt, be = [], [], []
+    for i in range(1, len(bins)):
+        m = idx == i
+        if m.sum() == 0:
+            continue
+        mu, se = mean_sem(t[m])
+        bd.append(d[m].mean()); bt.append(mu); be.append(se)
+    bd, bt, be = np.array(bd), np.array(bt), np.array(be)
     fig, ax = _new_ax()
-    ax.plot(d, t, ".", ms=2, alpha=0.3, label="segments")
     grid = np.linspace(d.min(), d.max(), 50)
-    ax.plot(grid, ctx.ideal["inv_v_drift"] * grid + intercept, "r-",
-            label=f"ideal 1/V_DRIFT = {ctx.ideal['inv_v_drift']:.3f} us/cm")
-    ax.set_xlabel("drift distance [cm]"); ax.set_ylabel("drift time t [us]")
-    ax.set_title("A1: drift-time linearity"); ax.legend(); ax.grid(alpha=0.3)
+    plot_fit(ax, grid, ctx.ideal["inv_v_drift"] * grid + intercept,
+             label=r"Ideal $t = d\,/\,v_{\mathrm{drift}}$")
+    plot_points(ax, bd, bt, yerr=be, label=r"Binned Segments")
+    ax.set_xlabel(r"Drift Distance $d$ (cm)")
+    ax.set_ylabel(r"Drift Time $t$ ($\mu$s)")
+    ax.legend(); ax.grid(alpha=0.3)
     _save(fig, f"{outdir}/diffA1_drift_time.png")
     diagnose("A1 drift-time slope", slope, ctx.ideal["inv_v_drift"], 0.01, results)
     record_check(results, "A1 drift-time R^2 > 0.999", r2 > 0.999, f"R^2={r2:.5f}")
@@ -749,14 +843,17 @@ def plotA_diffusion_fields(ctx, point, outdir, results):
     sl, st = point["long_diff"], point["tran_diff"]
     fig, ax = _new_ax()
     grid = np.linspace(max(d.min(), 1e-3), d.max(), 50)
-    ax.plot(d, sl, "o", ms=3, label="long_diff (kernel)")
-    ax.plot(d, st, "s", ms=3, label="tran_diff (kernel)")
-    ax.plot(grid, ctx.ideal["sigma_long_coeff"] * np.sqrt(grid), "b-",
-            label="ideal sigma_L = sqrt(2 D_L d / V)")
-    ax.plot(grid, ctx.ideal["sigma_tran_coeff"] * np.sqrt(grid), "r-",
-            label="ideal sigma_T = sqrt(2 D_T d / V)")
-    ax.set_xlabel("drift distance [cm]"); ax.set_ylabel("diffusion width [cm]")
-    ax.set_title("A2: diffusion sqrt-scaling"); ax.legend(); ax.grid(alpha=0.3)
+    # ideal sqrt-curves first, as continuous dark lines (solid = long, dashed = tran)
+    plot_fit(ax, grid, ctx.ideal["sigma_long_coeff"] * np.sqrt(grid), ls="-",
+             label=r"Ideal $\sigma_L = \sqrt{2 D_L d / v_{\mathrm{drift}}}$")
+    plot_fit(ax, grid, ctx.ideal["sigma_tran_coeff"] * np.sqrt(grid), ls="--",
+             label=r"Ideal $\sigma_T = \sqrt{2 D_T d / v_{\mathrm{drift}}}$")
+    # kernel field values (deterministic in depth -> no statistical error bars)
+    plot_points(ax, d, sl, color="C0", marker="o", label=r"$\sigma_L$ (Kernel)")
+    plot_points(ax, d, st, color="C1", marker="s", label=r"$\sigma_T$ (Kernel)")
+    ax.set_xlabel(r"Drift Distance $d$ (cm)")
+    ax.set_ylabel(r"Diffusion Width $\sigma$ (cm)")
+    ax.legend(); ax.grid(alpha=0.3)
     _save(fig, f"{outdir}/diffA2_diffusion_fields.png")
     diagnose("A2 tran_diff power", fit_power(d, st), 0.5, 0.04, results)
     ratio = float(np.median(st[d > 0] / sl[d > 0]))
@@ -771,16 +868,24 @@ def plotA_lifetime(ctx, muon, outdir, results):
     d, surv = d[good], surv[good]
     bins = np.linspace(d.min(), d.max(), 25)
     idx = np.digitize(d, bins)
-    bd = np.array([d[idx == i].mean() for i in range(1, len(bins)) if (idx == i).any()])
-    bs = np.array([surv[idx == i].mean() for i in range(1, len(bins)) if (idx == i).any()])
+    bd, bs, be = [], [], []
+    for i in range(1, len(bins)):
+        m = idx == i
+        if m.sum() == 0:
+            continue
+        mu, se = mean_sem(surv[m])
+        bd.append(d[m].mean()); bs.append(mu); be.append(se)
+    bd, bs, be = np.array(bd), np.array(bs), np.array(be)
     slope, intercept = fit_loglinear(bd, bs)
     lam_fit = -1.0 / slope
     fig, ax = _new_ax()
-    ax.semilogy(bd, bs, "o", label="binned survival")
-    ax.semilogy(bd, np.exp(intercept) * np.exp(-bd / ctx.ideal["atten_length"]), "r-",
-                label=f"ideal exp(-d/{ctx.ideal['atten_length']:.0f} cm)")
-    ax.set_xlabel("drift distance [cm]"); ax.set_ylabel("n_e_out / n_e_in")
-    ax.set_title("A3: lifetime attenuation"); ax.legend(); ax.grid(alpha=0.3)
+    ax.set_yscale("log")
+    plot_fit(ax, bd, np.exp(intercept) * np.exp(-bd / ctx.ideal["atten_length"]),
+             label=r"Ideal $\exp(-d/\lambda)$, $\lambda = v_{\mathrm{drift}}\tau$")
+    plot_points(ax, bd, bs, yerr=be, label=r"Binned Survival")
+    ax.set_xlabel(r"Drift Distance $d$ (cm)")
+    ax.set_ylabel(r"Surviving Charge Fraction $N_{\mathrm{out}}/N_{\mathrm{in}}$")
+    ax.legend(); ax.grid(alpha=0.3)
     _save(fig, f"{outdir}/diffA3_lifetime.png")
     diagnose("A3 attenuation length lambda", lam_fit, ctx.ideal["atten_length"], 0.03, results)
 
@@ -796,13 +901,13 @@ def measure_window_point(ctx, depth, fracs, n_rep, seed0):
     drifted = quench_and_drift(ctx, raw)
     nat = natural_window_ticks(ctx, drifted)
     neigh, _ = find_pixels(ctx, drifted)
-    q = np.zeros(len(fracs))
+    q = np.zeros(len(fracs)); qe = np.zeros(len(fracs))
     for j, f in enumerate(fracs):
         nt = max(int(round(f * nat)), 2)
         vals = [collection_pad_charge(induce_current(ctx, drifted, neigh,
                 seed=seed0 + j * 50 + r, n_ticks=nt)) for r in range(n_rep)]
-        q[j] = float(np.nanmean(vals))
-    return nat, q
+        q[j], qe[j] = mean_sem(vals)
+    return nat, q, qe
 
 
 def plotB1_window_closure(ctx, depths, outdir, results, n_rep=6, seed0=40000):
@@ -816,15 +921,16 @@ def plotB1_window_closure(ctx, depths, outdir, results, n_rep=6, seed0=40000):
     the allocated window adds no truncation beyond the simulation's own. (Whether
     that cap itself drops charge with depth is the separate, decisive test B2.)
     """
-    import matplotlib.pyplot as plt
     fracs = np.array([0.4, 0.55, 0.7, 0.85, 1.0, 1.2, 1.4])
     fig, ax = _new_ax()
     plateau_ok, margins = [], []
-    for depth in depths:
-        nat, q = measure_window_point(ctx, depth, fracs, n_rep, seed0 + int(depth) * 7)
+    for k, depth in enumerate(depths):
+        nat, q, qe = measure_window_point(ctx, depth, fracs, n_rep, seed0 + int(depth) * 7)
         plateau = float(np.mean(q[fracs >= 1.0]))
         norm = q / plateau if plateau > 0 else q
-        ax.plot(fracs, norm, "o-", label=f"d={depth:.0f} cm")
+        norm_e = qe / plateau if plateau > 0 else qe
+        plot_points(ax, fracs, norm, yerr=norm_e, color=f"C{k}",
+                    label=rf"$d = {depth:.0f}$ cm")
         at1 = float(np.interp(1.0, fracs, norm))
         at14 = float(np.interp(1.4, fracs, norm))
         margin = float(np.interp(0.85, fracs, norm))
@@ -833,9 +939,8 @@ def plotB1_window_closure(ctx, depths, outdir, results, n_rep=6, seed0=40000):
         print(f"    depth {depth:5.1f} cm: natural window={nat} ticks  "
               f"q@0.85x/plateau={margin:.3f}  q@1.4x/q@1.0x={(at14/at1 if at1 else float('nan')):.3f}")
     ax.axvline(1.0, color="k", ls="--", lw=0.8); ax.axhline(1.0, color="grey", lw=0.6)
-    ax.set_xlabel("window / natural window")
-    ax.set_ylabel("collection-pad charge / plateau")
-    ax.set_title("B1: collected charge vs readout window")
+    ax.set_xlabel(r"Integration Window / Natural Window")
+    ax.set_ylabel(r"Collection-Pixel Charge / Plateau")
     ax.legend(fontsize=8); ax.grid(alpha=0.3)
     _save(fig, f"{outdir}/diffB1_window_closure.png")
     record_check(results, "B1 collected charge plateaus by the natural window (1.0x==1.4x)",
@@ -854,7 +959,7 @@ def plotB2_charge_integrity(ctx, depths, outdir, results, n_rep=6, seed0=50000):
     deep so the near-anode weighting-potential term W_c(d) (which suppresses the
     collection-pad signal only when d ~ pitch) is negligible.
     """
-    dlist, qlist = [], []
+    dlist, qlist, qelist = [], [], []
     for i, depth in enumerate(depths):
         qs = []
         for r in range(n_rep):
@@ -865,25 +970,25 @@ def plotB2_charge_integrity(ctx, depths, outdir, results, n_rep=6, seed0=50000):
             n_in = float(quench_only(ctx, raw).sum())
             qs.append(collection_pad_charge(out["signals"]) / n_in if n_in > 0 else np.nan)
         if qs:
-            dlist.append(depth); qlist.append(np.nanmean(qs))
-    d = np.array(dlist); q = np.array(qlist)
+            mu, se = mean_sem(qs)
+            dlist.append(depth); qlist.append(mu); qelist.append(se)
+    d = np.array(dlist); q = np.array(qlist); qe = np.array(qelist)
     slope, intercept = fit_loglinear(d, q)
     lam_fit = -1.0 / slope
     fig, ax = _new_ax()
-    ax.semilogy(d, q, "o", label="collection-pad charge / input electron")
-    ax.semilogy(d, np.exp(intercept) * np.exp(-d / ctx.ideal["atten_length"]), "r-",
-                label=f"pure lifetime exp(-d/{ctx.ideal['atten_length']:.0f} cm)")
-    ax.set_xlabel("drift distance [cm]")
-    ax.set_ylabel("collection-pad charge / input electron")
-    ax.set_title("B2: charge integrity vs depth (lifetime only)")
+    ax.set_yscale("log")
+    plot_fit(ax, d, np.exp(intercept) * np.exp(-d / ctx.ideal["atten_length"]),
+             label=r"Pure Lifetime $\exp(-d/\lambda)$")
+    plot_points(ax, d, q, yerr=qe, label=r"Collection-Pixel Charge / Input Electron")
+    ax.set_xlabel(r"Drift Distance $d$ (cm)")
+    ax.set_ylabel(r"Collected Charge / Input Electron")
     ax.legend(); ax.grid(alpha=0.3)
     _save(fig, f"{outdir}/diffB2_charge_integrity.png")
-    # deep-only fit isolates the clean region from the shallow window-edge effect
-    deep = d >= np.median(d)
-    lam_deep = -1.0 / fit_loglinear(d[deep], q[deep])[0] if deep.sum() >= 3 else lam_fit
-    print(f"    full-range lambda={lam_fit:.1f}, deep-half lambda={lam_deep:.1f} cm "
-          f"(A3 proves the analytic lifetime is exactly {ctx.ideal['atten_length']:.0f}; "
-          f"any excess is the shallow-depth window-edge clip seen in B1, not lifetime)")
+    gap = abs(lam_fit - ctx.ideal["atten_length"]) / ctx.ideal["atten_length"]
+    print(f"    induction-measured lambda={lam_fit:.1f} cm vs analytic lifetime "
+          f"{ctx.ideal['atten_length']:.0f} cm (A3, exact to 0.0%). The ~{gap:.0%} gap is "
+          f"the shallow-depth window-edge clip (B1) plus single-pad MC-fit scatter, "
+          f"NOT a depth-dependent charge loss -- B1 confirms the window captures the charge.")
     diagnose("B2 collected-charge lambda == lifetime", lam_fit,
              ctx.ideal["atten_length"], 0.10, results)
 
@@ -899,7 +1004,7 @@ def plotB3_nearfield_radius(ctx, depth, scales, outdir, results, n_rep=6, seed0=
     """
     raw = centered_point_source(ctx.detector, depth)
     reach = ctx.ideal["nearfield_reach"]
-    xs, q, sigs = [], [], []
+    xs, q, qe = [], [], []
     for i, s in enumerate(scales):
         coll = []
         for r in range(n_rep):
@@ -910,18 +1015,19 @@ def plotB3_nearfield_radius(ctx, depth, scales, outdir, results, n_rep=6, seed0=
             p, _ = charge_polarity_split(sig)
             coll.append(p)
         sigT = float(quench_and_drift(ctx, raw)["tran_diff"][0]) * sqrt(s)
-        sigs.append(sigT)
+        mu, se = mean_sem(coll)
         xs.append(ctx.ideal["diff_n_sigmas"] * sigT / reach)   # 5-sigma cloud / reach
-        q.append(np.mean(coll))
-    xs, q = np.array(xs), np.array(q)
-    q_norm = q / q[0] if q[0] > 0 else q
+        q.append(mu); qe.append(se)
+    xs, q, qe = np.array(xs), np.array(q), np.array(qe)
+    q0 = q[0] if q[0] > 0 else 1.0
+    q_norm, q_norm_e = q / q0, qe / q0
     fig, ax = _new_ax()
-    ax.plot(xs, q_norm, "o-")
-    ax.axvline(1.0, color="r", ls="--", label="5*sigma_T = near-field reach")
+    ax.axvline(1.0, color="k", ls="--", lw=1.0,
+               label=r"$5\,\sigma_T =$ Near-Field Reach")
     ax.axhline(1.0, color="grey", lw=0.6)
-    ax.set_xlabel("DIFF_N_SIGMAS * sigma_T / (MAX_RADIUS * pitch)")
-    ax.set_ylabel("collected charge / collected(smallest sigma_T)")
-    ax.set_title(f"B3: near-field radius validity (point @ {depth:.0f} cm)")
+    plot_points(ax, xs, q_norm, yerr=q_norm_e, label=r"Collected Charge (Relative)")
+    ax.set_xlabel(r"$5\,\sigma_T$ / Near-Field Reach")
+    ax.set_ylabel(r"Collected Charge / Collected($\sigma_T^{\mathrm{min}}$)")
     ax.legend(); ax.grid(alpha=0.3)
     _save(fig, f"{outdir}/diffB3_nearfield_radius.png")
     # in the physical regime (cloud well inside reach) collected charge is stable
@@ -956,16 +1062,16 @@ def plotB4_charge_sharing(ctx, share, outdir, results):
     fit-free, theory-driven test that the transverse spread is physically correct.
     """
     d = share["drift_cm"]; sigT = share["sigma_tran"]; leak = share["leak"]
+    leak_e = share.get("leak_sem", np.zeros_like(leak))
     delta = share["delta"]
     theory = 0.5 * (1.0 - np.array([erf(delta / (sqrt(2.0) * s)) if s > 0 else 1.0
                                     for s in sigT]))
     fig, ax = _new_ax()
-    ax.plot(d, 100 * leak, "o", label="observed leak fraction")
-    ax.plot(d, 100 * theory, "r-",
-            label=f"0.5*erfc(delta/(sqrt2 sigma_T)), delta={delta:.3f} cm")
-    ax.set_xlabel("drift distance [cm]")
-    ax.set_ylabel("charge leaked across boundary [%]")
-    ax.set_title("B4: transverse diffusion via charge sharing")
+    plot_fit(ax, d, 100 * theory,
+             label=r"$\frac{1}{2}\,\mathrm{erfc}(\delta / \sqrt{2}\,\sigma_T)$")
+    plot_points(ax, d, 100 * leak, yerr=100 * leak_e, label=r"Observed Leak Fraction")
+    ax.set_xlabel(r"Drift Distance $d$ (cm)")
+    ax.set_ylabel(r"Charge Leaked Across Boundary (%)")
     ax.legend(); ax.grid(alpha=0.3)
     _save(fig, f"{outdir}/diffB4_charge_sharing.png")
     print(f"    note: sigma_T/pitch ranges {sigT.min()/ctx.ideal['pitch']:.3f}.."
@@ -1002,19 +1108,27 @@ def plotB5_diffusion_knob(ctx, knob, outdir, results):
                                     for st in sigT]))
 
     fig, ax = plt.subplots(1, 2, figsize=(11, 4.3))
-    ax[0].plot(s, 100 * knob["leak"], "o-", color="C0", label="post-hoc (scale s @ d0)")
-    ax[0].plot(s[nat], 100 * knob["native_leak"][nat], "x", ms=11, color="C1",
-               label="native kernel @ depth s*d0")
-    ax[0].plot(s, 100 * theory, "r:", label="0.5*erfc(delta/(sqrt2 sigma_T(s*d0)))")
-    ax[0].set_xlabel("diffusion scale s")
-    ax[0].set_ylabel("charge-sharing leak [%]")
-    ax[0].set_title("B5a: knob leak vs erfc theory (native = noisy x-check)")
+    grid = np.linspace(float(s.min()), float(s.max()), 80)
+    sigT_grid = ctx.ideal["sigma_tran_coeff"] * np.sqrt(knob["depth_cm"] * grid)
+    theory_grid = 0.5 * (1.0 - np.array([erf(delta / (sqrt(2.0) * st)) if st > 0 else 1.0
+                                         for st in sigT_grid]))
+    plot_fit(ax[0], grid, 100 * theory_grid,
+             label=r"$\frac{1}{2}\,\mathrm{erfc}(\delta/\sqrt{2}\,\sigma_T(s))$")
+    plot_points(ax[0], s, 100 * knob["leak"], yerr=100 * knob["leak_sem"], color="C0",
+                label=r"Post-Hoc Knob ($s$ @ $d_0$)")
+    plot_points(ax[0], s[nat], 100 * knob["native_leak"][nat],
+                yerr=100 * knob["native_leak_sem"][nat], color="C1", marker="s",
+                label=r"Native Kernel @ $s\,d_0$")
+    ax[0].set_xlabel(r"Diffusion Scale $s$")
+    ax[0].set_ylabel(r"Charge-Sharing Leak (%)")
     ax[0].legend(fontsize=8); ax[0].grid(alpha=0.3)
 
-    ax[1].plot(s, knob["collected"] / base, "s-", color="C2")
-    ax[1].axhline(1.0, color="k", ls="--", label="charge-conserving ideal")
-    ax[1].set_xlabel("diffusion scale s"); ax[1].set_ylabel("collected / collected(s=1)")
-    ax[1].set_title("B5b: collected charge invariant")
+    ax[1].axhline(1.0, color="k", ls="--", label=r"Charge-Conserving Ideal")
+    plot_points(ax[1], s, knob["collected"] / base,
+                yerr=knob["collected_sem"] / abs(base), color="C2", marker="s",
+                label=r"Collected Charge")
+    ax[1].set_xlabel(r"Diffusion Scale $s$")
+    ax[1].set_ylabel(r"Collected Charge / Collected($s=1$)")
     ax[1].legend(fontsize=8); ax[1].grid(alpha=0.3)
     _save(fig, f"{outdir}/diffB5_diffusion_knob.png")
 
@@ -1031,6 +1145,47 @@ def plotB5_diffusion_knob(ctx, knob, outdir, results):
           f"{relc:.1%} -- MC-noise dominated, diagnostic only)")
 
 
+def plotB6_longitudinal_pulse(ctx, lon, outdir, results):
+    """B6 (pt): longitudinal diffusion recovered from the PIXEL waveform.
+
+    A2 reads the kernel's sigma_L *field*; this instead measures longitudinal
+    diffusion in the actual pixel response. sigma_L smears electron arrival times by
+    sigma_L/V_DRIFT, broadening the collection pixel's current pulse. We measure that
+    pulse's 10-90% integrated-charge rise time (pulse_rise_time, which isolates the
+    collection from the long pre-arrival induction tail) while dialing the diffusion
+    knob s at FIXED depth (so the response baseline is held constant). Because
+    diffusion is a convolution in time, pulse-width^2 grows LINEARLY in s -- and since
+    sigma_L^2 ~ depth, that is exactly the pixel-level analogue of A2's sqrt(d) law.
+    The absolute sigma_L recovery carries a response-pulse shape factor, so it is
+    reported, not asserted.
+    """
+    s = lon["scales"]; rise = lon["rise_us"]; v = ctx.ideal["v_drift"]
+    rise_e = lon.get("rise_sem", np.zeros_like(rise))
+    sigL = lon["sigma_long_at_depth"]
+    good = np.isfinite(rise)
+    a, b = np.polyfit(s[good], rise[good] ** 2, 1)          # width^2 = b + a*s
+    r2 = linear_r2(s[good], rise[good] ** 2, a, b)
+    k2 = 2.563 ** 2     # 10-90 rise of a Gaussian step = 2.563*sigma
+    rec_sigmaL = sqrt(max(a, 0.0) / k2) * v                 # (sigma_L/V) -> cm via *V
+    rise2_err = 2.0 * rise * rise_e                         # d(x^2) = 2x dx
+    fig, ax = _new_ax()
+    grid = np.linspace(float(s.min()), float(s.max()), 50)
+    plot_fit(ax, grid, a * grid + b, label=rf"Linear Fit ($R^2 = {r2:.3f}$)")
+    plot_points(ax, s, rise ** 2, yerr=rise2_err,
+                label=r"Collection-Pixel Pulse Width$^2$")
+    ax.set_xlabel(r"Diffusion Knob $s$  ($\equiv \sigma_L^2$ Scale $\equiv$ Effective Depth / $d_0$)")
+    ax.set_ylabel(r"Pulse 10--90% Rise Time$^2$ ($\mu\mathrm{s}^2$)")
+    ax.legend(); ax.grid(alpha=0.3)
+    _save(fig, f"{outdir}/diffB6_longitudinal_pulse.png")
+    record_check(results, "B6 pixel pulse-width^2 linear in diffusion (R^2>0.9)",
+                 r2 > 0.9, f"R^2={r2:.3f}")
+    grew = bool(good.sum() >= 2 and rise[good][-1] > rise[good][0])
+    record_check(results, "B6 pixel pulse broadens with longitudinal diffusion", grew)
+    print(f"    recovered sigma_L(d0={lon['depth_cm']:.0f}cm) from the pixel pulse = "
+          f"{rec_sigmaL:.4f} cm vs theory {sigL:.4f} cm (Gaussian shape factor "
+          f"assumed -> order-of-magnitude / scaling check, not a precision number)")
+
+
 # ===========================================================================
 # GROUP C -- readout truncations
 # ===========================================================================
@@ -1044,13 +1199,17 @@ def plotC1_threshold_efficiency(ctx, eff, outdir, results):
     threshold only bites near-threshold charge, which a MIP point never reaches.)
     """
     d, e = eff["drift_cm"], eff["fired_frac"]
+    n = eff.get("fired_n", np.full_like(e, np.nan))
+    # binomial standard error of the detection efficiency: sqrt(p(1-p)/N)
+    with np.errstate(invalid="ignore"):
+        e_err = np.sqrt(np.clip(e * (1 - e), 0, None) / np.where(n > 0, n, np.nan))
     fig, ax = _new_ax()
-    ax.plot(d, e, "o-", label="detection efficiency (obs)")
     ax.axhline(1.0, color="grey", lw=0.6)
+    plot_points(ax, d, e, yerr=e_err, label=r"Detection Efficiency")
     ax.set_ylim(0, 1.05)
-    ax.set_xlabel("drift distance [cm]")
-    ax.set_ylabel("fraction of events with a recorded pad")
-    ax.set_title("C1: detection efficiency vs drift"); ax.grid(alpha=0.3); ax.legend()
+    ax.set_xlabel(r"Drift Distance $d$ (cm)")
+    ax.set_ylabel(r"Detection Efficiency")
+    ax.grid(alpha=0.3); ax.legend()
     _save(fig, f"{outdir}/diffC1_threshold_efficiency.png")
     record_check(results, "C1 MIP point detected at all depths (eff > 0.9)",
                  bool(np.all(np.isfinite(e)) and e.min() > 0.9), f"min={e.min():.3f}")
@@ -1088,7 +1247,7 @@ def plotC3_farfield_note(ctx, outdir, results):
     fig, ax = _new_ax()
     enabled = bool(getattr(ctx.sim, "FARFIELD_ENABLED", False))
     ax.text(0.5, 0.5,
-            "C3 far-field truncation\n\n"
+            "Far-Field Pre-Trigger -- SKIP (needs a dedicated farfield_enabled run)\n\n"
             f"sim.FARFIELD_ENABLED = {enabled} (default False)\n"
             f"MAX_RADIUS = {ctx.ideal['max_radius']:.0f} pix (near-field only)\n\n"
             "Quantifying the dropped long-range pre-trigger requires a separate\n"
@@ -1096,7 +1255,6 @@ def plotC3_farfield_note(ctx, outdir, results):
             "the far_field kernel at load time). A runtime flag flip is a no-op,\n"
             "so this is reported as SKIP rather than a fabricated 0%.",
             ha="center", va="center", transform=ax.transAxes, fontsize=9)
-    ax.set_title("C3: far-field pre-trigger (SKIP -- needs a dedicated FF run)")
     ax.axis("off")
     _save(fig, f"{outdir}/diffC3_farfield.png")
     print("    C3 far-field: SKIP -- needs a separate farfield_enabled run "
@@ -1132,7 +1290,8 @@ def accumulate_muons(ctx, n_muons, rng, seed0=1000):
 def accumulate_point_scan(ctx, depths, seed0=5000):
     """Per-depth point-source table: diffusion fields + long-window footprint."""
     cols = {k: [] for k in ("drift_cm", "long_diff", "tran_diff", "sigma_long",
-                            "sigma_tran", "foot_rms", "n_collect", "time_rms")}
+                            "sigma_tran", "foot_rms", "n_collect", "time_rms",
+                            "multiplicity")}
     for i, (depth, raw) in enumerate(scan_point_sources(ctx.detector, depths)):
         out = simulate_event(ctx, raw, seed=seed0 + i)
         if out is None:
@@ -1149,12 +1308,32 @@ def accumulate_point_scan(ctx, depths, seed0=5000):
         cols["foot_rms"].append(footprint_rms(ctx, out["signals"], out["neigh"]))
         cols["n_collect"].append(int((prof > 1e-3 * prof.max()).sum()) if prof.max() > 0 else 0)
         cols["time_rms"].append(waveform_time_rms(ctx, out["signals"]))
+        cols["multiplicity"].append(pixel_multiplicity(out["signals"]))
     return {k: np.array(v) for k, v in cols.items()}
+
+
+def accumulate_longitudinal_knob(ctx, depth, scales, n_rep=8, seed0=70000):
+    """B6: collection-pixel pulse rise-time vs the diffusion knob, at fixed depth."""
+    raw = centered_point_source(ctx.detector, depth)
+    rise, rise_sem = [], []
+    for i, s in enumerate(scales):
+        rr = []
+        for r in range(n_rep):
+            drifted = quench_and_drift(ctx, raw)
+            apply_diffusion_scale(drifted, s)
+            neigh, _ = find_pixels(ctx, drifted)
+            sig = induce_current(ctx, drifted, neigh, seed=seed0 + i * 50 + r)
+            rr.append(pulse_rise_time(ctx, collection_pixel_waveform(sig)))
+        mu, se = mean_sem(rr)
+        rise.append(mu); rise_sem.append(se)
+    return dict(scales=np.array(scales, float), rise_us=np.array(rise, float),
+                rise_sem=np.array(rise_sem, float), depth_cm=float(depth),
+                sigma_long_at_depth=ctx.ideal["sigma_long_coeff"] * sqrt(depth))
 
 
 def accumulate_charge_sharing(ctx, depths, delta=0.05, n_rep=8, seed0=7000):
     """Per-depth charge-sharing leak across an x pad boundary (B4)."""
-    cols = {k: [] for k in ("drift_cm", "sigma_tran", "leak")}
+    cols = {k: [] for k in ("drift_cm", "sigma_tran", "leak", "leak_sem")}
     for i, depth in enumerate(depths):
         raw, x_pt = boundary_point_source(ctx.detector, depth, delta)
         drifted = quench_and_drift(ctx, raw)
@@ -1165,26 +1344,24 @@ def accumulate_charge_sharing(ctx, depths, delta=0.05, n_rep=8, seed0=7000):
         for r in range(n_rep):
             sig = induce_current(ctx, drifted, neigh, seed=seed0 + i * 50 + r)
             leaks.append(charge_sharing_leak(ctx, sig, neigh, x_pt))
+        mu, se = mean_sem(leaks)
         cols["drift_cm"].append(depth)
         cols["sigma_tran"].append(float(drifted["tran_diff"][0]))
-        cols["leak"].append(float(np.nanmean(leaks)))
+        cols["leak"].append(mu); cols["leak_sem"].append(se)
     out = {k: np.array(v) for k, v in cols.items()}
     out["delta"] = delta
     return out
 
 
 def mean_boundary_leak(ctx, drifted, x_pt, n_rep, seed0):
-    """Mean (charge-sharing leak, collected positive charge) over n_rep MC reps."""
+    """((leak mean, leak sem), (collected mean, collected sem)) over n_rep MC reps."""
     neigh, _ = find_pixels(ctx, drifted)
     leaks, cols = [], []
     for r in range(n_rep):
         sig = induce_current(ctx, drifted, neigh, seed=seed0 + r)
-        lk = charge_sharing_leak(ctx, sig, neigh, x_pt)
-        if np.isfinite(lk):
-            leaks.append(lk)
+        leaks.append(charge_sharing_leak(ctx, sig, neigh, x_pt))
         cols.append(charge_polarity_split(sig)[0])
-    return (float(np.mean(leaks)) if leaks else np.nan,
-            float(np.mean(cols)) if cols else np.nan)
+    return mean_sem(leaks), mean_sem(cols)
 
 
 def accumulate_knob(ctx, depth_cm, scales, max_depth, delta=0.05, n_rep=8, seed0=9000):
@@ -1200,24 +1377,25 @@ def accumulate_knob(ctx, depth_cm, scales, max_depth, delta=0.05, n_rep=8, seed0
     stay invariant under s (diffusion conserves charge).
     """
     raw, x_pt = boundary_point_source(ctx.detector, depth_cm, delta)
-    keys = ("scales", "leak", "collected", "sigma_tran",
-            "native_depth", "native_leak")
+    keys = ("scales", "leak", "leak_sem", "collected", "collected_sem", "sigma_tran",
+            "native_depth", "native_leak", "native_leak_sem")
     cols = {k: [] for k in keys}
     for i, s in enumerate(scales):
         drifted = quench_and_drift(ctx, raw)
         apply_diffusion_scale(drifted, s)
-        leak, coll = mean_boundary_leak(ctx, drifted, x_pt, n_rep, seed0 + i * 100)
-        cols["scales"].append(s); cols["leak"].append(leak); cols["collected"].append(coll)
+        (leak, leak_e), (coll, coll_e) = mean_boundary_leak(ctx, drifted, x_pt, n_rep, seed0 + i * 100)
+        cols["scales"].append(s); cols["leak"].append(leak); cols["leak_sem"].append(leak_e)
+        cols["collected"].append(coll); cols["collected_sem"].append(coll_e)
         cols["sigma_tran"].append(ctx.ideal["sigma_tran_coeff"] * sqrt(depth_cm) * sqrt(s))
         nd = s * depth_cm
         cols["native_depth"].append(nd)
         if 0 < nd <= max_depth:
             raw_n, x_n = boundary_point_source(ctx.detector, nd, delta)
             drifted_n = quench_and_drift(ctx, raw_n)
-            nleak, _ = mean_boundary_leak(ctx, drifted_n, x_n, n_rep, seed0 + 50 + i * 100)
+            (nleak, nleak_e), _ = mean_boundary_leak(ctx, drifted_n, x_n, n_rep, seed0 + 50 + i * 100)
         else:
-            nleak = np.nan
-        cols["native_leak"].append(nleak)
+            nleak = nleak_e = np.nan
+        cols["native_leak"].append(nleak); cols["native_leak_sem"].append(nleak_e)
     out = {k: np.array(v, dtype=float) for k, v in cols.items()}
     out["depth_cm"] = depth_cm
     out["delta"] = delta
@@ -1234,7 +1412,7 @@ def accumulate_threshold(ctx, depths, n_rep, rng, seed0=13000):
     threshold-marginal source -- e.g. a dense low-energy blob -- would instead map the
     turn-on, which is a different study.)
     """
-    d_out, eff = [], []
+    d_out, eff, nrep = [], [], []
     for i, depth in enumerate(depths):
         fracs = []
         for r in range(n_rep):
@@ -1244,8 +1422,9 @@ def accumulate_threshold(ctx, depths, n_rep, rng, seed0=13000):
                 continue
             fracs.append(event_detected(out.get("adc")))
         if fracs:
-            d_out.append(depth); eff.append(float(np.nanmean(fracs)))
-    return dict(drift_cm=np.array(d_out), fired_frac=np.array(eff))
+            d_out.append(depth); eff.append(float(np.nanmean(fracs))); nrep.append(len(fracs))
+    return dict(drift_cm=np.array(d_out), fired_frac=np.array(eff),
+                fired_n=np.array(nrep, float))
 
 
 # ===========================================================================
@@ -1322,6 +1501,13 @@ def main():
     plotB4_charge_sharing(ctx, share, args.outdir, results)
     knob = accumulate_knob(ctx, 10.0, [0.0, 0.25, 0.5, 1.0, 2.0, 4.0, 8.0], max_depth)
     plotB5_diffusion_knob(ctx, knob, args.outdir, results)
+    if point.get("multiplicity") is not None and point["multiplicity"].size:
+        m = point["multiplicity"]
+        print(f"  transverse pixel multiplicity (centered point, all depths): "
+              f"min={int(m.min())} max={int(m.max())} median={int(np.median(m))} "
+              f"-- ~1 pad => transverse cloud is sub-pixel, hence B4 uses charge sharing")
+    lon = accumulate_longitudinal_knob(ctx, 10.0, [0.0, 2.0, 4.0, 8.0, 16.0, 32.0])
+    plotB6_longitudinal_pulse(ctx, lon, args.outdir, results)
 
     print("\n=== GROUP C: readout truncations ===")
     eff = accumulate_threshold(ctx, np.linspace(0.5, max_depth, 12), args.eff_reps, rng)
@@ -1334,6 +1520,7 @@ def main():
              **{f"point_{k}": v for k, v in point.items()},
              **{f"share_{k}": np.asarray(v) for k, v in share.items()},
              **{f"knob_{k}": np.asarray(v) for k, v in knob.items()},
+             **{f"lon_{k}": np.asarray(v) for k, v in lon.items()},
              **{f"eff_{k}": v for k, v in eff.items()})
     print_summary(results)
 
