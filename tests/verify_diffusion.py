@@ -36,8 +36,9 @@ TEST GROUPS
      B4 transverse diffusion via sub-pixel charge sharing vs 0.5*erfc(delta/sqrt2 sigma_T)
         (sigma_T recovered from pixel signals; sigma_T is sub-pixel so pixel-count won't);
      B5 post-hoc diffusion knob: leak follows erfc(scaled sigma_T) + charge invariant;
-     B6 longitudinal diffusion from the pixel pulse: collection-pad pulse width^2 grows
-        linearly in the diffusion knob (sigma_L recovered from pixel signals).
+     B6 longitudinal diffusion from the pixel pulse: collection-pad peak-to-last-tick
+        time above threshold -- relative-threshold version grows as sqrt(s) (recovers
+        sigma_L), absolute-threshold version caps (shows the threshold convolution).
   C. Readout truncations: FEE detection efficiency vs drift; ADC clamp (never negative);
      far-field pre-trigger (honest SKIP -- needs a dedicated farfield_enabled run).
 
@@ -60,7 +61,7 @@ NOTE ON THE DIFFUSION KNOB (B5) -- post-hoc by necessity
 
 import argparse
 import sys
-from math import ceil, sqrt, erf
+from math import ceil, sqrt, erf, log
 
 import numpy as np
 
@@ -111,7 +112,10 @@ def load_simulation(args):
                    detector=detector, physics=physics, sim=sim, units=units,
                    detsim=detsim, drifting=drifting, quenching=quenching,
                    pixels_from_track=pixels_from_track, fee=fee)
-    return SimContext(modules, response, ideal_constants(detector))
+    sc = SimContext(modules, response, ideal_constants(detector))
+    sc.config = dict(detector=args.detector, pixel_layout=args.pixel_layout,
+                     response=args.response, sim_properties=args.sim_properties)
+    return sc
 
 
 def ideal_constants(detector):
@@ -141,10 +145,40 @@ def ideal_constants(detector):
     return d
 
 
+def detector_identity(ctx):
+    """(name, geometry one-liner) identifying which detector config was loaded."""
+    import os
+    det = ctx.detector
+    cfg = getattr(ctx, "config", {})
+    det_path = cfg.get("detector", "?")
+    name = os.path.splitext(os.path.basename(det_path))[0]
+    n_tpcs = int(det.TPC_BORDERS.shape[0])
+    n_modules = len(getattr(det, "MODULE_TO_TPCS", {1: None}))
+    e_field = float(getattr(det, "E_FIELD", float("nan")))
+    geom = (f"{n_modules} module(s), {n_tpcs} TPC(s); "
+            f"E={e_field:.3g} kV/cm, V_drift={det.V_DRIFT:.4f} cm/us, "
+            f"lifetime={det.ELECTRON_LIFETIME:.0f} us, "
+            f"drift_length={abs(det.DRIFT_LENGTH):.2f} cm, "
+            f"pixel_pitch={det.PIXEL_PITCH:.4f} cm, "
+            f"N_pixels={det.N_PIXELS[0]}x{det.N_PIXELS[1]}/plane")
+    return name, geom, det_path
+
+
 def print_config(ctx):
     k = ctx.ideal
+    cfg = getattr(ctx, "config", {})
+    name, geom, det_path = detector_identity(ctx)
     print("=" * 70)
-    print("Diffusion verification -- module0 constants (runtime):")
+    print(f"DETECTOR UNDER TEST: {name}")
+    print("  (name, geometry and all constants below are read from the loaded")
+    print("   config files -- they are not hard-coded assumptions)")
+    print(f"  detector       : {det_path}")
+    print(f"  pixel_layout   : {cfg.get('pixel_layout', '?')}")
+    print(f"  response       : {cfg.get('response', '?')}")
+    print(f"  sim_properties : {cfg.get('sim_properties', '?')}")
+    print(f"  geometry       : {geom}")
+    print("-" * 70)
+    print(f"Diffusion verification -- {name} constants (runtime):")
     print(f"  V_DRIFT          = {k['v_drift']:.5f} cm/us "
           f"(1/V_DRIFT = {k['inv_v_drift']:.4f} us/cm)")
     print(f"  D_L, D_T         = {k['d_long']:.3e}, {k['d_tran']:.3e} cm^2/us")
@@ -648,29 +682,27 @@ def collection_pixel_waveform(signals):
     return to_host(signals)[:, ipix, :].sum(axis=0)
 
 
-def pulse_rise_time(ctx, waveform, lo=0.1, hi=0.9):
-    """10-90% rise time (us) of the INTEGRATED charge on a pixel waveform.
+def pulse_fall_time(ctx, waveform, level):
+    """Time (us) from the peak tick to the LAST tick above `level`, searching from
+    the peak onward. The simple longitudinal-diffusion observable: 'how long after
+    the collection peak does the pixel signal stay above threshold'.
 
-    Longitudinal-diffusion observable measured from the pixel signal. The cumulative
-    integral stays near zero through the small pre-arrival induction (q*W_c(d) << q
-    for d >> pitch) and then climbs through the collection pulse, so the 10%-90%
-    crossing straddles only the collection -- not the long induction tail that
-    swamps a naive waveform RMS. The collection pulse width is the response pulse
-    convolved with the arrival-time spread sigma_L/V_DRIFT, so this grows with
-    longitudinal diffusion.
+    Looking only POST-peak naturally excludes the long pre-arrival induction tail.
+    With `level` a fraction of the peak the result is ~ sigma_total = the response
+    pulse convolved with sigma_L/V_DRIFT, so it grows monotonically with longitudinal
+    diffusion. With `level` an absolute (fixed) value it instead grows then turns
+    over -- as diffusion lowers the peak toward `level`, fewer ticks survive above it.
     """
     if waveform is None:
         return np.nan
-    c = np.cumsum(np.asarray(waveform, dtype=float))
-    total = c[-1]
-    if total <= 0:
+    w = np.asarray(waveform, dtype=float)
+    if w.size == 0 or not np.isfinite(w).any() or w.max() <= 0:
         return np.nan
-    c = c / total
-    i_lo = int(np.argmax(c >= lo))
-    i_hi = int(np.argmax(c >= hi))
-    if i_hi < i_lo:
-        return np.nan
-    return float((i_hi - i_lo) * ctx.detector.TIME_SAMPLING)
+    ipk = int(np.argmax(w))
+    above = np.where(w[ipk:] > level)[0]    # indices relative to the peak
+    if above.size == 0:
+        return 0.0
+    return float(int(above[-1]) * ctx.detector.TIME_SAMPLING)
 
 
 def pixel_multiplicity(signals, frac=0.05):
@@ -1146,44 +1178,56 @@ def plotB5_diffusion_knob(ctx, knob, outdir, results):
 
 
 def plotB6_longitudinal_pulse(ctx, lon, outdir, results):
-    """B6 (pt): longitudinal diffusion recovered from the PIXEL waveform.
+    """B6 (pt): longitudinal diffusion from the PIXEL pulse fall-time.
 
-    A2 reads the kernel's sigma_L *field*; this instead measures longitudinal
-    diffusion in the actual pixel response. sigma_L smears electron arrival times by
-    sigma_L/V_DRIFT, broadening the collection pixel's current pulse. We measure that
-    pulse's 10-90% integrated-charge rise time (pulse_rise_time, which isolates the
-    collection from the long pre-arrival induction tail) while dialing the diffusion
-    knob s at FIXED depth (so the response baseline is held constant). Because
-    diffusion is a convolution in time, pulse-width^2 grows LINEARLY in s -- and since
-    sigma_L^2 ~ depth, that is exactly the pixel-level analogue of A2's sqrt(d) law.
-    The absolute sigma_L recovery carries a response-pulse shape factor, so it is
-    reported, not asserted.
+    A2 reads the kernel's sigma_L *field*; this measures longitudinal diffusion in
+    the actual pixel response. sigma_L smears electron arrival times by sigma_L/V,
+    so the collection pixel's pulse lasts longer after its peak. We measure the time
+    from the peak to the last tick still above threshold, dialing the diffusion knob s
+    at FIXED depth, with TWO thresholds:
+      * RELATIVE (frac of the pulse peak): fall-time ~ sqrt(sigma_resp^2 + s*(sigma_L/V)^2),
+        so fall-time^2 is LINEAR in s -- the clean validation (the pixel-level analogue
+        of A2's sqrt-law, since sigma_L^2 ~ depth). sigma_L recovery carries a pulse-shape
+        factor, so it is reported, not asserted;
+      * ABSOLUTE (fixed level): rises then TURNS OVER as diffusion lowers the peak
+        toward the fixed level -- demonstrating the threshold convolution / cap.
     """
-    s = lon["scales"]; rise = lon["rise_us"]; v = ctx.ideal["v_drift"]
-    rise_e = lon.get("rise_sem", np.zeros_like(rise))
+    s = lon["scales"]; v = ctx.ideal["v_drift"]; frac = lon["frac"]
+    rel, rel_e = lon["fall_rel"], lon["fall_rel_sem"]
+    ab, ab_e = lon["fall_abs"], lon["fall_abs_sem"]
     sigL = lon["sigma_long_at_depth"]
-    good = np.isfinite(rise)
-    a, b = np.polyfit(s[good], rise[good] ** 2, 1)          # width^2 = b + a*s
-    r2 = linear_r2(s[good], rise[good] ** 2, a, b)
-    k2 = 2.563 ** 2     # 10-90 rise of a Gaussian step = 2.563*sigma
-    rec_sigmaL = sqrt(max(a, 0.0) / k2) * v                 # (sigma_L/V) -> cm via *V
-    rise2_err = 2.0 * rise * rise_e                         # d(x^2) = 2x dx
+    good = np.isfinite(rel)
+    a, b = np.polyfit(s[good], rel[good] ** 2, 1)            # fall_rel^2 = b + a*s
+    r2 = linear_r2(s[good], rel[good] ** 2, a, b)
+    k2 = 2.0 * log(1.0 / frac)            # fall(frac) = sqrt(2 ln(1/frac)) * sigma_total
+    rec_sigmaL = sqrt(max(a, 0.0) / k2) * v                  # (sigma_L/V) -> cm via *V
     fig, ax = _new_ax()
-    grid = np.linspace(float(s.min()), float(s.max()), 50)
-    plot_fit(ax, grid, a * grid + b, label=rf"Linear Fit ($R^2 = {r2:.3f}$)")
-    plot_points(ax, s, rise ** 2, yerr=rise2_err,
-                label=r"Collection-Pixel Pulse Width$^2$")
+    grid = np.linspace(float(s.min()), float(s.max()), 80)
+    plot_fit(ax, grid, np.sqrt(np.maximum(a * grid + b, 0.0)),
+             label=r"Fit $\sqrt{\sigma_{\mathrm{resp}}^2 + s\,(\sigma_L/v_{\mathrm{drift}})^2}$"
+                   + f"  ($R^2 = {r2:.3f}$)")
+    plot_points(ax, s, rel, yerr=rel_e, color="C0",
+                label=r"Relative Threshold (" + f"{frac:.0%} of Peak)")
+    plot_points(ax, s, ab, yerr=ab_e, color="C3", marker="s",
+                label=r"Fixed Absolute Threshold")
     ax.set_xlabel(r"Diffusion Knob $s$  ($\equiv \sigma_L^2$ Scale $\equiv$ Effective Depth / $d_0$)")
-    ax.set_ylabel(r"Pulse 10--90% Rise Time$^2$ ($\mu\mathrm{s}^2$)")
+    ax.set_ylabel(r"Peak-to-Last Time Above Threshold ($\mu$s)")
     ax.legend(); ax.grid(alpha=0.3)
     _save(fig, f"{outdir}/diffB6_longitudinal_pulse.png")
     record_check(results, "B6 pixel pulse-width^2 linear in diffusion (R^2>0.9)",
                  r2 > 0.9, f"R^2={r2:.3f}")
-    grew = bool(good.sum() >= 2 and rise[good][-1] > rise[good][0])
+    grew = bool(good.sum() >= 2 and rel[good][-1] > rel[good][0])
     record_check(results, "B6 pixel pulse broadens with longitudinal diffusion", grew)
     print(f"    recovered sigma_L(d0={lon['depth_cm']:.0f}cm) from the pixel pulse = "
-          f"{rec_sigmaL:.4f} cm vs theory {sigL:.4f} cm (Gaussian shape factor "
-          f"assumed -> order-of-magnitude / scaling check, not a precision number)")
+          f"{rec_sigmaL:.4f} cm vs theory {sigL:.4f} cm (pulse-shape factor assumed "
+          f"-> scaling check, not a precision number)")
+    # the absolute-threshold curve should turn over (its max is before the last point)
+    fin = np.isfinite(ab)
+    af, s_fin = ab[fin], s[fin]
+    caps = bool(af.size >= 3 and int(af.argmax()) < af.size - 1)
+    if af.size:
+        print(f"    absolute-threshold fall-time peaks at s={s_fin[int(af.argmax())]:.1f} "
+              f"then falls (threshold cap present: {caps})")
 
 
 # ===========================================================================
@@ -1312,22 +1356,42 @@ def accumulate_point_scan(ctx, depths, seed0=5000):
     return {k: np.array(v) for k, v in cols.items()}
 
 
-def accumulate_longitudinal_knob(ctx, depth, scales, n_rep=8, seed0=70000):
-    """B6: collection-pixel pulse rise-time vs the diffusion knob, at fixed depth."""
+def accumulate_longitudinal_knob(ctx, depth, scales, frac=0.2, abs_frac=0.5,
+                                 n_rep=8, seed0=70000):
+    """B6: collection-pixel pulse fall-time (peak -> last tick above threshold) vs the
+    diffusion knob at fixed depth, with TWO thresholds:
+      * relative (frac * this pulse's peak): clean, monotonic ~ sqrt(s) -- validation;
+      * absolute (abs_frac * the s=1 reference peak): rises then turns over as diffusion
+        lowers the peak toward the fixed level -- the threshold convolution / cap.
+    """
     raw = centered_point_source(ctx.detector, depth)
-    rise, rise_sem = [], []
+    # reference peak at nominal diffusion (s=1) sets the fixed absolute level
+    ref_peaks = []
+    for r in range(n_rep):
+        drifted = quench_and_drift(ctx, raw); apply_diffusion_scale(drifted, 1.0)
+        neigh, _ = find_pixels(ctx, drifted)
+        w = collection_pixel_waveform(induce_current(ctx, drifted, neigh, seed=seed0 + r))
+        if w is not None and np.max(w) > 0:
+            ref_peaks.append(float(np.max(w)))
+    abs_level = abs_frac * (float(np.mean(ref_peaks)) if ref_peaks else 0.0)
+    rel, rel_e, ab, ab_e = [], [], [], []
     for i, s in enumerate(scales):
-        rr = []
+        rr, aa = [], []
         for r in range(n_rep):
-            drifted = quench_and_drift(ctx, raw)
-            apply_diffusion_scale(drifted, s)
+            drifted = quench_and_drift(ctx, raw); apply_diffusion_scale(drifted, s)
             neigh, _ = find_pixels(ctx, drifted)
-            sig = induce_current(ctx, drifted, neigh, seed=seed0 + i * 50 + r)
-            rr.append(pulse_rise_time(ctx, collection_pixel_waveform(sig)))
-        mu, se = mean_sem(rr)
-        rise.append(mu); rise_sem.append(se)
-    return dict(scales=np.array(scales, float), rise_us=np.array(rise, float),
-                rise_sem=np.array(rise_sem, float), depth_cm=float(depth),
+            w = collection_pixel_waveform(
+                induce_current(ctx, drifted, neigh, seed=seed0 + 1000 + i * 50 + r))
+            if w is None:
+                continue
+            rr.append(pulse_fall_time(ctx, w, frac * float(np.max(w))))
+            aa.append(pulse_fall_time(ctx, w, abs_level))
+        m1, e1 = mean_sem(rr); m2, e2 = mean_sem(aa)
+        rel.append(m1); rel_e.append(e1); ab.append(m2); ab_e.append(e2)
+    return dict(scales=np.array(scales, float),
+                fall_rel=np.array(rel, float), fall_rel_sem=np.array(rel_e, float),
+                fall_abs=np.array(ab, float), fall_abs_sem=np.array(ab_e, float),
+                depth_cm=float(depth), frac=float(frac),
                 sigma_long_at_depth=ctx.ideal["sigma_long_coeff"] * sqrt(depth))
 
 
@@ -1515,19 +1579,22 @@ def main():
     check_C2_adc_clamp(ctx, results)
     plotC3_farfield_note(ctx, args.outdir, results)
 
+    det_name, det_geom, det_path = detector_identity(ctx)
     np.savez(f"{args.outdir}/verify_diffusion_results.npz",
+             detector_name=np.array(det_name), detector_path=np.array(det_path),
+             detector_geometry=np.array(det_geom),
              **{f"muon_{k}": v for k, v in muon.items()},
              **{f"point_{k}": v for k, v in point.items()},
              **{f"share_{k}": np.asarray(v) for k, v in share.items()},
              **{f"knob_{k}": np.asarray(v) for k, v in knob.items()},
              **{f"lon_{k}": np.asarray(v) for k, v in lon.items()},
              **{f"eff_{k}": v for k, v in eff.items()})
-    print_summary(results)
+    print_summary(results, det_name)
 
 
-def print_summary(results):
+def print_summary(results, det_name="?"):
     print("\n" + "=" * 70)
-    print("SUMMARY")
+    print(f"SUMMARY  (detector: {det_name})")
     checks = results["checks"]
     # None -> SKIP, else truthiness. Robust to numpy.bool_ (which fails `is True`).
     def tag_of(v):
@@ -1537,7 +1604,8 @@ def print_summary(results):
     skipped = sum(1 for v in checks.values() if tag_of(v) == "SKIP")
     for name, ok in checks.items():
         print(f"  [{tag_of(ok)}] {name}")
-    print(f"\n  {passed} passed, {failed} failed, {skipped} skipped")
+    print(f"\n  {passed} passed, {failed} failed, {skipped} skipped  "
+          f"[detector: {det_name}]")
     print("=" * 70)
 
 
