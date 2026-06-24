@@ -164,6 +164,22 @@ def detector_identity(ctx):
     return name, geom, det_path
 
 
+def response_depth_coverage(ctx):
+    """(d_lo, d_hi) depth range (cm) over which the loaded response covers the drift.
+
+    The detsim kernel reads the response at template-time `this_time + (DRIFT_LENGTH-d)/
+    V_DRIFT`, valid only up to RESPONSE_MAX_TIME. A deposit shallower than
+    `DRIFT_LENGTH - RESPONSE_MAX_TIME*V_DRIFT` never reaches the response and induces
+    ZERO charge. With a velocity-matched response RESPONSE_MAX_TIME >= DRIFT_MAX_TIME so
+    d_lo <= 0 (full coverage); a field/velocity mismatch (e.g. a 0.5 kV/cm response used
+    at 0.25 kV/cm) leaves the shallow part of the drift uncovered.
+    """
+    det = ctx.detector
+    L = abs(det.DRIFT_LENGTH)
+    d_lo = L - det.RESPONSE_MAX_TIME * det.V_DRIFT
+    return max(d_lo, 0.0), L
+
+
 def print_config(ctx):
     k = ctx.ideal
     cfg = getattr(ctx, "config", {})
@@ -731,6 +747,38 @@ def event_detected(adc):
     if adc is None or adc.size == 0:
         return 0.0
     return float(adc.max() > 0)
+
+
+def adc_to_charge(ctx, adc):
+    """Recover per-sample charge (electrons) from recorded ADC counts, the way a DATA
+    analysis would -- by inverting the FEE calibration in fee.digitize (fee.py:519):
+
+        adc = floor( clip( (Q*GAIN*mV/e + (V_PEDESTAL-V_CM)*mV) * S + ADC_OFFSET,
+                           0, ADC_COUNTS-1 ) ),   S = ADC_COUNTS/((V_REF-V_CM)*mV*ADC_SCALE_FACTOR)
+
+    so  Q = ((adc - ADC_OFFSET)/S - (V_PEDESTAL-V_CM)*mV) * e/(GAIN*mV),  and Q=0 where adc==0.
+    Reconstructing from the ADC (not the internal integral) deliberately carries the ~1-LSB
+    quantization (~1064 e-/count at module0 gain) -- the same charge resolution as real data.
+    """
+    det, mV, e = ctx.detector, ctx.units.mV, ctx.units.e
+    a = np.asarray(adc, dtype=float)
+    scale = det.ADC_COUNTS / ((det.V_REF * mV - det.V_CM * mV) * det.ADC_SCALE_FACTOR)
+    voltage = (a - det.ADC_OFFSET) / scale
+    q = (voltage - (det.V_PEDESTAL - det.V_CM) * mV) * e / (det.GAIN * mV)
+    return np.where(a > 0, q, 0.0)
+
+
+def fee_dead_time(ctx):
+    """Dead time (us) between consecutive ADC samples on one pixel.
+
+    After a sample fires, get_adc_values advances by RESET_CYCLES then blocks for
+    ADC_BUSY_DELAY (fee.py:703-705); those clock cycles are genuinely dead (no integration),
+    while the (3+ADC_HOLD_DELAY)-cycle integration window IS live. So the dead interval to
+    subtract in Q_{i+1}/(t_{i+1}-t_i-t_dead) is t_dead = (RESET_CYCLES+ADC_BUSY_DELAY)*CLOCK_CYCLE
+    (module0: (1+9)*0.1 = 1.0 us). The C4 overlay vs the pre-FEE current confirms this choice.
+    """
+    det = ctx.detector
+    return float((det.RESET_CYCLES + det.ADC_BUSY_DELAY) * det.CLOCK_CYCLE)
 
 
 # ===========================================================================
@@ -1307,6 +1355,352 @@ def plotC3_farfield_note(ctx, outdir, results):
 
 
 # ===========================================================================
+# C4 -- FEE charge response: reconstruct the induced current dQ/dt from the ADC
+# ===========================================================================
+def reconstruct_dqdt(ctx, adc_row, ticks_row, t_dead):
+    """One pixel's recorded ADC samples -> (t_mid, dQ/dt) by finite-differencing the
+    ADC-reconstructed charge: dQ/dt = Q_{i+1}/(t_{i+1}-t_i-t_dead) at the live-window
+    midpoint 0.5(t_i+t_{i+1}+t_dead). Q_i = adc_to_charge(adc_i) (the data-domain charge)."""
+    q = adc_to_charge(ctx, adc_row)
+    keep = q > 0
+    if keep.sum() < 2:
+        return np.empty(0), np.empty(0)
+    t = np.asarray(ticks_row, float)[keep]
+    qk = q[keep]
+    order = np.argsort(t)
+    t, qk = t[order], qk[order]
+    dt = np.diff(t) - t_dead
+    good = dt > 0
+    return (0.5 * (t[:-1][good] + t[1:][good] + t_dead), qk[1:][good] / dt[good])
+
+
+def analytic_induced_current(ctx, depth, n_offset, n_electrons):
+    """Theory: induced current (e-/us) vs READOUT time on the pixel `n_offset` away in x,
+    from the bare (diffusion-free) response template -- N_e * response[i_off, 0, k] mapped
+    from template time to readout time via the collection shift (DRIFT_LENGTH-depth)/V."""
+    det = ctx.detector
+    try:
+        resp = to_host(ctx.response)
+        i_off = int(round(n_offset * det.PIXEL_PITCH / det.RESPONSE_BIN_SIZE - 0.5))
+        if not (0 <= i_off < resp.shape[0]):
+            return np.empty(0), np.empty(0)
+        wf = n_electrons * resp[i_off, 0, :]
+        k = np.arange(wf.shape[0])
+        shift = (abs(det.DRIFT_LENGTH) - depth) / det.V_DRIFT
+        t_read = k * det.RESPONSE_SAMPLING - shift
+        keep = t_read >= 0
+        return t_read[keep], wf[keep]
+    except Exception:
+        return np.empty(0), np.empty(0)
+
+
+def measure_fee_dqdt(ctx, depth, offsets, seed, point_dE=2.0, dx=0.3):
+    """One sim: a strong point source above a pixel; per offset return reconstructed
+    dQ/dt points and the pre-FEE per-pixel current (the FEE-closure reference)."""
+    det = ctx.detector
+    i0, j0 = det.N_PIXELS[0] // 2, det.N_PIXELS[1] // 2
+    x, y = pixel_center(det, i0, j0)
+    raw = point_source_record(det, x, y, depth, point_dE=point_dE, dx=dx)
+    out = simulate_event(ctx, raw, seed=seed, with_fee=True)
+    if out is None or out.get("adc") is None:
+        return None
+    adc, ticks = out["adc"], out["adc_ticks"]
+    upix = to_host(out["unique_pix"]); psig = to_host(out["pixels_signals"])
+    nx = det.N_PIXELS[0]
+    t_dead = fee_dead_time(ctx)
+    res = {}
+    for n in offsets:
+        pid = (i0 + n) + nx * j0                        # plane-0 pixel ID
+        idx = np.where(upix == pid)[0]
+        if idx.size == 0:                               # pixel not simulated (beyond MAX_RADIUS)
+            res[n] = dict(tmid=np.empty(0), dqdt=np.empty(0), cur=None)
+            continue
+        ip = int(idx[0])
+        tmid, dqdt = reconstruct_dqdt(ctx, adc[ip], ticks[ip], t_dead)
+        res[n] = dict(tmid=tmid, dqdt=dqdt, cur=psig[ip])
+    return res
+
+
+def accumulate_fee_dqdt(ctx, depth, offsets, n_reps, seed0=80000):
+    """Repeat measure_fee_dqdt; per offset collect all (t_mid, dQ/dt) and the mean pre-FEE
+    current; also the input electron count N_e for the analytic-response overlay."""
+    pts = {n: [[], []] for n in offsets}
+    curs = {n: [] for n in offsets}
+    for r in range(n_reps):
+        m = measure_fee_dqdt(ctx, depth, offsets, seed=seed0 + r)
+        if m is None:
+            continue
+        for n in offsets:
+            pts[n][0].append(m[n]["tmid"]); pts[n][1].append(m[n]["dqdt"])
+            if m[n]["cur"] is not None:
+                curs[n].append(m[n]["cur"])
+    det = ctx.detector
+    i0, j0 = det.N_PIXELS[0] // 2, det.N_PIXELS[1] // 2
+    x, y = pixel_center(det, i0, j0)
+    n_e = float(quench_and_drift(ctx, point_source_record(det, x, y, depth,
+                point_dE=2.0, dx=0.3))["n_electrons"][0])
+    out = {"depth": depth, "n_e": n_e}
+    for n in offsets:
+        tmid = np.concatenate(pts[n][0]) if pts[n][0] else np.empty(0)
+        dqdt = np.concatenate(pts[n][1]) if pts[n][1] else np.empty(0)
+        if curs[n]:
+            L = max(c.shape[0] for c in curs[n])
+            stk = np.array([np.pad(c, (0, L - c.shape[0])) for c in curs[n]])
+            cur, cur_t = stk.mean(axis=0), np.arange(L) * det.TIME_SAMPLING
+        else:
+            cur, cur_t = np.empty(0), np.empty(0)
+        out[n] = dict(tmid=tmid, dqdt=dqdt, cur=cur, cur_t=cur_t)
+    return out
+
+
+def _dqdt_envelope(tmid, dqdt, nbins=24):
+    """Median and [16,84] percentile band of dQ/dt vs time (the 'envelope')."""
+    if tmid.size < 3:
+        return np.empty(0), np.empty(0), np.empty(0), np.empty(0)
+    edges = np.linspace(0.0, float(np.percentile(tmid, 99)), nbins + 1)
+    cen = 0.5 * (edges[:-1] + edges[1:])
+    idx = np.digitize(tmid, edges)
+    med = np.full(nbins, np.nan); lo = np.full(nbins, np.nan); hi = np.full(nbins, np.nan)
+    for b in range(1, nbins + 1):
+        v = dqdt[idx == b]
+        if v.size >= 3:
+            med[b - 1], lo[b - 1], hi[b - 1] = np.percentile(v, [50, 16, 84])
+    good = np.isfinite(med)
+    return cen[good], med[good], lo[good], hi[good]
+
+
+def plotC4_fee_charge_response(ctx, accs, offsets, outdir, results):
+    """C4 (pt): reconstruct dQ/dt from the ADC and compare to the induced current.
+
+    For each drift distance, per pixel offset, overlay: the reconstructed-dQ/dt envelope
+    (median + [16,84] band over the reps), the sim's pre-FEE per-pixel current (the exact
+    FEE-closure reference, black solid), and the bare response-template current (theory,
+    black dashed). Validates FEE integration + dead-time, and the MONODIRECTIONAL readout:
+    dQ/dt is never negative and the bipolar-neighbor / post-peak NEGATIVE current is simply
+    not read out.
+    """
+    import matplotlib.pyplot as plt
+    closure_ok, mono_ok, neg_read = [], [], []
+    for depth, acc in accs.items():
+        fig, axes = plt.subplots(1, len(offsets), figsize=(4.2 * len(offsets), 4.0),
+                                 squeeze=False)
+        for col, n in enumerate(offsets):
+            ax = axes[0][col]
+            d = acc[n]
+            cen, med, lo, hi = _dqdt_envelope(d["tmid"], d["dqdt"])
+            # pre-FEE current (closure reference)
+            if d["cur"].size:
+                plot_fit(ax, d["cur_t"], d["cur"], label="Pre-FEE Current (Sim)")
+            # analytic response template (theory)
+            ta, wa = analytic_induced_current(ctx, depth, n, acc["n_e"])
+            if ta.size:
+                plot_fit(ax, ta, wa, ls="--", label="Response Template (Theory)")
+            if cen.size:
+                ax.fill_between(cen, lo, hi, color="C0", alpha=0.30, lw=0)
+                plot_points(ax, cen, med, color="C0", label=r"Reconstructed $dQ/dt$ (ADC)")
+            ax.axhline(0, color="grey", lw=0.6)
+            ax.set_xlabel(r"Readout Time $t$ ($\mu$s)")
+            if col == 0:
+                ax.set_ylabel(r"Induced Current $dQ/dt$ (e$^-$/$\mu$s)")
+            ax.legend(fontsize=7, loc="upper right")
+            ax.text(0.03, 0.95, (r"Target Pixel" if n == 0 else rf"${n}$ Pixels Away"),
+                    transform=ax.transAxes, va="top", fontsize=9)
+            ax.grid(alpha=0.3)
+            # --- checks ---
+            if cen.size and d["cur"].size:
+                cur_at = np.interp(cen, d["cur_t"], d["cur"])
+                if n == 0:                              # closure on the target pixel
+                    pos = cur_at > 0.05 * np.max(d["cur"])
+                    if pos.sum() >= 3:
+                        closure_ok.append(median_rel_dev(med[pos], cur_at[pos]))
+                # monodirectional: no reconstructed sample where the true current < 0
+                neg = cur_at < 0
+                if neg.any():
+                    neg_read.append(float(np.mean(np.abs(med[neg]) >
+                                                  0.05 * np.max(np.abs(d["cur"])))))
+            mono_ok.append(bool(d["dqdt"].size == 0 or np.nanmin(d["dqdt"]) >= 0))
+        _save(fig, f"{outdir}/diffC4_dqdt_d{int(round(depth)):02d}.png")
+    # closure on the target pixel (median rel dev of recon vs pre-FEE current)
+    if closure_ok:
+        diagnose("C4 reconstructed dQ/dt == pre-FEE current (target pixel)",
+                 1 + float(np.median(closure_ok)), 1.0, 0.30, results)
+    record_check(results, "C4 reconstructed dQ/dt never negative (monodirectional)",
+                 all(mono_ok))
+    if neg_read:
+        record_check(results, "C4 negative induced current NOT read out (<10% leakage)",
+                     float(np.mean(neg_read)) < 0.10, f"{np.mean(neg_read):.1%}")
+
+
+# ===========================================================================
+# B7 -- transverse D_T from one muon track's pixel readout (data-style)
+# ===========================================================================
+def _erf_vec(x):
+    """Vectorized erf (Abramowitz & Stegun 7.1.26, |err|<1.5e-7) -- numpy-only, fast."""
+    x = np.asarray(x, float)
+    s = np.sign(x); ax = np.abs(x)
+    t = 1.0 / (1.0 + 0.3275911 * ax)
+    y = 1.0 - (((((1.061405429 * t - 1.453152027) * t) + 1.421413741) * t
+                - 0.284496736) * t + 0.254829592) * t * np.exp(-ax * ax)
+    return s * y
+
+
+def build_strip_muon(ctx, rng, depth_lo, depth_hi, n_cols=25, plane=0):
+    """A muon kept over one pixel row (strip), inclined in drift z so position along the
+    track maps to depth, riding NEAR the row's upper boundary with a FLOATING offset
+    (random magnitude + slope) so the neighbour row shares measurably at all depths but the
+    track is NOT perfectly down a pixel line -- as in real data. (Near-boundary keeps the
+    sub-pixel sharing above the 5000 e- threshold.)"""
+    det = ctx.detector
+    i0, j0 = det.N_PIXELS[0] // 2, det.N_PIXELS[1] // 2
+    half = n_cols // 2
+    x0 = pixel_center(det, i0 - half, j0, plane)[0]
+    x1 = pixel_center(det, i0 + half, j0, plane)[0]
+    yc = pixel_center(det, i0, j0, plane)[1]
+    p = det.PIXEL_PITCH
+    dy0, dy1 = rng.uniform(0.30, 0.45, size=2) * p      # floating offset, near j0/j0+1 boundary
+    z0, z1 = depth_to_z(det, depth_lo, plane), depth_to_z(det, depth_hi, plane)
+    pairs = segmentize((x0, yc + dy0, z0), (x1, yc + dy1, z1), 0.4)
+    tracks = blank_tracks(len(pairs))
+    for i, (a, b) in enumerate(pairs):
+        fill_segment(tracks[i], plane, a, b, dEdx=2.1)
+        tracks[i]["segment_id"] = i
+    return tracks
+
+
+def measure_strip_DT(ctx, out, plane=0):
+    """From the pixel readout: per column, the charge-sharing fraction f, the drift depth
+    d=V*t_hit, and the transverse offset delta = distance from the deposit to the shared
+    pixel boundary. f and d are pure DATA (ADC + hit time); delta is the track's transverse
+    position vs depth -- in data this comes from the 3D track fit, here from the (known)
+    trajectory (out['tracks']), which is what breaks the offset/D_T degeneracy.
+    Returns (d, f, delta)."""
+    det = ctx.detector
+    if out is None or out.get("adc") is None:
+        return np.empty(0), np.empty(0), np.empty(0)
+    adc, ticks = out["adc"], out["adc_ticks"]
+    upix = to_host(out["unique_pix"])
+    nx, ny = det.N_PIXELS
+    ix, iy = upix % nx, (upix // nx) % ny
+    qtot = np.array([adc_to_charge(ctx, adc[ip]).sum() for ip in range(upix.size)])
+    if upix.size == 0 or qtot.max() <= 0:
+        return np.empty(0), np.empty(0), np.empty(0)
+    rowsum = {int(r): float(qtot[iy == r].sum()) for r in np.unique(iy)}
+    j = max(rowsum, key=rowsum.get)                     # busiest row
+    jp = j + 1 if rowsum.get(j + 1, 0.) >= rowsum.get(j - 1, 0.) else j - 1
+    pid_of = {int(upix[ip]): ip for ip in range(upix.size)}
+    # deposit transverse position per column from the (reconstructed/known) trajectory
+    tr = out["tracks"]
+    bx, by = det.TPC_BORDERS[plane][0][0], det.TPC_BORDERS[plane][1][0]
+    col_of = np.floor((np.asarray(tr["x"]) - bx) / det.PIXEL_PITCH).astype(int)
+    ymean = {}
+    for c in np.unique(col_of):
+        ymean[int(c)] = float(np.mean(np.asarray(tr["y"])[col_of == c]))
+    y_bnd = by + (0.5 * (j + jp) + 0.5) * det.PIXEL_PITCH  # the j/jp boundary
+    ds, fs, dl = [], [], []
+    for col in np.unique(ix[iy == j]):
+        ip_m = pid_of.get(int(col + nx * j))
+        if ip_m is None or int(col) not in ymean:
+            continue
+        qm = float(adc_to_charge(ctx, adc[ip_m]).sum())
+        samp_t = np.asarray(ticks[ip_m], float)[adc[ip_m] > 0]
+        if qm <= 0 or samp_t.size == 0:
+            continue
+        ip_a = pid_of.get(int(col + nx * jp))
+        qa = float(adc_to_charge(ctx, adc[ip_a]).sum()) if ip_a is not None else 0.0
+        ds.append(det.V_DRIFT * float(samp_t.min()))     # depth from the hit TIME
+        fs.append(qa / (qm + qa) if (qm + qa) > 0 else 0.0)
+        dl.append(abs(y_bnd - ymean[int(col)]))          # |deposit - boundary| (known offset)
+    return np.array(ds), np.array(fs), np.array(dl)
+
+
+def fit_strip_DT(ctx, d, f, delta):
+    """1-parameter fit f(d)=0.5*erfc(delta(d)/(sqrt2*sqrt(2 D_T d/V))) for D_T, with the
+    transverse offset delta KNOWN per column (from the track fit). 200-pt grid over a blind
+    physical D_T range -- no degeneracy now that delta is fixed."""
+    V = ctx.ideal["v_drift"]
+    d, f, delta = np.asarray(d, float), np.asarray(f, float), np.asarray(delta, float)
+    g = (np.isfinite(d) & np.isfinite(f) & np.isfinite(delta)
+         & (d > 0) & (f > 1e-3) & (f < 0.5) & (delta > 0))
+    d, f, delta = d[g], f[g], delta[g]
+    if d.size < 5 or (np.max(d) - np.min(d)) < 5.0:
+        return np.nan
+    DT_grid = np.logspace(np.log10(2e-6), np.log10(2e-5), 200)
+    sse = [np.sum((f - 0.5 * (1 - _erf_vec(delta / (np.sqrt(2) * np.sqrt(2 * DT * d / V))))) ** 2)
+           for DT in DT_grid]
+    return float(DT_grid[int(np.argmin(sse))])
+
+
+def accumulate_strip_DT(ctx, depth_lo, depth_hi, n, seed0=90000):
+    """Ensemble of floating-geometry strip muons; per track fit D_T from the readout."""
+    rng = np.random.default_rng(seed0)
+    dts, rep = [], None
+    for r in range(n):
+        raw = build_strip_muon(ctx, rng, depth_lo, depth_hi)
+        out = simulate_event(ctx, raw, seed=seed0 + 1 + r, with_fee=True)
+        d, f, delta = measure_strip_DT(ctx, out)
+        dt = fit_strip_DT(ctx, d, f, delta)
+        if np.isfinite(dt):
+            dts.append(dt)
+            if rep is None or d.size > rep[0].size:
+                rep = (d, f, delta, dt)
+    return dict(dt_fits=np.array(dts, float), rep=rep,
+                d_tran=ctx.detector.TRAN_DIFF, v_drift=ctx.ideal["v_drift"],
+                pitch=ctx.detector.PIXEL_PITCH)
+
+
+def plotB7_muon_transverse_diffusion(ctx, b7, outdir, results):
+    """B7 (mu): could we measure D_T from ONE muon track's pixel readout, in data?
+
+    A muon kept over a pixel strip and inclined in drift samples a depth range; the
+    charge-sharing fraction between adjacent rows vs depth (depth taken from each pixel's
+    HIT TIME, d=V*t) follows 0.5*erfc(delta/(sqrt2 sigma_T(d))). The transverse offset
+    delta(d) is taken from the track's trajectory (the 3D track fit in data) -- which
+    breaks the offset/D_T degeneracy that a sharing-only fit suffers -- leaving a clean
+    1-parameter D_T fit. The ensemble of per-track fitted D_T should bracket the kernel D_T,
+    i.e. the measurement would work on real, imperfect (floating-angle) tracks.
+    """
+    import matplotlib.pyplot as plt
+    dts = b7["dt_fits"]; dT = b7["d_tran"]; rep = b7["rep"]; V = b7["v_drift"]
+    fig, ax = plt.subplots(1, 2, figsize=(11, 4.3))
+    # panel A: one representative track -- f vs d, with the known-delta erfc at the fitted D_T
+    if rep is not None:
+        d, f, delta, dt = rep
+        order = np.argsort(d)
+        plot_points(ax[0], d[order], f[order], color="C0",
+                    label=r"Readout $f = Q_{j'}/(Q_j+Q_{j'})$")
+        dd = d[order]; de = delta[order]
+        mg = 0.5 * (1 - _erf_vec(de / (np.sqrt(2) * np.sqrt(2 * dt * dd / V))))
+        plot_fit(ax[0], dd, mg, label=rf"$0.5\,\mathrm{{erfc}}(\delta/\sqrt{{2}}\sigma_T)$, $D_T={dt:.2e}$")
+    ax[0].set_xlabel(r"Drift Distance $d$ (cm)")
+    ax[0].set_ylabel(r"Charge-Sharing Fraction $f$")
+    ax[0].legend(fontsize=8); ax[0].grid(alpha=0.3)
+    # panel B: ensemble of fitted D_T vs the kernel value
+    ax[1].axhline(dT, color="k", ls="--", label=rf"Kernel $D_T={dT:.2e}$")
+    if dts.size:
+        jit = np.random.default_rng(0).uniform(-0.3, 0.3, dts.size)
+        plot_points(ax[1], jit, dts, color="C1", label=r"Per-Track Fit")
+        ax[1].axhline(np.median(dts), color="C1", lw=1.2, ls=":",
+                      label=rf"Median $={np.median(dts):.2e}$")
+    ax[1].set_xlim(-1, 1); ax[1].set_xticks([])
+    ax[1].set_xlabel(r"Muon Tracks (Ensemble)")
+    ax[1].set_ylabel(r"Fitted $D_T$ (cm$^2$/$\mu$s)")
+    ax[1].legend(fontsize=8); ax[1].grid(alpha=0.3)
+    _save(fig, f"{outdir}/diffB7_muon_transverse_diffusion.png")
+    if dts.size:
+        med = float(np.median(dts))
+        diagnose("B7 muon-track fitted D_T == kernel D_T", med, dT, 0.30, results)
+        print(f"    B7: {dts.size} tracks; fitted D_T median={med:.3e} "
+              f"(IQR {np.percentile(dts,25):.2e}-{np.percentile(dts,75):.2e}) "
+              f"vs kernel {dT:.3e} cm^2/us")
+    else:
+        record_check(results, "B7 muon-track D_T measurable", False, "no tracks fit")
+    if rep is not None:
+        d, f = rep[0], rep[1]
+        grew = bool(d.size >= 3 and f[np.argmax(d)] >= f[np.argmin(d)])
+        record_check(results, "B7 charge sharing grows with depth along the track", grew)
+
+
+# ===========================================================================
 # Ensemble accumulation
 # ===========================================================================
 def accumulate_muons(ctx, n_muons, rng, seed0=1000):
@@ -1513,12 +1907,12 @@ def parse_args():
     return ap.parse_args()
 
 
-def sanity_floor(ctx):
+def sanity_floor(ctx, depth=10.0):
     """A centered, well-diffused point source must give positive collected charge."""
     out = simulate_event(ctx, build_point_source_event(
-        ctx.detector, np.random.default_rng(7), 10.0), seed=1)
+        ctx.detector, np.random.default_rng(7), depth), seed=1)
     val = total_induced_charge(out["signals"]) if out else 0.0
-    print(f"Sanity floor: centered point @10cm collected = {val:.4e}")
+    print(f"Sanity floor: centered point @{depth:.0f}cm collected = {val:.4e}")
     if not (np.isfinite(val) and val > 0):
         print("  !! HARNESS UNSOUND: non-positive collected sum. Aborting.")
         return False
