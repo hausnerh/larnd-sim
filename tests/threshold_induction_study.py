@@ -306,7 +306,9 @@ class Langaus:
 
     def density(self, x, mpv, eta, sigma_g):
         eta = max(eta, 1e-6)
-        z = (self.g - mpv) / eta
+        # clip the lower tail: for z < -30 the Moyal density is already 0, and
+        # np.exp(-z) there overflows float64 (harmless inf -> 0, but it warns)
+        z = np.clip((self.g - mpv) / eta, -30.0, None)
         land = np.exp(-0.5 * (z + np.exp(-z))) / (eta * SQRT2PI)
         if sigma_g > self.dx:
             # cap the kernel half-width to the grid so convolve(mode="same")
@@ -343,24 +345,28 @@ def _hist(q, threshold_e, nbins=70, qmax=None):
 
 
 def _guess(centres, counts, threshold_e):
-    """Seed (m1,e1,s1,A1, m2,e2,s2,A2) from peak heuristics (truth-free)."""
-    split = max(2.5 * threshold_e, centres[np.argmax(counts)] * 1.6)
-    lo_m = centres < split
-    hi_m = centres >= split
-    # induction peak: tallest bin in the low region (near threshold turn-on)
-    if lo_m.any() and counts[lo_m].sum() > 0:
-        m1 = centres[lo_m][np.argmax(counts[lo_m])]
-        A1 = counts[lo_m].sum() * (centres[1] - centres[0])
+    """Seed (m1,e1,s1,A1, m2,e2,s2,A2) from peak heuristics (truth-free).
+
+    Physical roles: component 1 (induction) is a NARROW peak that rides just above
+    threshold; component 2 (shower) is a BROADER langaus at higher Q. The band
+    `2*threshold` only splits the seed *amplitudes*, not the fit -- the populations
+    may overlap.
+    """
+    w = centres[1] - centres[0]
+    band = 2.0 * threshold_e
+    near, far = centres < band, centres >= band
+    if near.any() and counts[near].sum() > 0:
+        m1 = float(centres[near][np.argmax(counts[near])])
+        A1 = float(counts[near].sum() * w)
     else:
-        m1, A1 = 1.2 * threshold_e, counts.sum() * (centres[1] - centres[0]) * 0.3
-    # shower peak: charge-weighted mode of the high region
-    if hi_m.any() and counts[hi_m].sum() > 0:
-        m2 = np.average(centres[hi_m], weights=counts[hi_m])
-        A2 = counts[hi_m].sum() * (centres[1] - centres[0])
+        m1, A1 = 1.2 * threshold_e, float(counts.sum() * w * 0.5)
+    if far.any() and counts[far].sum() > 0:
+        m2 = float(np.average(centres[far], weights=counts[far]))
+        A2 = float(counts[far].sum() * w)
     else:
-        m2, A2 = max(split * 1.3, 2 * m1), counts.sum() * (centres[1] - centres[0]) * 0.7
-    return [m1, 0.12 * m1, 0.10 * m1, A1,
-            m2, 0.18 * m2, 0.14 * m2, A2], split
+        m2, A2 = max(2.5 * threshold_e, 1.6 * m1), float(counts.sum() * w * 0.3)
+    return [m1, 0.15 * threshold_e, 0.12 * threshold_e, A1,
+            m2, 0.20 * m2, 0.15 * m2, A2]
 
 
 def fit_two_langaus(q, threshold_e, qmax=None):
@@ -376,12 +382,17 @@ def fit_two_langaus(q, threshold_e, qmax=None):
         return None
     centres, counts, width = h
     model = Langaus(centres[0], centres[-1])
-    p0, split = _guess(centres, counts, threshold_e)
+    p0 = _guess(centres, counts, threshold_e)
     cmax = centres[-1]
-    span = centres[-1] - centres[0]      # cap widths at the data span (keeps the
-    #                                      langaus from degenerating to a flat line)
-    lb = [0.5 * threshold_e, 1.0,  1.0,  0.0,  split, 1.0,  1.0,  0.0]
-    ub = [split,             span, span, np.inf, cmax, span, span, np.inf]
+    span = centres[-1] - centres[0]
+    T = threshold_e
+    # Physical constraints prevent the degenerate broad-flat collapse on
+    # non-bimodal data: induction (comp 1) is a NARROW peak pinned just above
+    # threshold; shower (comp 2) is a BROADER langaus at higher Q. Their MPV
+    # windows overlap (1.3 T .. 2 T) so genuinely-merged populations still fit.
+    lb = [0.9 * T, 0.02 * T, 0.02 * T, 0.0,    1.3 * T, 0.02 * T, 0.02 * T, 0.0]
+    ub = [2.0 * T, 0.80 * T, 0.80 * T, np.inf, cmax,    span,     span,     np.inf]
+    split = 2.0 * T                                 # kept for the headline annotation
     p0 = [min(max(v, lb[i] + 1e-6), ub[i] - 1e-6) for i, v in enumerate(p0)]
     sigma = np.sqrt(counts) + 1.0                   # Poisson-ish weights
     try:
@@ -458,77 +469,120 @@ def aggregate_singlehits(ctx, evs, threshold_e, reset_cycles, induction_scale,
 
 
 # ===========================================================================
-# Plots
+# Plots  -- publication style (Phys-Rev-like: serif/STIX, inward ticks, no grid)
 # ===========================================================================
-def plot_headline(ctx, q, truth, fit, outdir, q_truth_cut):
-    """The bimodal single-hit Q spectrum + two-langaus fit, validated by truth.
+_C_IND = "#3B6FB6"   # induction (blue)
+_C_SHW = "#C24A4A"   # shower (red)
+_C_SUM = "#1A1A1A"   # sum / total (near-black)
+_C_GRN = "#4E9A6B"   # induction fraction
+_C_PUR = "#7E6CAD"   # single-hit rate
 
-    Filled stacked histogram: induction (truth net ~0) vs shower (truth collected
-    > cut) -- the model-independent ground truth. Overlaid: the two fitted langaus
-    components (dashed) and their sum (solid dark). If the fit is reasonable the
-    two fitted peaks line up with the two truth-coloured humps.
-    """
+
+def _journal_style():
+    """Matplotlib rcParams for a clean physics-journal look (call once in main)."""
+    import matplotlib as mpl
+    mpl.rcParams.update({
+        "figure.dpi": 120, "savefig.dpi": 300, "savefig.bbox": "tight",
+        "font.family": "serif", "font.serif": ["STIXGeneral", "DejaVu Serif"],
+        "mathtext.fontset": "stix", "font.size": 12, "axes.labelsize": 13,
+        "xtick.labelsize": 11, "ytick.labelsize": 11, "legend.fontsize": 9.5,
+        "axes.linewidth": 0.9, "lines.linewidth": 1.6,
+        "xtick.direction": "in", "ytick.direction": "in",
+        "xtick.top": True, "ytick.right": True,
+        "xtick.minor.visible": True, "ytick.minor.visible": True,
+        "xtick.major.size": 5.5, "ytick.major.size": 5.5,
+        "xtick.minor.size": 3.0, "ytick.minor.size": 3.0,
+        "xtick.major.width": 0.9, "ytick.major.width": 0.9,
+        "legend.frameon": True, "legend.framealpha": 0.92,
+        "legend.edgecolor": "0.7", "legend.fancybox": False, "axes.grid": False,
+    })
+
+
+def _savefig(fig, path):
+    fig.savefig(path)
     import matplotlib.pyplot as plt
-    fig, ax = vd._new_ax(figsize=(8.4, 5.2))
+    plt.close(fig)
+    print("  wrote", path)
+
+
+def plot_headline(ctx, q, truth, fit, outdir, q_truth_cut):
+    """Single-hit Q spectrum + two-langauss fit, validated against the per-pixel
+    truth (net collected charge). The stacked histogram is the model-independent
+    ground truth (induction = net Q ~ 0, shower = real collection); the curves are
+    the truth-free two-langauss fit. Agreement validates the decomposition."""
+    import matplotlib.pyplot as plt
+    fig, ax = plt.subplots(figsize=(7.2, 5.0))
     is_shw = truth > q_truth_cut
     lo, hi = 0.7 * fit["threshold_e"], fit["centres"][-1]
-    edges = np.linspace(lo, hi, len(fit["centres"]) + 1)
-    ax.hist([q[~is_shw] / 1e3, q[is_shw] / 1e3], bins=edges / 1e3, stacked=True,
-            color=["#9ecae1", "#fc9272"], alpha=0.75,
-            label=["Induction (truth: net $\\approx$0)", "Shower (truth: collected)"])
+    edges = np.linspace(lo, hi, len(fit["centres"]) + 1) / 1e3
+    ax.hist([q[~is_shw] / 1e3, q[is_shw] / 1e3], bins=edges, stacked=True,
+            color=[_C_IND, _C_SHW], alpha=0.45, edgecolor="white", linewidth=0.3,
+            label=[r"Induction (truth: net $Q\!\approx\!0$)",
+                   r"Shower (truth: collected)"])
     if fit.get("ok"):
-        # The fit matches counts-per-bin directly (area absorbs N*bin_width), so the
-        # model curves overlay the histogram as-is -- no extra width rescaling.
-        xs = np.linspace(lo, hi, 400)
+        xs = np.linspace(lo, hi, 600)
         m1, e1, s1, A1, m2, e2, s2, A2 = fit["popt"]
-        ax.plot(xs / 1e3, fit["model"].comp(xs, m1, e1, s1, A1), "C0--", lw=1.6,
-                label="Langaus 1 (induction)")
-        ax.plot(xs / 1e3, fit["model"].comp(xs, m2, e2, s2, A2), "C3--", lw=1.6,
-                label="Langaus 2 (shower)")
-        ax.plot(xs / 1e3, fit["model"].two(xs, *fit["popt"]), "k-", lw=1.9,
-                label="Sum of two Langaus")
-        ax.axvline(fit["mpv_ind"] / 1e3, color="C0", ls=":", lw=1)
-        ax.axvline(fit["mpv_shw"] / 1e3, color="C3", ls=":", lw=1)
-        ax.text(0.97, 0.95,
-                (f"Ind. MPV = {fit['mpv_ind']/1e3:.2f}k e$^-$\n"
-                 f"Shower MPV = {fit['mpv_shw']/1e3:.2f}k e$^-$\n"
-                 f"Ind. fraction = {fit['frac_ind']:.2f}\n"
-                 f"$\\chi^2/$ndf = {fit['chi2ndf']:.2f}"),
-                transform=ax.transAxes, ha="right", va="top", fontsize=8.5,
-                bbox=dict(boxstyle="round", fc="white", ec="0.7", alpha=0.9))
-    ax.axvline(fit["threshold_e"] / 1e3, color="grey", ls="-", lw=0.8)
-    ax.set_xlabel(r"Single-Hit Pixel Charge $Q$ ($10^3$ e$^-$)")
-    ax.set_ylabel(r"Single-Hit Pixels / Bin")
+        ax.plot(xs / 1e3, fit["model"].comp(xs, m1, e1, s1, A1), color=_C_IND,
+                ls="--", lw=1.7, label="Langauss: induction")
+        ax.plot(xs / 1e3, fit["model"].comp(xs, m2, e2, s2, A2), color=_C_SHW,
+                ls="--", lw=1.7, label="Langauss: shower")
+        ax.plot(xs / 1e3, fit["model"].two(xs, *fit["popt"]), color=_C_SUM,
+                ls="-", lw=2.0, label="Sum of two Langauss")
+        for mpv, c in ((fit["mpv_ind"], _C_IND), (fit["mpv_shw"], _C_SHW)):
+            ax.axvline(mpv / 1e3, color=c, ls=":", lw=1.0, alpha=0.8)
+        stats = "\n".join((
+            r"$\mathrm{MPV}_{\mathrm{ind}}=%.1f\times10^{3}\,e^{-}$" % (fit["mpv_ind"] / 1e3),
+            r"$\mathrm{MPV}_{\mathrm{shw}}=%.1f\times10^{3}\,e^{-}$" % (fit["mpv_shw"] / 1e3),
+            r"$f_{\mathrm{ind}}=%.2f$" % fit["frac_ind"],
+            r"$\chi^{2}/\mathrm{ndf}=%.2f$" % fit["chi2ndf"]))
+        ax.text(0.975, 0.965, stats, transform=ax.transAxes, ha="right", va="top",
+                fontsize=10, linespacing=1.5,
+                bbox=dict(boxstyle="round,pad=0.5", fc="white", ec="0.6", lw=0.8))
+    ax.axvline(fit["threshold_e"] / 1e3, color="0.35", ls="-", lw=0.9)
+    ax.set_xlabel(r"Single-hit pixel charge $Q$ ($10^{3}\,e^{-}$)")
+    ax.set_ylabel("Single-hit pixels / bin")
     ax.set_yscale("log")
-    ax.legend(fontsize=8, loc="upper center")
-    ax.grid(alpha=0.3)
-    vd._save(fig, f"{outdir}/ti_hist_nominal.png")
+    ax.set_xlim(edges[0], edges[-1])
+    ax.set_ylim(bottom=0.6)
+    ax.legend(loc="upper center", fontsize=9, handlelength=1.9)
+    ax.text(0.025, 0.04, r"larnd-sim $\cdot$ %s" % vd.detector_identity(ctx)[0],
+            transform=ax.transAxes, ha="left", va="bottom", fontsize=9,
+            style="italic", color="0.4")
+    fig.tight_layout()
+    _savefig(fig, f"{outdir}/ti_hist_nominal.png")
 
 
 def plot_scan(ctx, scan, knob_label, fname, outdir, knob_vals_disp=None):
-    """Fitted observables vs one knob: Ind. MPV, Shower MPV, induction fraction.
-
-    Three stacked panels share the knob x-axis so the reader sees at a glance
-    which observable responds and which stays flat -- the visual statement of
-    disentanglement for that knob.
-    """
+    """Fitted observables vs one knob, in three stacked panels sharing the x-axis:
+    (a) induction & shower MPV, (b) induction fraction, (c) single-hit rate. The
+    reader sees at a glance which observable moves and which stays flat -- the
+    visual statement of disentanglement for that knob."""
     import matplotlib.pyplot as plt
     x = np.asarray(knob_vals_disp if knob_vals_disp is not None else scan["knob"], float)
-    fig, axes = plt.subplots(3, 1, figsize=(7.2, 8.4), sharex=True)
-    vd.plot_points(axes[0], x, scan["mpv_ind"] / 1e3, yerr=scan["mpv_ind_err"] / 1e3,
-                   color="C0", label="Induction MPV")
-    vd.plot_points(axes[0], x, scan["mpv_shw"] / 1e3, yerr=scan["mpv_shw_err"] / 1e3,
-                   color="C3", marker="s", label="Shower MPV")
-    axes[0].set_ylabel(r"Fitted MPV ($10^3$ e$^-$)")
-    axes[0].legend(fontsize=8); axes[0].grid(alpha=0.3)
-    vd.plot_points(axes[1], x, scan["frac_ind"], color="C2", marker="D")
-    axes[1].set_ylabel("Induction Fraction")
-    axes[1].grid(alpha=0.3)
-    vd.plot_points(axes[2], x, scan["rate"], color="C4", marker="^")
-    axes[2].set_ylabel("Single-Hit Pixels / Event")
+    order = np.argsort(x)
+    x = x[order]
+    col = lambda k: np.asarray(scan[k], float)[order]
+    fig, axes = plt.subplots(3, 1, figsize=(6.6, 7.8), sharex=True)
+    fig.subplots_adjust(hspace=0.07)
+    ekw = dict(ms=6.5, mfc="white", mew=1.5, capsize=3, elinewidth=1.1, lw=1.1)
+    axes[0].errorbar(x, col("mpv_ind") / 1e3, yerr=col("mpv_ind_err") / 1e3,
+                     fmt="o-", color=_C_IND, label=r"Induction $\mathrm{MPV}$", **ekw)
+    axes[0].errorbar(x, col("mpv_shw") / 1e3, yerr=col("mpv_shw_err") / 1e3,
+                     fmt="s-", color=_C_SHW, label=r"Shower $\mathrm{MPV}$", **ekw)
+    axes[0].set_ylabel(r"Fitted MPV  ($10^{3}\,e^{-}$)")
+    axes[0].legend(loc="best")
+    axes[1].errorbar(x, col("frac_ind"), fmt="D-", color=_C_GRN, **ekw)
+    axes[1].set_ylabel(r"Induction fraction $f_{\mathrm{ind}}$")
+    axes[1].set_ylim(-0.03, 1.03)
+    axes[2].errorbar(x, col("rate"), fmt="^-", color=_C_PUR, **ekw)
+    axes[2].set_ylabel("Single-hit pixels / event")
     axes[2].set_xlabel(knob_label)
-    axes[2].grid(alpha=0.3)
-    vd._save(fig, f"{outdir}/{fname}")
+    for k, axp in enumerate(axes):
+        axp.text(0.018, 0.93, "(%s)" % chr(97 + k), transform=axp.transAxes,
+                 fontsize=11, va="top", ha="left")
+    fig.align_ylabels(axes)
+    fig.tight_layout()
+    _savefig(fig, f"{outdir}/{fname}")
 
 
 def plot_sensitivity(matrix, knobs, observables, outdir):
@@ -541,20 +595,31 @@ def plot_sensitivity(matrix, knobs, observables, outdir):
     separable from the single-hit Q spectrum.
     """
     import matplotlib.pyplot as plt
-    fig, ax = plt.subplots(figsize=(7.6, 3.6))
+    fig, ax = plt.subplots(figsize=(7.0, 3.4))
     M = np.abs(np.asarray(matrix, float))
-    im = ax.imshow(M, cmap="viridis", aspect="auto")
-    ax.set_xticks(range(len(observables)))
-    ax.set_xticklabels(observables, rotation=20, ha="right", fontsize=9)
-    ax.set_yticks(range(len(knobs)))
-    ax.set_yticklabels(knobs, fontsize=9)
+    vmax = float(np.nanmax(M)) if np.isfinite(M).any() else 1.0
+    im = ax.imshow(M, cmap="cividis", aspect="auto", vmin=0.0, vmax=vmax)
+    ax.set_xticks(range(len(observables)), labels=observables, fontsize=10.5)
+    ax.set_yticks(range(len(knobs)), labels=knobs, fontsize=10.5)
+    # thin white cell borders for a clean heatmap; no tick marks
+    ax.set_xticks(np.arange(-0.5, len(observables)), minor=True)
+    ax.set_yticks(np.arange(-0.5, len(knobs)), minor=True)
+    ax.grid(which="minor", color="white", linewidth=1.3)
+    ax.tick_params(which="both", length=0)
     for i in range(M.shape[0]):
         for j in range(M.shape[1]):
             v = M[i, j]
-            ax.text(j, i, f"{v:.2f}", ha="center", va="center",
-                    color="white" if v < 0.6 * np.nanmax(M) else "black", fontsize=9)
-    fig.colorbar(im, ax=ax, label="|Sensitivity|  (frac. obs. change / frac. knob change)")
-    vd._save(fig, f"{outdir}/ti_sensitivity_matrix.png")
+            if np.isfinite(v):
+                ax.text(j, i, f"{v:.2f}", ha="center", va="center", fontsize=11,
+                        color="white" if v < 0.55 * vmax else "black")
+    cb = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.03)
+    cb.set_label(r"$|\,\Delta\mathrm{obs}/\mathrm{obs}\,|\;/\;|\,\Delta\mathrm{knob}/\mathrm{knob}\,|$",
+                 fontsize=10)
+    cb.ax.tick_params(labelsize=9)
+    ax.set_title("Sensitivity of each fit observable to each readout knob",
+                 fontsize=11, pad=8)
+    fig.tight_layout()
+    _savefig(fig, f"{outdir}/ti_sensitivity_matrix.png")
 
 
 # ===========================================================================
@@ -716,6 +781,7 @@ def main():
     args = parse_args()
     import matplotlib
     matplotlib.use("Agg")
+    _journal_style()
     from numba import cuda
     if not cuda.is_available():
         sys.exit("ERROR: no CUDA GPU available. Run this on a GPU node.")
