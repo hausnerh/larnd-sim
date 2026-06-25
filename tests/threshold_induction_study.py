@@ -248,14 +248,20 @@ def event_presignals(ctx, tracks, seed):
     if pixels_signals is None:
         return None
     ts = ctx.detector.TIME_SAMPLING
-    ps_host = vd.to_host(pixels_signals)
+    ps_host = vd.to_host(pixels_signals).astype(np.float32)
+    npix = ps_host.shape[0]
+    # The study uses only the ADC (q_sum), never the per-track backtracking. The
+    # backtracking array (pixels_tracks_signals, size nt0*sum(num_backtrack)) is by
+    # far the largest per-event object and OOM'd the 200-event cache -- so we DROP
+    # it: zero num_backtrack makes get_adc_values skip backtracking entirely while
+    # adc_list (built from pixels_signals alone) is bit-for-bit unchanged.
     return dict(
         unique_pix=vd.to_host(unique_pix),
         pixels_signals=ps_host,
-        pixels_tracks_signals=vd.to_host(summed[2]),
-        num_backtrack=vd.to_host(summed[3]),
-        offset_backtrack=vd.to_host(summed[4]),
-        truth_e=ps_host.sum(axis=1) * ts,           # net collected charge (e-)
+        pixels_tracks_signals=np.zeros(1, dtype=np.float64),
+        num_backtrack=np.zeros(npix, dtype=np.int64),
+        offset_backtrack=np.zeros(npix, dtype=np.int64),
+        truth_e=ps_host.sum(axis=1, dtype=np.float64) * ts,   # net collected charge (e-)
         max_time=ps_host.shape[1] * ts,
     )
 
@@ -328,20 +334,46 @@ class Langaus:
         return (self.comp(x, m1, e1, s1, A1) + self.comp(x, m2, e2, s2, A2))
 
 
-def _hist(q, threshold_e, nbins=70, qmax=None):
-    """Histogram single-hit Q over [0.7*threshold, q99] -> (centres, counts, width)."""
+def _adc_lsb(q):
+    """Charge quantum (e-/ADC-count) inferred from the recorded-Q grid.
+
+    adc_to_charge maps integer ADC counts to charge, so the recorded Q values lie
+    on an evenly-spaced grid whose step is the LSB. The median spacing of the
+    sorted unique values recovers it (robust to the occasional gap)."""
+    u = np.unique(q[np.isfinite(q) & (q > 0)])
+    if u.size < 3:
+        return 0.0
+    d = np.diff(u)
+    d = d[d > 1e-6]
+    return float(np.median(d)) if d.size else 0.0
+
+
+def _hist(q, threshold_e, nbins=45, qmax=None):
+    """Histogram single-hit Q on the ADC-LSB grid -> (centres, counts, width, edges).
+
+    Bin width is an integer multiple k of the LSB and edges are offset by LSB/2,
+    so each bin contains exactly k ADC levels -- this removes the comb artifact you
+    get when bins are narrower than the charge quantum."""
     q = np.asarray(q, float)
     q = q[np.isfinite(q) & (q > 0)]
     if q.size < 20:
         return None
     lo = 0.7 * threshold_e
-    hi = qmax if qmax is not None else np.percentile(q, 99.3)
+    hi = qmax if qmax is not None else np.percentile(q, 99.0)
     if hi <= lo:
         hi = lo * 4
-    edges = np.linspace(lo, hi, nbins + 1)
+    lsb = _adc_lsb(q)
+    if lsb > 0:
+        k = max(1, int(round((hi - lo) / nbins / lsb)))
+        w = k * lsb
+        start = float(np.min(q)) - 0.5 * lsb        # ADC levels fall at bin centres
+        nb = max(int(np.ceil((hi - start) / w)), 1)
+        edges = start + w * np.arange(nb + 1)
+    else:
+        edges = np.linspace(lo, hi, nbins + 1)
     counts, _ = np.histogram(q, bins=edges)
     centres = 0.5 * (edges[:-1] + edges[1:])
-    return centres, counts.astype(float), edges[1] - edges[0]
+    return centres, counts.astype(float), edges[1] - edges[0], edges
 
 
 def _guess(centres, counts, threshold_e):
@@ -369,20 +401,42 @@ def _guess(centres, counts, threshold_e):
             m2, 0.20 * m2, 0.15 * m2, A2]
 
 
-def fit_two_langaus(q, threshold_e, qmax=None):
-    """Fit the single-hit Q spectrum with two langaus peaks.
+def _guess_from_truth(q, truth, truth_cut, threshold_e, w):
+    """Seed from the MC truth: MPVs at the truth induction/shower recorded-Q medians,
+    areas at the truth sub-sample counts. The fit still optimises on the data -- the
+    truth only provides the starting point (and anchors the shower MPV, which the
+    heuristic otherwise mis-places out in the sparse Landau tail)."""
+    T = threshold_e
+    good = np.isfinite(q) & (q > 0)
+    qi = q[good & (truth <= truth_cut)]
+    qs = q[good & (truth > truth_cut)]
+    m1 = float(np.median(qi)) if qi.size else 1.1 * T
+    m2 = float(np.median(qs)) if qs.size else 2.5 * T
+    m1 = min(max(m1, 0.95 * T), 1.9 * T)
+    m2 = max(m2, 1.35 * T, 1.08 * m1)
+    return [m1, 0.15 * T, 0.10 * T, float(qi.size * w),
+            m2, 0.45 * m2, 0.25 * m2, float(qs.size * w)]
 
-    Returns a dict with the fitted parameters, the derived observables
-    (Ind. MPV, Shower MPV, induction fraction), the chi2/ndf, and the
-    histogram + model curves for plotting. None if there is not enough data.
+
+def fit_two_langaus(q, threshold_e, truth=None, truth_cut=1500.0, qmax=None):
+    """Fit the single-hit Q spectrum with two langaus peaks (induction + shower).
+
+    If `truth` (per-pixel net charge, aligned with q) is given, the fit is SEEDED
+    from the truth sub-sample medians/counts; it still optimises on the data alone,
+    so the extracted parameters remain a data measurement. Returns a dict with the
+    parameters, derived observables, chi2/ndf, and histogram/edges for plotting.
     """
     from scipy.optimize import curve_fit
     h = _hist(q, threshold_e, qmax=qmax)
     if h is None:
         return None
-    centres, counts, width = h
+    centres, counts, width, edges = h
     model = Langaus(centres[0], centres[-1])
-    p0 = _guess(centres, counts, threshold_e)
+    if truth is not None and np.size(truth) == np.size(q):
+        p0 = _guess_from_truth(np.asarray(q, float), np.asarray(truth, float),
+                               truth_cut, threshold_e, width)
+    else:
+        p0 = _guess(centres, counts, threshold_e)
     cmax = centres[-1]
     span = centres[-1] - centres[0]
     T = threshold_e
@@ -401,7 +455,7 @@ def fit_two_langaus(q, threshold_e, qmax=None):
                                absolute_sigma=True, maxfev=20000)
     except Exception as exc:
         return dict(ok=False, reason=str(exc), centres=centres, counts=counts,
-                    width=width, threshold_e=threshold_e)
+                    width=width, edges=edges, threshold_e=threshold_e)
     m1, e1, s1, A1, m2, e2, s2, A2 = popt
     pred = model.two(centres, *popt)
     ndf = max(len(centres) - len(popt), 1)
@@ -409,7 +463,7 @@ def fit_two_langaus(q, threshold_e, qmax=None):
     perr = np.sqrt(np.clip(np.diag(pcov), 0, np.inf))
     f_ind = A1 / (A1 + A2) if (A1 + A2) > 0 else np.nan
     return dict(
-        ok=True, popt=popt, perr=perr, model=model, centres=centres,
+        ok=True, popt=popt, perr=perr, model=model, centres=centres, edges=edges,
         counts=counts, width=width, pred=pred, split=split, threshold_e=threshold_e,
         mpv_ind=float(m1), mpv_shw=float(m2),
         mpv_ind_err=float(perr[0]), mpv_shw_err=float(perr[4]),
@@ -513,10 +567,10 @@ def plot_headline(ctx, q, truth, fit, outdir, q_truth_cut):
     import matplotlib.pyplot as plt
     fig, ax = plt.subplots(figsize=(7.2, 5.0))
     is_shw = truth > q_truth_cut
-    lo, hi = 0.7 * fit["threshold_e"], fit["centres"][-1]
-    edges = np.linspace(lo, hi, len(fit["centres"]) + 1) / 1e3
+    edges = fit["edges"] / 1e3                       # the ADC-LSB-aligned fit bins
+    lo, hi = fit["edges"][0], fit["edges"][-1]
     ax.hist([q[~is_shw] / 1e3, q[is_shw] / 1e3], bins=edges, stacked=True,
-            color=[_C_IND, _C_SHW], alpha=0.45, edgecolor="white", linewidth=0.3,
+            color=[_C_IND, _C_SHW], alpha=0.55, edgecolor="white", linewidth=0.4,
             label=[r"Induction (truth: net $Q\!\approx\!0$)",
                    r"Shower (truth: collected)"])
     if fit.get("ok"):
@@ -639,7 +693,7 @@ def run_fixed_induction_scan(ctx, evs, knob_name, knob_vals, base_threshold,
         thr, rst = set_fn(val)
         q, tr = aggregate_singlehits(ctx, evs, thr, rst, 1.0,
                                      seed0=seed0 + j * 1000)
-        fit = fit_two_langaus(q, thr)
+        fit = fit_two_langaus(q, thr, truth=tr)
         fits.append((val, fit, q, tr))
         out["knob"].append(val)
         if fit and fit.get("ok"):
@@ -673,7 +727,7 @@ def run_induction_scan(ctx, raw_events, scales, base_threshold, base_reset,
                 evs.append(ev)
         q, tr = aggregate_singlehits(ctx, evs, base_threshold, base_reset, s,
                                      seed0=seed0 + j * 1000 + 50000)
-        fit = fit_two_langaus(q, base_threshold)
+        fit = fit_two_langaus(q, base_threshold, truth=tr)
         out["knob"].append(s)
         if fit and fit.get("ok"):
             for k in ("mpv_ind", "mpv_ind_err", "mpv_shw", "mpv_shw_err",
@@ -833,7 +887,7 @@ def main():
     # --- headline: nominal bimodal spectrum + fit
     print("\n=== Nominal single-hit spectrum + two-langaus fit ===")
     q0, tr0 = aggregate_singlehits(ctx, evs, base_thr, base_reset, 1.0, seed0=args.seed + 1)
-    fit0 = fit_two_langaus(q0, base_thr)
+    fit0 = fit_two_langaus(q0, base_thr, truth=tr0)
     if fit0 and fit0.get("ok"):
         print(f"  single-hit pixels: {fit0['n_single']}  "
               f"Ind.MPV={fit0['mpv_ind']:.0f} e-  Shower.MPV={fit0['mpv_shw']:.0f} e-  "
@@ -852,9 +906,9 @@ def main():
     thr_scan, _ = run_fixed_induction_scan(
         ctx, evs, "threshold", args.thresholds, base_thr, base_reset, n_eff,
         seed0=args.seed + 2000, set_fn=lambda v: (float(v), base_reset))
-    plot_scan(ctx, thr_scan, r"Discrimination Threshold (e$^-$)",
+    plot_scan(ctx, thr_scan, r"Pixel charge threshold $Q_{\mathrm{thr}}$  ($10^{3}\,e^{-}$)",
               "ti_scan_threshold.png", args.outdir,
-              knob_vals_disp=np.asarray(args.thresholds, float))
+              knob_vals_disp=np.asarray(args.thresholds, float) / 1e3)
 
     # --- periodic-reset scan (recompile per value; FEE-only on cached signals)
     print("\n=== Periodic-reset scan ===")
@@ -863,18 +917,16 @@ def main():
         ctx, evs, "reset", args.resets, base_thr, base_reset, n_eff,
         seed0=args.seed + 3000, set_fn=lambda v: (base_thr, int(v)))
     set_periodic_reset(ctx, base_reset)  # restore nominal (off)
-    # display as reset PERIOD in us (off -> inf, shown at the right edge)
-    periods = np.array([v * ts if v > 0 else np.nan for v in args.resets])
-    plot_scan(ctx, rst_scan, r"Periodic-Reset Cycles (lower = more frequent)",
-              "ti_scan_periodic_reset.png", args.outdir,
-              knob_vals_disp=np.asarray([v if v > 0 else
-                                         (max(args.resets) + 100) for v in args.resets], float))
+    # x-axis = reset RATE (1/period); "off" maps naturally to 0 (no resets)
+    reset_rate = np.array([1.0e3 / (v * ts) if v > 0 else 0.0 for v in args.resets])
+    plot_scan(ctx, rst_scan, r"Periodic-reset rate  (kHz)",
+              "ti_scan_periodic_reset.png", args.outdir, knob_vals_disp=reset_rate)
 
     # --- induction scan (expensive: re-induce per scale)
     print("\n=== Induction-response scan ===")
     ind_scan = run_induction_scan(ctx, raw_events, args.inductions, base_thr,
                                   base_reset, n_eff, seed0=args.seed + 4000)
-    plot_scan(ctx, ind_scan, r"Neighbour-Pad Induction Scale",
+    plot_scan(ctx, ind_scan, r"Neighbour-pad induction-response scale",
               "ti_scan_induction.png", args.outdir,
               knob_vals_disp=np.asarray(args.inductions, float))
 
