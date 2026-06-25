@@ -309,7 +309,11 @@ class Langaus:
         z = (self.g - mpv) / eta
         land = np.exp(-0.5 * (z + np.exp(-z))) / (eta * SQRT2PI)
         if sigma_g > self.dx:
-            ks = np.arange(-4 * sigma_g, 4 * sigma_g + self.dx, self.dx)
+            # cap the kernel half-width to the grid so convolve(mode="same")
+            # always returns len(self.g) (else np.interp lengths mismatch when
+            # curve_fit pushes sigma_g wider than the whole grid)
+            half = min(int(4 * sigma_g / self.dx), (len(self.g) - 1) // 2)
+            ks = np.arange(-half, half + 1) * self.dx
             ker = np.exp(-0.5 * (ks / sigma_g) ** 2)
             ker /= ker.sum()
             land = np.convolve(land, ker, mode="same")
@@ -374,8 +378,10 @@ def fit_two_langaus(q, threshold_e, qmax=None):
     model = Langaus(centres[0], centres[-1])
     p0, split = _guess(centres, counts, threshold_e)
     cmax = centres[-1]
-    lb = [0.5 * threshold_e, 1.0, 1.0, 0.0,  split,        1.0, 1.0, 0.0]
-    ub = [split,           cmax,  cmax, np.inf,  cmax,    cmax, cmax, np.inf]
+    span = centres[-1] - centres[0]      # cap widths at the data span (keeps the
+    #                                      langaus from degenerating to a flat line)
+    lb = [0.5 * threshold_e, 1.0,  1.0,  0.0,  split, 1.0,  1.0,  0.0]
+    ub = [split,             span, span, np.inf, cmax, span, span, np.inf]
     p0 = [min(max(v, lb[i] + 1e-6), ub[i] - 1e-6) for i, v in enumerate(p0)]
     sigma = np.sqrt(counts) + 1.0                   # Poisson-ish weights
     try:
@@ -403,6 +409,34 @@ def fit_two_langaus(q, threshold_e, qmax=None):
 # ===========================================================================
 # Aggregation across events
 # ===========================================================================
+class _silence_device_stdout:
+    """Redirect C-level fd 1 to /dev/null so numba-cuda device print()s -- e.g.
+    'More ADC values than possible, 30' from dense shower-core pixels (which are
+    multi-hit and dropped by the single-hit cut anyway) -- don't spam the log.
+    Python-level prints outside the `with` block are unaffected. No-op if stdout
+    has no real file descriptor."""
+    def __enter__(self):
+        try:
+            import os as _os
+            self._fd = sys.stdout.fileno()
+            sys.stdout.flush()
+            self._saved = _os.dup(self._fd)
+            devnull = _os.open(_os.devnull, _os.O_WRONLY)
+            _os.dup2(devnull, self._fd)
+            _os.close(devnull)
+        except Exception:
+            self._saved = None
+        return self
+
+    def __exit__(self, *exc):
+        if getattr(self, "_saved", None) is not None:
+            import os as _os
+            sys.stdout.flush()
+            _os.dup2(self._saved, self._fd)
+            _os.close(self._saved)
+        return False
+
+
 def aggregate_singlehits(ctx, evs, threshold_e, reset_cycles, induction_scale,
                          seed0, n_events=None):
     """Run the FEE on cached pre-signals and concatenate single-hit (Q, truth).
@@ -413,10 +447,11 @@ def aggregate_singlehits(ctx, evs, threshold_e, reset_cycles, induction_scale,
     """
     set_periodic_reset(ctx, reset_cycles)
     qs, tr = [], []
-    for i, ev in enumerate(evs):
-        q, t = event_fee_singlehits(ctx, ev, threshold_e, seed=seed0 + i)
-        if q.size:
-            qs.append(q); tr.append(t)
+    with _silence_device_stdout():
+        for i, ev in enumerate(evs):
+            q, t = event_fee_singlehits(ctx, ev, threshold_e, seed=seed0 + i)
+            if q.size:
+                qs.append(q); tr.append(t)
     if not qs:
         return np.empty(0), np.empty(0)
     return np.concatenate(qs), np.concatenate(tr)
