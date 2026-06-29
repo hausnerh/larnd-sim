@@ -359,7 +359,7 @@ def _hist(q, threshold_e, nbins=45, qmax=None):
     if q.size < 20:
         return None
     lo = 0.7 * threshold_e
-    hi = qmax if qmax is not None else np.percentile(q, 99.0)
+    hi = qmax if qmax is not None else np.percentile(q, 99.7)
     if hi <= lo:
         hi = lo * 4
     lsb = _adc_lsb(q)
@@ -440,12 +440,22 @@ def fit_two_langaus(q, threshold_e, truth=None, truth_cut=1500.0, qmax=None):
     cmax = centres[-1]
     span = centres[-1] - centres[0]
     T = threshold_e
-    # Physical constraints prevent the degenerate broad-flat collapse on
-    # non-bimodal data: induction (comp 1) is a NARROW peak pinned just above
-    # threshold; shower (comp 2) is a BROADER langaus at higher Q. Their MPV
-    # windows overlap (1.3 T .. 2 T) so genuinely-merged populations still fit.
-    lb = [0.9 * T, 0.02 * T, 0.02 * T, 0.0,    1.3 * T, 0.02 * T, 0.02 * T, 0.0]
-    ub = [2.0 * T, 0.80 * T, 0.80 * T, np.inf, cmax,    span,     span,     np.inf]
+    if truth is not None and np.size(truth) == np.size(q):
+        # Anchor the MPVs to a window around the truth-seed medians so the fit
+        # can't drift away from the truth-identified populations (the overlap
+        # otherwise pushes the broad shower langaus out into the Landau tail).
+        m1s, m2s = p0[0], p0[4]
+        lb = [max(0.85 * T, 0.70 * m1s), 0.02 * T, 0.02 * T, 0.0,
+              max(1.05 * T, 0.60 * m2s), 0.02 * T, 0.02 * T, 0.0]
+        ub = [min(2.2 * T, 1.30 * m1s), 0.80 * T, 0.80 * T, np.inf,
+              min(cmax,   1.45 * m2s),  span,     span,     np.inf]
+    else:
+        # No truth: induction is a NARROW peak pinned above threshold, shower a
+        # BROADER langaus higher up; overlapping MPV windows so merged populations
+        # still fit and it can't collapse to a single broad-flat component.
+        lb = [0.9 * T, 0.02 * T, 0.02 * T, 0.0,    1.3 * T, 0.02 * T, 0.02 * T, 0.0]
+        ub = [2.0 * T, 0.80 * T, 0.80 * T, np.inf, cmax,    span,     span,     np.inf]
+    ub = [max(u, lb[i] * 1.01 + 1e-6) for i, u in enumerate(ub)]   # guard lb < ub
     split = 2.0 * T                                 # kept for the headline annotation
     p0 = [min(max(v, lb[i] + 1e-6), ub[i] - 1e-6) for i, v in enumerate(p0)]
     sigma = np.sqrt(counts) + 1.0                   # Poisson-ish weights
@@ -559,58 +569,87 @@ def _savefig(fig, path):
     print("  wrote", path)
 
 
-def plot_headline(ctx, q, truth, fit, outdir, q_truth_cut):
-    """Single-hit Q spectrum + two-langauss fit, validated against the per-pixel
-    truth (net collected charge). The stacked histogram is the model-independent
-    ground truth (induction = net Q ~ 0, shower = real collection); the curves are
-    the truth-free two-langauss fit. Agreement validates the decomposition."""
+def _draw_charge_dist(ax, q, truth, fit, threshold_e, truth_cut, xlim=None, compact=False):
+    """Draw one FEE-readout single-hit Q spectrum, the bins coloured by the per-pixel
+    truth into induction (net collected charge ~ 0) vs shower (real collection), with
+    the two-langauss fit overlaid (each component in its population's colour) and the
+    pixel-charge-threshold line. Shared by the nominal headline and each test case."""
+    edges = fit["edges"] / 1e3
+    is_shw = truth > truth_cut
+    ax.hist([q[~is_shw] / 1e3, q[is_shw] / 1e3], bins=edges, stacked=True,
+            color=[_C_IND, _C_SHW], alpha=0.55, edgecolor="white",
+            linewidth=(0.2 if compact else 0.35), label=["Induction", "Shower"])
+    if fit.get("ok"):
+        xs = np.linspace(fit["edges"][0], fit["edges"][-1], 700)
+        m1, e1, s1, A1, m2, e2, s2, A2 = fit["popt"]
+        lw = 1.2 if compact else 1.6
+        ax.plot(xs / 1e3, fit["model"].comp(xs, m1, e1, s1, A1), color=_C_IND, ls="--", lw=lw)
+        ax.plot(xs / 1e3, fit["model"].comp(xs, m2, e2, s2, A2), color=_C_SHW, ls="--", lw=lw)
+        ax.plot(xs / 1e3, fit["model"].two(xs, *fit["popt"]), color=_C_SUM,
+                ls="-", lw=lw + 0.5, label="Two-Langauss fit")
+    ax.axvline(threshold_e / 1e3, color="0.30", ls="--", lw=1.2, label=r"$Q_{\mathrm{thr}}$")
+    ax.set_yscale("log")
+    ax.set_ylim(bottom=0.6)
+    if xlim is not None:
+        ax.set_xlim(*xlim)
+    elif fit.get("edges") is not None:
+        ax.set_xlim(fit["edges"][0] / 1e3, fit["edges"][-1] / 1e3)
+
+
+def plot_headline(ctx, q, truth, fit, outdir, truth_cut, xlim=None):
+    """Nominal FEE-readout single-hit Q spectrum (induction/shower coloured) + fit."""
     import matplotlib.pyplot as plt
     fig, ax = plt.subplots(figsize=(7.2, 5.0))
-    is_shw = truth > q_truth_cut
-    edges = fit["edges"] / 1e3                       # the ADC-LSB-aligned fit bins
-    lo, hi = fit["edges"][0], fit["edges"][-1]
-    ax.hist([q[~is_shw] / 1e3, q[is_shw] / 1e3], bins=edges, stacked=True,
-            color=[_C_IND, _C_SHW], alpha=0.55, edgecolor="white", linewidth=0.4,
-            label=[r"Induction (truth: net $Q\!\approx\!0$)",
-                   r"Shower (truth: collected)"])
+    _draw_charge_dist(ax, q, truth, fit, fit["threshold_e"], truth_cut, xlim=xlim)
     if fit.get("ok"):
-        xs = np.linspace(lo, hi, 600)
-        m1, e1, s1, A1, m2, e2, s2, A2 = fit["popt"]
-        ax.plot(xs / 1e3, fit["model"].comp(xs, m1, e1, s1, A1), color=_C_IND,
-                ls="--", lw=1.7, label="Langauss: induction")
-        ax.plot(xs / 1e3, fit["model"].comp(xs, m2, e2, s2, A2), color=_C_SHW,
-                ls="--", lw=1.7, label="Langauss: shower")
-        ax.plot(xs / 1e3, fit["model"].two(xs, *fit["popt"]), color=_C_SUM,
-                ls="-", lw=2.0, label="Sum of two Langauss")
-        for mpv, c in ((fit["mpv_ind"], _C_IND), (fit["mpv_shw"], _C_SHW)):
-            ax.axvline(mpv / 1e3, color=c, ls=":", lw=1.0, alpha=0.8)
         stats = "\n".join((
             r"$\mathrm{MPV}_{\mathrm{ind}}=%.1f\times10^{3}\,e^{-}$" % (fit["mpv_ind"] / 1e3),
             r"$\mathrm{MPV}_{\mathrm{shw}}=%.1f\times10^{3}\,e^{-}$" % (fit["mpv_shw"] / 1e3),
             r"$f_{\mathrm{ind}}=%.2f$" % fit["frac_ind"],
             r"$\chi^{2}/\mathrm{ndf}=%.2f$" % fit["chi2ndf"]))
         ax.text(0.975, 0.965, stats, transform=ax.transAxes, ha="right", va="top",
-                fontsize=10, linespacing=1.5,
+                fontsize=10.5, linespacing=1.5,
                 bbox=dict(boxstyle="round,pad=0.5", fc="white", ec="0.6", lw=0.8))
-    ax.axvline(fit["threshold_e"] / 1e3, color="0.35", ls="-", lw=0.9)
     ax.set_xlabel(r"Single-hit pixel charge $Q$ ($10^{3}\,e^{-}$)")
-    ax.set_ylabel("Single-hit pixels / bin")
-    ax.set_yscale("log")
-    ax.set_xlim(edges[0], edges[-1])
-    ax.set_ylim(bottom=0.6)
-    ax.legend(loc="upper center", fontsize=9, handlelength=1.9)
-    ax.text(0.025, 0.04, r"larnd-sim $\cdot$ %s" % vd.detector_identity(ctx)[0],
-            transform=ax.transAxes, ha="left", va="bottom", fontsize=9,
-            style="italic", color="0.4")
+    ax.set_ylabel("Single-hit pixels")
+    ax.legend(loc="upper center", fontsize=9.5, handlelength=1.9)
     fig.tight_layout()
     _savefig(fig, f"{outdir}/ti_hist_nominal.png")
 
 
-def plot_scan(ctx, scan, knob_label, fname, outdir, knob_vals_disp=None):
+def plot_scan_distributions(panels, title, fmt_val, fname, outdir, truth_cut, xlim=None):
+    """Grid of readout-Q spectra + fits, one panel per test case (scan value).
+    `panels` is [(knob_disp, fit, q, truth), ...]; `fmt_val` formats the panel tag."""
+    import matplotlib.pyplot as plt
+    items = [(d, f, q, tr) for (d, f, q, tr) in panels if f and f.get("ok")]
+    if not items:
+        return
+    n = len(items); ncol = min(n, 3); nrow = int(np.ceil(n / ncol))
+    fig, axes = plt.subplots(nrow, ncol, figsize=(3.8 * ncol, 2.9 * nrow),
+                             sharex=True, sharey=True, squeeze=False)
+    for ax, (d, f, q, tr) in zip(axes.flat, items):
+        _draw_charge_dist(ax, q, tr, f, f["threshold_e"], truth_cut, xlim=xlim, compact=True)
+        ax.text(0.95, 0.93, fmt_val(d), transform=ax.transAxes, ha="right", va="top",
+                fontsize=9.5, bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="0.7", lw=0.6))
+    for ax in axes.flat[len(items):]:
+        ax.set_visible(False)
+    for ax in axes[-1]:
+        ax.set_xlabel(r"$Q$ ($10^{3}\,e^{-}$)")
+    for ax in axes[:, 0]:
+        ax.set_ylabel("Single-hit pixels")
+    h, l = axes.flat[0].get_legend_handles_labels()
+    fig.legend(h, l, loc="upper center", ncol=4, fontsize=9.5, bbox_to_anchor=(0.5, 1.02))
+    fig.suptitle(title, y=1.06, fontsize=12)
+    fig.tight_layout()
+    _savefig(fig, f"{outdir}/{fname}")
+
+
+def plot_scan(ctx, scan, knob_label, fname, outdir, knob_vals_disp=None, mpv_ylim=None):
     """Fitted observables vs one knob, in three stacked panels sharing the x-axis:
-    (a) induction & shower MPV, (b) induction fraction, (c) single-hit rate. The
-    reader sees at a glance which observable moves and which stays flat -- the
-    visual statement of disentanglement for that knob."""
+    (a) induction & shower MPV, (b) induction fraction, (c) single-hit rate. Points
+    with uncertainties (no connecting lines). `mpv_ylim` (in 10^3 e-) sets panel (a)
+    to the same charge range as the distributions, so the MPV shifts are read in
+    context."""
     import matplotlib.pyplot as plt
     x = np.asarray(knob_vals_disp if knob_vals_disp is not None else scan["knob"], float)
     order = np.argsort(x)
@@ -618,17 +657,19 @@ def plot_scan(ctx, scan, knob_label, fname, outdir, knob_vals_disp=None):
     col = lambda k: np.asarray(scan[k], float)[order]
     fig, axes = plt.subplots(3, 1, figsize=(6.6, 7.8), sharex=True)
     fig.subplots_adjust(hspace=0.07)
-    ekw = dict(ms=6.5, mfc="white", mew=1.5, capsize=3, elinewidth=1.1, lw=1.1)
+    ekw = dict(ms=6.5, mfc="white", mew=1.5, capsize=3, elinewidth=1.1, ls="none")
     axes[0].errorbar(x, col("mpv_ind") / 1e3, yerr=col("mpv_ind_err") / 1e3,
-                     fmt="o-", color=_C_IND, label=r"Induction $\mathrm{MPV}$", **ekw)
+                     fmt="o", color=_C_IND, label=r"Induction $\mathrm{MPV}$", **ekw)
     axes[0].errorbar(x, col("mpv_shw") / 1e3, yerr=col("mpv_shw_err") / 1e3,
-                     fmt="s-", color=_C_SHW, label=r"Shower $\mathrm{MPV}$", **ekw)
+                     fmt="s", color=_C_SHW, label=r"Shower $\mathrm{MPV}$", **ekw)
     axes[0].set_ylabel(r"Fitted MPV  ($10^{3}\,e^{-}$)")
+    if mpv_ylim is not None:
+        axes[0].set_ylim(*mpv_ylim)
     axes[0].legend(loc="best")
-    axes[1].errorbar(x, col("frac_ind"), fmt="D-", color=_C_GRN, **ekw)
+    axes[1].errorbar(x, col("frac_ind"), fmt="D", color=_C_GRN, **ekw)
     axes[1].set_ylabel(r"Induction fraction $f_{\mathrm{ind}}$")
     axes[1].set_ylim(-0.03, 1.03)
-    axes[2].errorbar(x, col("rate"), fmt="^-", color=_C_PUR, **ekw)
+    axes[2].errorbar(x, col("rate"), fmt="^", color=_C_PUR, **ekw)
     axes[2].set_ylabel("Single-hit pixels / event")
     axes[2].set_xlabel(knob_label)
     for k, axp in enumerate(axes):
@@ -680,7 +721,7 @@ def plot_sensitivity(matrix, knobs, observables, outdir):
 # Scans
 # ===========================================================================
 def run_fixed_induction_scan(ctx, evs, knob_name, knob_vals, base_threshold,
-                             base_reset, n_events, seed0, set_fn):
+                             base_reset, n_events, seed0, set_fn, qmax=None):
     """Threshold or reset scan: reuse cached nominal-induction pre-signals.
 
     `set_fn(value)` returns (threshold_e, reset_cycles) for that knob value; the
@@ -693,7 +734,7 @@ def run_fixed_induction_scan(ctx, evs, knob_name, knob_vals, base_threshold,
         thr, rst = set_fn(val)
         q, tr = aggregate_singlehits(ctx, evs, thr, rst, 1.0,
                                      seed0=seed0 + j * 1000)
-        fit = fit_two_langaus(q, thr, truth=tr)
+        fit = fit_two_langaus(q, thr, truth=tr, qmax=qmax)
         fits.append((val, fit, q, tr))
         out["knob"].append(val)
         if fit and fit.get("ok"):
@@ -709,7 +750,7 @@ def run_fixed_induction_scan(ctx, evs, knob_name, knob_vals, base_threshold,
 
 
 def run_induction_scan(ctx, raw_events, scales, base_threshold, base_reset,
-                       n_events, seed0):
+                       n_events, seed0, qmax=None):
     """Induction scan: re-induce the pre-FEE current at each response scale.
 
     This is the expensive scan -- scaling the response changes tracks_current_mc's
@@ -718,6 +759,7 @@ def run_induction_scan(ctx, raw_events, scales, base_threshold, base_reset,
     set_periodic_reset(ctx, base_reset)
     out = {k: [] for k in ("knob", "mpv_ind", "mpv_ind_err", "mpv_shw",
                            "mpv_shw_err", "frac_ind", "rate", "chi2ndf", "n_single")}
+    fits = []
     for j, s in enumerate(scales):
         set_induction(ctx, s)
         evs = []
@@ -727,7 +769,8 @@ def run_induction_scan(ctx, raw_events, scales, base_threshold, base_reset,
                 evs.append(ev)
         q, tr = aggregate_singlehits(ctx, evs, base_threshold, base_reset, s,
                                      seed0=seed0 + j * 1000 + 50000)
-        fit = fit_two_langaus(q, base_threshold, truth=tr)
+        fit = fit_two_langaus(q, base_threshold, truth=tr, qmax=qmax)
+        fits.append((s, fit, q, tr))
         out["knob"].append(s)
         if fit and fit.get("ok"):
             for k in ("mpv_ind", "mpv_ind_err", "mpv_shw", "mpv_shw_err",
@@ -739,7 +782,7 @@ def run_induction_scan(ctx, raw_events, scales, base_threshold, base_reset,
                       "frac_ind", "chi2ndf", "n_single", "rate"):
                 out[k].append(np.nan)
     set_induction(ctx, 1.0)
-    return {k: np.asarray(v, float) for k, v in out.items()}
+    return {k: np.asarray(v, float) for k, v in out.items()}, fits
 
 
 def sensitivity_row(scan, observables_keys):
@@ -884,51 +927,69 @@ def main():
     if n_eff == 0:
         sys.exit("No events produced any pixels -- check shower placement / config.")
 
-    # --- headline: nominal bimodal spectrum + fit
+    # --- headline: nominal spectrum + fit. A common charge range (q99.7 of the
+    #     nominal data) is used for every fit & plot so the test cases share axes.
     print("\n=== Nominal single-hit spectrum + two-langaus fit ===")
     q0, tr0 = aggregate_singlehits(ctx, evs, base_thr, base_reset, 1.0, seed0=args.seed + 1)
-    fit0 = fit_two_langaus(q0, base_thr, truth=tr0)
+    qmax = float(np.percentile(q0[q0 > 0], 99.7)) if np.any(q0 > 0) else 30000.0
+    xlim = (0.0, qmax / 1e3)                # 10^3 e- units for the charge axis
+    mpv_ylim = (0.0, qmax / 1e3)            # MPV panels share the charge range
+    fit0 = fit_two_langaus(q0, base_thr, truth=tr0, qmax=qmax)
     if fit0 and fit0.get("ok"):
         print(f"  single-hit pixels: {fit0['n_single']}  "
               f"Ind.MPV={fit0['mpv_ind']:.0f} e-  Shower.MPV={fit0['mpv_shw']:.0f} e-  "
               f"f_ind={fit0['frac_ind']:.2f}  chi2/ndf={fit0['chi2ndf']:.2f}")
-        # truth validation: do the truth-low and truth-high medians bracket the fitted MPVs?
         lo_med = float(np.median(q0[tr0 <= args.truth_cut])) if np.any(tr0 <= args.truth_cut) else np.nan
         hi_med = float(np.median(q0[tr0 > args.truth_cut])) if np.any(tr0 > args.truth_cut) else np.nan
-        print(f"  truth medians: induction={lo_med:.0f} e-  shower={hi_med:.0f} e- "
-              f"(fitted MPVs should sit near these)")
-        plot_headline(ctx, q0, tr0, fit0, args.outdir, args.truth_cut)
+        print(f"  truth medians (seed check): induction={lo_med:.0f} e-  shower={hi_med:.0f} e-")
+        plot_headline(ctx, q0, tr0, fit0, args.outdir, args.truth_cut, xlim=xlim)
     else:
         print("  !! nominal fit failed:", fit0.get("reason") if fit0 else "no data")
 
+    def dist_panels(fits, disp):
+        """[(disp_value, fit, q, truth), ...] for the per-test-case distribution grid."""
+        return [(d, f, q, tr) for d, (val, f, q, tr) in zip(disp, fits)]
+
     # --- threshold scan (cheap: FEE-only on cached signals)
     print("\n=== Threshold scan ===")
-    thr_scan, _ = run_fixed_induction_scan(
+    thr_disp = np.asarray(args.thresholds, float) / 1e3
+    thr_scan, thr_fits = run_fixed_induction_scan(
         ctx, evs, "threshold", args.thresholds, base_thr, base_reset, n_eff,
-        seed0=args.seed + 2000, set_fn=lambda v: (float(v), base_reset))
+        seed0=args.seed + 2000, set_fn=lambda v: (float(v), base_reset), qmax=qmax)
     plot_scan(ctx, thr_scan, r"Pixel charge threshold $Q_{\mathrm{thr}}$  ($10^{3}\,e^{-}$)",
-              "ti_scan_threshold.png", args.outdir,
-              knob_vals_disp=np.asarray(args.thresholds, float) / 1e3)
+              "ti_scan_threshold.png", args.outdir, knob_vals_disp=thr_disp, mpv_ylim=mpv_ylim)
+    plot_scan_distributions(dist_panels(thr_fits, thr_disp),
+                            r"Readout-$Q$ spectra vs pixel charge threshold",
+                            lambda d: r"$Q_{\mathrm{thr}}=%.1f$" % d,
+                            "ti_dist_threshold.png", args.outdir, args.truth_cut, xlim=xlim)
 
     # --- periodic-reset scan (recompile per value; FEE-only on cached signals)
     print("\n=== Periodic-reset scan ===")
     ts = ctx.detector.TIME_SAMPLING
-    rst_scan, _ = run_fixed_induction_scan(
+    rst_scan, rst_fits = run_fixed_induction_scan(
         ctx, evs, "reset", args.resets, base_thr, base_reset, n_eff,
-        seed0=args.seed + 3000, set_fn=lambda v: (base_thr, int(v)))
+        seed0=args.seed + 3000, set_fn=lambda v: (base_thr, int(v)), qmax=qmax)
     set_periodic_reset(ctx, base_reset)  # restore nominal (off)
     # x-axis = reset RATE (1/period); "off" maps naturally to 0 (no resets)
     reset_rate = np.array([1.0e3 / (v * ts) if v > 0 else 0.0 for v in args.resets])
     plot_scan(ctx, rst_scan, r"Periodic-reset rate  (kHz)",
               "ti_scan_periodic_reset.png", args.outdir, knob_vals_disp=reset_rate)
+    plot_scan_distributions(dist_panels(rst_fits, reset_rate),
+                            r"Readout-$Q$ spectra vs periodic-reset rate",
+                            lambda d: ("reset off" if d == 0 else r"%.0f kHz" % d),
+                            "ti_dist_periodic_reset.png", args.outdir, args.truth_cut, xlim=xlim)
 
     # --- induction scan (expensive: re-induce per scale)
     print("\n=== Induction-response scan ===")
-    ind_scan = run_induction_scan(ctx, raw_events, args.inductions, base_thr,
-                                  base_reset, n_eff, seed0=args.seed + 4000)
+    ind_scan, ind_fits = run_induction_scan(ctx, raw_events, args.inductions, base_thr,
+                                            base_reset, n_eff, seed0=args.seed + 4000, qmax=qmax)
+    ind_disp = np.asarray(args.inductions, float)
     plot_scan(ctx, ind_scan, r"Neighbour-pad induction-response scale",
-              "ti_scan_induction.png", args.outdir,
-              knob_vals_disp=np.asarray(args.inductions, float))
+              "ti_scan_induction.png", args.outdir, knob_vals_disp=ind_disp)
+    plot_scan_distributions(dist_panels(ind_fits, ind_disp),
+                            r"Readout-$Q$ spectra vs induction-response scale",
+                            lambda d: r"induction $\times%.1f$" % d,
+                            "ti_dist_induction.png", args.outdir, args.truth_cut, xlim=xlim)
 
     # --- disentanglement money plot
     print("\n=== Sensitivity matrix ===")
