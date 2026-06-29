@@ -569,11 +569,15 @@ def _savefig(fig, path):
     print("  wrote", path)
 
 
-def _draw_charge_dist(ax, q, truth, fit, threshold_e, truth_cut, xlim=None, compact=False):
-    """Draw one FEE-readout single-hit Q spectrum, the bins coloured by the per-pixel
-    truth into induction (net collected charge ~ 0) vs shower (real collection), with
-    the two-langauss fit overlaid (each component in its population's colour) and the
-    pixel-charge-threshold line. Shared by the nominal headline and each test case."""
+def _draw_charge_dist(ax, q, truth, fit, threshold_e, truth_cut, xlim=None,
+                      compact=False, thr_sigma=0.0, logy=True):
+    """Draw one FEE-readout single-hit Q spectrum (the noisy Q you trigger on in
+    data), bins coloured by the per-pixel truth into induction (net collected charge
+    ~ 0) vs shower (real collection), the two-langauss fit overlaid (each component
+    in its population's colour), and the pixel-charge-threshold line with a +/-sigma
+    band: the discriminator fires on `q+noise >= threshold + disc_noise`, so the
+    threshold itself is Gaussian-smeared by sigma_disc -- which is why recorded
+    charges land below the nominal line."""
     edges = fit["edges"] / 1e3
     is_shw = truth > truth_cut
     ax.hist([q[~is_shw] / 1e3, q[is_shw] / 1e3], bins=edges, stacked=True,
@@ -587,61 +591,104 @@ def _draw_charge_dist(ax, q, truth, fit, threshold_e, truth_cut, xlim=None, comp
         ax.plot(xs / 1e3, fit["model"].comp(xs, m2, e2, s2, A2), color=_C_SHW, ls="--", lw=lw)
         ax.plot(xs / 1e3, fit["model"].two(xs, *fit["popt"]), color=_C_SUM,
                 ls="-", lw=lw + 0.5, label="Two-Langauss fit")
-    ax.axvline(threshold_e / 1e3, color="0.30", ls="--", lw=1.2, label=r"$Q_{\mathrm{thr}}$")
-    ax.set_yscale("log")
-    ax.set_ylim(bottom=0.6)
+    if thr_sigma and thr_sigma > 0:
+        ax.axvspan((threshold_e - thr_sigma) / 1e3, (threshold_e + thr_sigma) / 1e3,
+                   color="0.45", alpha=0.18, lw=0,
+                   label=r"$Q_{\mathrm{thr}}\pm\sigma_{\mathrm{disc}}$")
+        ax.axvline(threshold_e / 1e3, color="0.30", ls="--", lw=1.2)
+    else:
+        ax.axvline(threshold_e / 1e3, color="0.30", ls="--", lw=1.2, label=r"$Q_{\mathrm{thr}}$")
+    if logy:
+        ax.set_yscale("log")
+        ax.set_ylim(bottom=0.6)
+    else:
+        ax.set_yscale("linear")
+        ax.set_ylim(bottom=0.0)
     if xlim is not None:
         ax.set_xlim(*xlim)
     elif fit.get("edges") is not None:
         ax.set_xlim(fit["edges"][0] / 1e3, fit["edges"][-1] / 1e3)
 
 
-def plot_headline(ctx, q, truth, fit, outdir, truth_cut, xlim=None):
-    """Nominal FEE-readout single-hit Q spectrum (induction/shower coloured) + fit."""
+def plot_headline(ctx, q, truth, fit, outdir, truth_cut, xlim=None, thr_sigma=0.0):
+    """Nominal single-hit Q spectrum (the noisy Q triggered on, induction/shower
+    coloured) + two-langauss fit + threshold-with-noise band. Saved both log-y
+    (ti_hist_nominal.png, shows the tail) and linear-y (ti_hist_nominal_lin.png,
+    shows the peak region where the two langauss separate)."""
     import matplotlib.pyplot as plt
-    fig, ax = plt.subplots(figsize=(7.2, 5.0))
-    _draw_charge_dist(ax, q, truth, fit, fit["threshold_e"], truth_cut, xlim=xlim)
-    if fit.get("ok"):
-        stats = "\n".join((
-            r"$\mathrm{MPV}_{\mathrm{ind}}=%.1f\times10^{3}\,e^{-}$" % (fit["mpv_ind"] / 1e3),
-            r"$\mathrm{MPV}_{\mathrm{shw}}=%.1f\times10^{3}\,e^{-}$" % (fit["mpv_shw"] / 1e3),
-            r"$f_{\mathrm{ind}}=%.2f$" % fit["frac_ind"],
-            r"$\chi^{2}/\mathrm{ndf}=%.2f$" % fit["chi2ndf"]))
-        ax.text(0.975, 0.965, stats, transform=ax.transAxes, ha="right", va="top",
-                fontsize=10.5, linespacing=1.5,
-                bbox=dict(boxstyle="round,pad=0.5", fc="white", ec="0.6", lw=0.8))
-    ax.set_xlabel(r"Single-hit pixel charge $Q$ ($10^{3}\,e^{-}$)")
-    ax.set_ylabel("Single-hit pixels")
-    ax.legend(loc="upper center", fontsize=9.5, handlelength=1.9)
-    fig.tight_layout()
-    _savefig(fig, f"{outdir}/ti_hist_nominal.png")
+    for logy, suf in ((True, ""), (False, "_lin")):
+        fig, ax = plt.subplots(figsize=(7.2, 5.0))
+        _draw_charge_dist(ax, q, truth, fit, fit["threshold_e"], truth_cut, xlim=xlim,
+                          thr_sigma=thr_sigma, logy=logy)
+        if fit.get("ok"):
+            stats = "\n".join((
+                r"$\mathrm{MPV}_{\mathrm{ind}}=%.1f\times10^{3}\,e^{-}$" % (fit["mpv_ind"] / 1e3),
+                r"$\mathrm{MPV}_{\mathrm{shw}}=%.1f\times10^{3}\,e^{-}$" % (fit["mpv_shw"] / 1e3),
+                r"$f_{\mathrm{ind}}=%.2f$" % fit["frac_ind"],
+                r"$\chi^{2}/\mathrm{ndf}=%.2f$" % fit["chi2ndf"]))
+            ax.text(0.975, 0.965, stats, transform=ax.transAxes, ha="right", va="top",
+                    fontsize=10.5, linespacing=1.5,
+                    bbox=dict(boxstyle="round,pad=0.5", fc="white", ec="0.6", lw=0.8))
+        ax.set_xlabel(r"Single-hit pixel charge $Q$ ($10^{3}\,e^{-}$)")
+        ax.set_ylabel("Single-hit pixels")
+        ax.legend(loc="upper center", fontsize=9.5, handlelength=1.9)
+        fig.tight_layout()
+        _savefig(fig, f"{outdir}/ti_hist_nominal{suf}.png")
 
 
-def plot_scan_distributions(panels, title, fmt_val, fname, outdir, truth_cut, xlim=None):
-    """Grid of readout-Q spectra + fits, one panel per test case (scan value).
-    `panels` is [(knob_disp, fit, q, truth), ...]; `fmt_val` formats the panel tag."""
+def plot_scan_distributions(panels, title, fmt_val, col0_header, fname, outdir,
+                            truth_cut, xlim=None, thr_sigma=0.0):
+    """Grid of readout-Q spectra + fits, one panel per test case (scan value). Any
+    leftover grid cell is filled with a table of the fit MPVs and integrals (the
+    per-population pixel yields) across the scan. `panels` is
+    [(knob_disp, fit, q, truth), ...]; `fmt_val` formats each panel's tag."""
     import matplotlib.pyplot as plt
     items = [(d, f, q, tr) for (d, f, q, tr) in panels if f and f.get("ok")]
     if not items:
         return
-    n = len(items); ncol = min(n, 3); nrow = int(np.ceil(n / ncol))
-    fig, axes = plt.subplots(nrow, ncol, figsize=(3.8 * ncol, 2.9 * nrow),
-                             sharex=True, sharey=True, squeeze=False)
-    for ax, (d, f, q, tr) in zip(axes.flat, items):
-        _draw_charge_dist(ax, q, tr, f, f["threshold_e"], truth_cut, xlim=xlim, compact=True)
-        ax.text(0.95, 0.93, fmt_val(d), transform=ax.transAxes, ha="right", va="top",
-                fontsize=9.5, bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="0.7", lw=0.6))
-    for ax in axes.flat[len(items):]:
-        ax.set_visible(False)
-    for ax in axes[-1]:
-        ax.set_xlabel(r"$Q$ ($10^{3}\,e^{-}$)")
-    for ax in axes[:, 0]:
-        ax.set_ylabel("Single-hit pixels")
-    h, l = axes.flat[0].get_legend_handles_labels()
-    fig.legend(h, l, loc="upper center", ncol=4, fontsize=9.5, bbox_to_anchor=(0.5, 1.02))
-    fig.suptitle(title, y=1.06, fontsize=12)
-    fig.tight_layout()
-    _savefig(fig, f"{outdir}/{fname}")
+    n = len(items)
+    ncol = min(max(n, 2), 3)
+    nrow = int(np.ceil((n + 1) / ncol))             # +1 so there's a cell for the table
+    base = fname[:-4] if fname.endswith(".png") else fname
+    for logy, suf in ((True, ""), (False, "_lin")):   # log (tail) + linear (peak) versions
+        fig, axes = plt.subplots(nrow, ncol, figsize=(3.8 * ncol, 2.9 * nrow),
+                                 sharex=True, sharey=True, squeeze=False)
+        for ax, (d, f, q, tr) in zip(axes.flat, items):
+            _draw_charge_dist(ax, q, tr, f, f["threshold_e"], truth_cut, xlim=xlim,
+                              compact=True, thr_sigma=thr_sigma, logy=logy)
+            ax.text(0.95, 0.93, fmt_val(d), transform=ax.transAxes, ha="right", va="top",
+                    fontsize=9.5, bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="0.7", lw=0.6))
+        leftover = list(axes.flat[n:])
+        for ax in axes[-1]:
+            ax.set_xlabel(r"$Q$ ($10^{3}\,e^{-}$)")
+        for ax in axes[:, 0]:
+            ax.set_ylabel("Single-hit pixels")
+        if leftover:                                # fit-summary table in the first spare cell
+            tax = leftover[0]
+            # NB: axes share y -- do NOT touch this axis's scale or it flips them all.
+            tax.set_frame_on(False); tax.tick_params(left=False, bottom=False,
+                                                     labelleft=False, labelbottom=False)
+            cols = [col0_header, r"$\mathrm{MPV}_{\mathrm{i}}$", r"$\mathrm{MPV}_{\mathrm{s}}$",
+                    r"$\int_{\mathrm{i}}$", r"$\int_{\mathrm{s}}$"]
+            rows = [[("%g" % d),
+                     "%.1f" % (f["mpv_ind"] / 1e3), "%.1f" % (f["mpv_shw"] / 1e3),
+                     "%d" % round(f["area_ind"] / f["width"]),
+                     "%d" % round(f["area_shw"] / f["width"])] for (d, f, q, tr) in items]
+            tbl = tax.table(cellText=rows, colLabels=cols, loc="center", cellLoc="center",
+                            bbox=[0.0, 0.0, 1.0, 0.92])
+            tbl.auto_set_font_size(False); tbl.set_fontsize(8.0)
+            for (r, c), cell in tbl.get_celld().items():
+                cell.set_edgecolor("0.8")
+                if r == 0:
+                    cell.set_text_props(weight="bold")
+            tax.set_title(r"MPV ($10^{3}\,e^{-}$), $\int$ = pixels", fontsize=8.5, pad=2)
+            for ax in leftover[1:]:
+                ax.set_visible(False)
+        h, l = axes.flat[0].get_legend_handles_labels()
+        fig.legend(h, l, loc="upper center", ncol=4, fontsize=9.5, bbox_to_anchor=(0.5, 1.02))
+        fig.suptitle(title, y=1.06, fontsize=12)
+        fig.tight_layout()
+        _savefig(fig, f"{outdir}/{base}{suf}.png")
 
 
 def plot_scan(ctx, scan, knob_label, fname, outdir, knob_vals_disp=None, mpv_ylim=None):
@@ -894,6 +941,8 @@ def main():
     ctx._response0 = ctx.response.copy()
     ctx._induction_mask = induction_mask(ctx)
     ctx.induction_scale = 1.0
+    # discriminator-noise sigma -> the +/-sigma band drawn around the threshold line
+    thr_sigma = float(np.atleast_1d(ctx.detector.DISCRIMINATOR_NOISE).ravel()[0])
 
     base_thr, base_reset = base_config(ctx, args)
     reset_state = "off" if base_reset <= 0 else f"{base_reset} cycles"
@@ -931,9 +980,11 @@ def main():
     #     nominal data) is used for every fit & plot so the test cases share axes.
     print("\n=== Nominal single-hit spectrum + two-langaus fit ===")
     q0, tr0 = aggregate_singlehits(ctx, evs, base_thr, base_reset, 1.0, seed0=args.seed + 1)
-    qmax = float(np.percentile(q0[q0 > 0], 99.7)) if np.any(q0 > 0) else 30000.0
-    xlim = (0.0, qmax / 1e3)                # 10^3 e- units for the charge axis
-    mpv_ylim = (0.0, qmax / 1e3)            # MPV panels share the charge range
+    # Bin/fit out to the tail, but DISPLAY a fixed 0..50 (10^3 e-) window everywhere
+    # so the spectra and the MPV panels share one charge axis.
+    qmax = float(min(np.percentile(q0[q0 > 0], 99.9), 50000.0)) if np.any(q0 > 0) else 30000.0
+    xlim = (0.0, 50.0)
+    mpv_ylim = (0.0, 50.0)
     fit0 = fit_two_langaus(q0, base_thr, truth=tr0, qmax=qmax)
     if fit0 and fit0.get("ok"):
         print(f"  single-hit pixels: {fit0['n_single']}  "
@@ -942,7 +993,8 @@ def main():
         lo_med = float(np.median(q0[tr0 <= args.truth_cut])) if np.any(tr0 <= args.truth_cut) else np.nan
         hi_med = float(np.median(q0[tr0 > args.truth_cut])) if np.any(tr0 > args.truth_cut) else np.nan
         print(f"  truth medians (seed check): induction={lo_med:.0f} e-  shower={hi_med:.0f} e-")
-        plot_headline(ctx, q0, tr0, fit0, args.outdir, args.truth_cut, xlim=xlim)
+        plot_headline(ctx, q0, tr0, fit0, args.outdir, args.truth_cut, xlim=xlim,
+                      thr_sigma=thr_sigma)
     else:
         print("  !! nominal fit failed:", fit0.get("reason") if fit0 else "no data")
 
@@ -960,8 +1012,8 @@ def main():
               "ti_scan_threshold.png", args.outdir, knob_vals_disp=thr_disp, mpv_ylim=mpv_ylim)
     plot_scan_distributions(dist_panels(thr_fits, thr_disp),
                             r"Readout-$Q$ spectra vs pixel charge threshold",
-                            lambda d: r"$Q_{\mathrm{thr}}=%.1f$" % d,
-                            "ti_dist_threshold.png", args.outdir, args.truth_cut, xlim=xlim)
+                            lambda d: r"$Q_{\mathrm{thr}}=%.1f$" % d, r"$Q_{\mathrm{thr}}$",
+                            "ti_dist_threshold.png", args.outdir, args.truth_cut, xlim=xlim, thr_sigma=thr_sigma)
 
     # --- periodic-reset scan (recompile per value; FEE-only on cached signals)
     print("\n=== Periodic-reset scan ===")
@@ -976,8 +1028,8 @@ def main():
               "ti_scan_periodic_reset.png", args.outdir, knob_vals_disp=reset_rate)
     plot_scan_distributions(dist_panels(rst_fits, reset_rate),
                             r"Readout-$Q$ spectra vs periodic-reset rate",
-                            lambda d: ("reset off" if d == 0 else r"%.0f kHz" % d),
-                            "ti_dist_periodic_reset.png", args.outdir, args.truth_cut, xlim=xlim)
+                            lambda d: ("reset off" if d == 0 else r"%.0f kHz" % d), r"kHz",
+                            "ti_dist_periodic_reset.png", args.outdir, args.truth_cut, xlim=xlim, thr_sigma=thr_sigma)
 
     # --- induction scan (expensive: re-induce per scale)
     print("\n=== Induction-response scan ===")
@@ -988,8 +1040,8 @@ def main():
               "ti_scan_induction.png", args.outdir, knob_vals_disp=ind_disp)
     plot_scan_distributions(dist_panels(ind_fits, ind_disp),
                             r"Readout-$Q$ spectra vs induction-response scale",
-                            lambda d: r"induction $\times%.1f$" % d,
-                            "ti_dist_induction.png", args.outdir, args.truth_cut, xlim=xlim)
+                            lambda d: r"induction $\times%.1f$" % d, r"scale",
+                            "ti_dist_induction.png", args.outdir, args.truth_cut, xlim=xlim, thr_sigma=thr_sigma)
 
     # --- disentanglement money plot
     print("\n=== Sensitivity matrix ===")
