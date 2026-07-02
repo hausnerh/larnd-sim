@@ -230,37 +230,65 @@ def set_periodic_reset(ctx, cycles):
 # ===========================================================================
 # One event: expensive pre-FEE stage (cached) + cheap FEE stage (scanned)
 # ===========================================================================
-def event_presignals(ctx, tracks, seed):
+def collection_pixels_from_signals(signals, neigh, f_collect):
+    """Truth BACKTRACK: the set of pixel IDs on which drifting charge actually LANDED.
+
+    `signals[s, j, :]` is the signed induced current from segment s on the j-th pad
+    of its neighbourhood (pixel id `neigh[s, j]`; -1 = padding). Integrated over
+    time it is the NET charge that pad sees from that segment -- ~the collected
+    electrons on a pad the diffused cloud lands on, ~0 on a pure-induction neighbour
+    (the bipolar Ramo lobes telescope away). So a (segment, pad) COLLECTED charge
+    iff its net is a real positive fraction (> f_collect) of the most-collecting pad
+    for that same segment: a footprint/shape criterion that says "charge terminated
+    here", independent of any absolute charge cut or the discriminator threshold.
+    This is the per-pixel truth used to split single-hit pixels into collection
+    (shower) vs pure-induction hits -- no arbitrary net-charge cut."""
+    import cupy as cp
+    net_sp = cp.asnumpy(signals.sum(axis=2))          # (nseg, max_neigh) net per (seg,pad)
+    neigh_h = cp.asnumpy(neigh)
+    seg_peak = np.maximum(net_sp.max(axis=1), 0.0)    # per-segment peak collected net
+    landed = (neigh_h >= 0) & (net_sp > 0) & (net_sp > f_collect * seg_peak[:, None])
+    return np.unique(neigh_h[landed])
+
+
+def event_presignals(ctx, tracks, seed, collect_frac=0.15):
     """Drift -> get_pixels -> induce -> sum, returned as HOST arrays + truth.
 
-    Everything needed to re-run only the FEE stage later. truth_e[ip] is the NET
-    integrated charge on pixel ip (electrons; units.e==1): ~the collected charge
-    on a real collection pad, ~0 on an induction-only pad. This is the per-pixel
-    TRUTH label used to validate the two-population decomposition.
+    Everything needed to re-run only the FEE stage later. `is_collection[ip]` is the
+    per-pixel TRUTH label from a backtrack (collection_pixels_from_signals): True if
+    drifting charge landed on pixel ip (a shower/collection hit), False if it only
+    ever saw induced current from a neighbour (a pure-induction hit). `truth_e[ip]`
+    (net integrated charge) is kept only for the diagnostic seed-check print.
     """
     drifted = vd.quench_and_drift(ctx, tracks)
     if float(np.sum(drifted["n_electrons"])) <= 0:
         return None
     neigh, radius = vd.find_pixels(ctx, drifted)
     signals = vd.induce_current(ctx, drifted, neigh, seed=seed)
+    collect_ids = collection_pixels_from_signals(signals, neigh, collect_frac)
     summed = vd.sum_to_pixels(ctx, signals, neigh, radius, drifted)
     unique_pix, pixels_signals = summed[0], summed[1]
     if pixels_signals is None:
         return None
     ts = ctx.detector.TIME_SAMPLING
     ps_host = vd.to_host(pixels_signals).astype(np.float32)
+    uph = vd.to_host(unique_pix)
     npix = ps_host.shape[0]
+    # pixel rows of pixels_signals align 1:1 with unique_pix, so the backtrack set
+    # maps straight onto a per-pixel boolean collection/induction label.
+    is_collection = np.isin(uph, collect_ids)
     # The study uses only the ADC (q_sum), never the per-track backtracking. The
     # backtracking array (pixels_tracks_signals, size nt0*sum(num_backtrack)) is by
     # far the largest per-event object and OOM'd the 200-event cache -- so we DROP
     # it: zero num_backtrack makes get_adc_values skip backtracking entirely while
     # adc_list (built from pixels_signals alone) is bit-for-bit unchanged.
     return dict(
-        unique_pix=vd.to_host(unique_pix),
+        unique_pix=uph,
         pixels_signals=ps_host,
         pixels_tracks_signals=np.zeros(1, dtype=np.float64),
         num_backtrack=np.zeros(npix, dtype=np.int64),
         offset_backtrack=np.zeros(npix, dtype=np.int64),
+        is_collection=is_collection,                          # per-pixel truth (backtrack)
         truth_e=ps_host.sum(axis=1, dtype=np.float64) * ts,   # net collected charge (e-)
         max_time=ps_host.shape[1] * ts,
     )
@@ -272,7 +300,7 @@ def event_fee_singlehits(ctx, ev, threshold_e, seed):
     A pixel is a SINGLE-HIT pixel iff it produced exactly one ADC sample. Its
     recorded charge Q is recovered from the ADC the way a data analysis would
     (vd.adc_to_charge, carrying the ~1-LSB quantization). Returns the measured Q
-    (electrons) and the truth net charge for each single-hit pixel.
+    (electrons) and the per-pixel truth collection flag for each single-hit pixel.
     """
     import cupy as cp
     ctx.detector.DISCRIMINATION_THRESHOLD = float(threshold_e)
@@ -287,10 +315,10 @@ def event_fee_singlehits(ctx, ev, threshold_e, seed):
     n_hits = (adc > 0).sum(axis=1)
     sel = n_hits == 1
     if not sel.any():
-        return np.empty(0), np.empty(0)
+        return np.empty(0), np.empty(0, bool)
     single_adc = adc[sel].max(axis=1)               # the one nonzero sample per row
     q = vd.adc_to_charge(ctx, single_adc)           # electrons
-    return np.asarray(q, float), ev["truth_e"][sel]
+    return np.asarray(q, float), ev["is_collection"][sel]
 
 
 # ===========================================================================
@@ -401,15 +429,16 @@ def _guess(centres, counts, threshold_e):
             m2, 0.20 * m2, 0.15 * m2, A2]
 
 
-def _guess_from_truth(q, truth, truth_cut, threshold_e, w):
-    """Seed from the MC truth: MPVs at the truth induction/shower recorded-Q medians,
-    areas at the truth sub-sample counts. The fit still optimises on the data -- the
-    truth only provides the starting point (and anchors the shower MPV, which the
-    heuristic otherwise mis-places out in the sparse Landau tail)."""
+def _guess_from_truth(q, is_collection, threshold_e, w):
+    """Seed from the backtrack truth: MPVs at the induction/shower recorded-Q medians,
+    areas at the sub-sample counts. The fit still optimises on the data -- the truth
+    only provides the starting point (and anchors the shower MPV, which the heuristic
+    otherwise mis-places out in the sparse Landau tail)."""
     T = threshold_e
+    coll = np.asarray(is_collection, bool)
     good = np.isfinite(q) & (q > 0)
-    qi = q[good & (truth <= truth_cut)]
-    qs = q[good & (truth > truth_cut)]
+    qi = q[good & ~coll]
+    qs = q[good & coll]
     m1 = float(np.median(qi)) if qi.size else 1.1 * T
     m2 = float(np.median(qs)) if qs.size else 2.5 * T
     m1 = min(max(m1, 0.95 * T), 1.9 * T)
@@ -418,13 +447,14 @@ def _guess_from_truth(q, truth, truth_cut, threshold_e, w):
             m2, 0.45 * m2, 0.25 * m2, float(qs.size * w)]
 
 
-def fit_two_langaus(q, threshold_e, truth=None, truth_cut=1500.0, qmax=None):
+def fit_two_langaus(q, threshold_e, truth=None, qmax=None):
     """Fit the single-hit Q spectrum with two langaus peaks (induction + shower).
 
-    If `truth` (per-pixel net charge, aligned with q) is given, the fit is SEEDED
-    from the truth sub-sample medians/counts; it still optimises on the data alone,
-    so the extracted parameters remain a data measurement. Returns a dict with the
-    parameters, derived observables, chi2/ndf, and histogram/edges for plotting.
+    If `truth` (per-pixel backtrack collection flag, aligned with q) is given, the
+    fit is SEEDED from the induction/shower sub-sample medians/counts; it still
+    optimises on the data alone, so the extracted parameters remain a data
+    measurement. Returns a dict with the parameters, derived observables, chi2/ndf,
+    and histogram/edges for plotting.
     """
     from scipy.optimize import curve_fit
     h = _hist(q, threshold_e, qmax=qmax)
@@ -433,8 +463,8 @@ def fit_two_langaus(q, threshold_e, truth=None, truth_cut=1500.0, qmax=None):
     centres, counts, width, edges = h
     model = Langaus(centres[0], centres[-1])
     if truth is not None and np.size(truth) == np.size(q):
-        p0 = _guess_from_truth(np.asarray(q, float), np.asarray(truth, float),
-                               truth_cut, threshold_e, width)
+        p0 = _guess_from_truth(np.asarray(q, float), np.asarray(truth, bool),
+                               threshold_e, width)
     else:
         p0 = _guess(centres, counts, threshold_e)
     cmax = centres[-1]
@@ -530,28 +560,21 @@ def aggregate_singlehits(ctx, evs, threshold_e, reset_cycles, induction_scale,
             if q.size:
                 qs.append(q); tr.append(t)
     if not qs:
-        return np.empty(0), np.empty(0)
+        return np.empty(0), np.empty(0, bool)
     return np.concatenate(qs), np.concatenate(tr)
 
 
-def categorize(q, truth, truth_cut, f_pre=0.5):
-    """3-way truth split of single-hit pixels by (net collected charge, recorded/collected):
+def categorize(q, is_collection):
+    """2-way truth split of single-hit pixels from the backtrack collection flag:
 
-      * induction  -- net collected charge ~ 0 (a pure induced transient),
-      * pre-trigger -- collected real charge, but the RECORDED hit is only a fraction
-                       (< f_pre) of it: an early/partial trigger that blocks the would-be
-                       single dense shower hit (grows with periodic-reset frequency),
-      * shower      -- the recorded hit captures ~ all the collected charge.
+      * induction -- drifting charge never landed on the pad (pure induced transient),
+      * shower    -- drifting charge collected on the pad (a real deposit).
 
-    The pre-trigger class is exactly the population the old (net==0?) discriminator
-    lumped in with 'shower'."""
-    q = np.asarray(q, float)
-    truth = np.asarray(truth, float)
-    is_ind = truth <= truth_cut
-    ratio = q / np.maximum(truth, 1.0)
-    is_pre = (~is_ind) & (ratio < f_pre)
-    is_shw = (~is_ind) & (ratio >= f_pre)
-    return is_ind, is_pre, is_shw
+    `is_collection` is the per-pixel boolean from collection_pixels_from_signals;
+    `q` is accepted for a uniform signature but is not used (the label is purely the
+    backtrack, so it stays valid on data-free truth)."""
+    is_shw = np.asarray(is_collection, bool)
+    return ~is_shw, is_shw
 
 
 def peak_tail_observables(centres, counts, threshold_e):
@@ -574,7 +597,6 @@ def peak_tail_observables(centres, counts, threshold_e):
 # Plots  -- publication style (Phys-Rev-like: serif/STIX, inward ticks, no grid)
 # ===========================================================================
 _C_IND = "#3B6FB6"   # induction (blue)
-_C_PRE = "#E1A730"   # pre-trigger (amber)
 _C_SHW = "#C24A4A"   # shower (red)
 _C_SUM = "#1A1A1A"   # sum / total (near-black)
 _C_GRN = "#4E9A6B"   # induction fraction
@@ -608,20 +630,20 @@ def _savefig(fig, path):
     print("  wrote", path)
 
 
-def _draw_charge_dist(ax, q, truth, fit, threshold_e, truth_cut, xlim=None,
-                      compact=False, thr_sigma=0.0, logy=True, f_pre=0.5):
+def _draw_charge_dist(ax, q, truth, fit, threshold_e, xlim=None,
+                      compact=False, thr_sigma=0.0, logy=True):
     """Draw one FEE-readout single-hit Q spectrum (the noisy Q you trigger on in
-    data), bins coloured by the per-pixel truth into induction / pre-trigger / shower
-    (see categorize()), the two-langauss fit overlaid, and the pixel-charge-threshold
-    line with a +/-sigma band: the discriminator fires on `q+noise >= threshold +
-    disc_noise`, so the threshold is Gaussian-smeared by sigma_disc -- which is why
-    recorded charges land below the nominal line."""
+    data), bins coloured by the per-pixel backtrack truth into induction vs shower
+    (collection) hits (see categorize()), the two-langauss fit overlaid, and the
+    pixel-charge-threshold line with a +/-sigma band: the discriminator fires on
+    `q+noise >= threshold + disc_noise`, so the threshold is Gaussian-smeared by
+    sigma_disc -- which is why recorded charges land below the nominal line."""
     edges = fit["edges"] / 1e3
-    is_ind, is_pre, is_shw = categorize(q, truth, truth_cut, f_pre)
-    ax.hist([q[is_ind] / 1e3, q[is_pre] / 1e3, q[is_shw] / 1e3], bins=edges,
-            stacked=True, color=[_C_IND, _C_PRE, _C_SHW], alpha=0.6, edgecolor="white",
+    is_ind, is_shw = categorize(q, truth)
+    ax.hist([q[is_ind] / 1e3, q[is_shw] / 1e3], bins=edges,
+            stacked=True, color=[_C_IND, _C_SHW], alpha=0.6, edgecolor="white",
             linewidth=(0.2 if compact else 0.35),
-            label=["Induction", "Pre-trigger", "Shower"])
+            label=["Induction", "Shower"])
     if fit.get("ok"):
         xs = np.linspace(fit["edges"][0], fit["edges"][-1], 700)
         m1, e1, s1, A1, m2, e2, s2, A2 = fit["popt"]
@@ -649,7 +671,7 @@ def _draw_charge_dist(ax, q, truth, fit, threshold_e, truth_cut, xlim=None,
         ax.set_xlim(fit["edges"][0] / 1e3, fit["edges"][-1] / 1e3)
 
 
-def plot_headline(ctx, q, truth, fit, outdir, truth_cut, xlim=None, thr_sigma=0.0, f_pre=0.5):
+def plot_headline(ctx, q, truth, fit, outdir, xlim=None, thr_sigma=0.0):
     """Nominal single-hit Q spectrum (the noisy Q triggered on, induction/shower
     coloured) + two-langauss fit + threshold-with-noise band. Saved both log-y
     (ti_hist_nominal.png, shows the tail) and linear-y (ti_hist_nominal_lin.png,
@@ -657,8 +679,8 @@ def plot_headline(ctx, q, truth, fit, outdir, truth_cut, xlim=None, thr_sigma=0.
     import matplotlib.pyplot as plt
     for logy, suf in ((True, ""), (False, "_lin")):
         fig, ax = plt.subplots(figsize=(7.2, 5.0))
-        _draw_charge_dist(ax, q, truth, fit, fit["threshold_e"], truth_cut, xlim=xlim,
-                          thr_sigma=thr_sigma, logy=logy, f_pre=f_pre)
+        _draw_charge_dist(ax, q, truth, fit, fit["threshold_e"], xlim=xlim,
+                          thr_sigma=thr_sigma, logy=logy)
         if fit.get("ok"):
             stats = "\n".join((
                 r"$\mathrm{MPV}_{\mathrm{ind}}=%.1f\times10^{3}\,e^{-}$" % (fit["mpv_ind"] / 1e3),
@@ -676,58 +698,47 @@ def plot_headline(ctx, q, truth, fit, outdir, truth_cut, xlim=None, thr_sigma=0.
 
 
 def plot_scan_distributions(panels, title, fmt_val, col0_header, fname, outdir,
-                            truth_cut, xlim=None, thr_sigma=0.0, f_pre=0.5):
-    """Grid of readout-Q spectra + fits, one panel per test case (scan value). Any
-    leftover grid cell is filled with a table of the fit MPVs and integrals (the
-    per-population pixel yields) across the scan. `panels` is
-    [(knob_disp, fit, q, truth), ...]; `fmt_val` formats each panel's tag."""
+                            xlim=None, thr_sigma=0.0):
+    """Grid of readout-Q spectra + fits, one panel per test case (scan value). Each
+    panel carries its own fit summary (the two langauss MPVs and the backtrack
+    induction/shower pixel yields) in its annotation box -- no separate table -- and
+    the grid is sized to exactly the number of test cases (6 -> a clean 2x3), so no
+    empty cell and no stray shared x-axis label leak in. `panels` is
+    [(knob_disp, fit, q, truth), ...]; `fmt_val` formats each panel's tag.
+    `col0_header` is accepted for call-site compatibility but no longer used."""
     import matplotlib.pyplot as plt
     items = [(d, f, q, tr) for (d, f, q, tr) in panels if f and f.get("ok")]
     if not items:
         return
     n = len(items)
-    ncol = min(max(n, 2), 3)
-    nrow = int(np.ceil((n + 1) / ncol))             # +1 so there's a cell for the table
+    ncol = min(max(n, 1), 3)
+    nrow = int(np.ceil(n / ncol))
     base = fname[:-4] if fname.endswith(".png") else fname
     for logy, suf in ((True, ""), (False, "_lin")):   # log (tail) + linear (peak) versions
         fig, axes = plt.subplots(nrow, ncol, figsize=(3.8 * ncol, 2.9 * nrow),
                                  sharex=True, sharey=True, squeeze=False)
         for ax, (d, f, q, tr) in zip(axes.flat, items):
-            _draw_charge_dist(ax, q, tr, f, f["threshold_e"], truth_cut, xlim=xlim,
+            _draw_charge_dist(ax, q, tr, f, f["threshold_e"], xlim=xlim,
                               compact=True, thr_sigma=thr_sigma, logy=logy)
-            ax.text(0.95, 0.93, fmt_val(d), transform=ax.transAxes, ha="right", va="top",
-                    fontsize=9.5, bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="0.7", lw=0.6))
-        leftover = list(axes.flat[n:])
-        for ax in axes[-1]:
-            ax.set_xlabel(r"$Q$ ($10^{3}\,e^{-}$)")
-        for ax in axes[:, 0]:
-            ax.set_ylabel("Single-hit pixels")
-        if leftover:                                # fit-summary table in the first spare cell
-            tax = leftover[0]
-            # NB: axes share x/y -- don't touch this axis's scale/ticks-as-data or it
-            # flips them all; just hide ALL tick marks + labels on this one Axes.
-            tax.set_frame_on(False)
-            tax.tick_params(which="both", left=False, right=False, top=False,
-                            bottom=False, labelleft=False, labelbottom=False)
-            cols = [col0_header, r"MPV$_{\mathrm{i}}$", r"MPV$_{\mathrm{s}}$",
-                    r"$N_{\mathrm{i}}$", r"$N_{\mathrm{s}}$"]
-            rows = [[("%g" % d),
-                     "%.1f" % (f["mpv_ind"] / 1e3), "%.1f" % (f["mpv_shw"] / 1e3),
-                     "%d" % round(f["area_ind"] / f["width"]),
-                     "%d" % round(f["area_shw"] / f["width"])] for (d, f, q, tr) in items]
-            tbl = tax.table(cellText=rows, colLabels=cols, loc="center", cellLoc="center",
-                            bbox=[0.0, 0.0, 1.0, 0.90])
-            tbl.auto_set_font_size(False); tbl.set_fontsize(8.0)
-            for (r, c), cell in tbl.get_celld().items():
-                cell.set_edgecolor("0.75")
-                if r == 0:                          # header row: bold + shaded
-                    cell.set_text_props(weight="bold")
-                    cell.set_facecolor("0.85")
-            tax.text(0.5, 0.965, r"MPV in $10^{3}\,e^{-}$;  $N$ = pixel yield",
-                     transform=tax.transAxes, ha="center", va="bottom", fontsize=7.5,
-                     color="0.35")
-            for ax in leftover[1:]:
-                ax.set_visible(False)
+            is_ind, is_shw = categorize(q, tr)
+            stat = "\n".join((
+                fmt_val(d),
+                r"$\mathrm{MPV}_{i,s}=%.1f,\,%.1f$" % (f["mpv_ind"] / 1e3, f["mpv_shw"] / 1e3),
+                r"$N_{i,s}=%d,\,%d$" % (int(is_ind.sum()), int(is_shw.sum()))))
+            ax.text(0.95, 0.93, stat, transform=ax.transAxes, ha="right", va="top",
+                    fontsize=8.0, linespacing=1.35,
+                    bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="0.7", lw=0.6))
+        for ax in axes.flat[n:]:                     # hide any unused cells (label included)
+            ax.set_visible(False)
+        for c in range(ncol):                        # x-label on the lowest USED cell per column
+            used = [r * ncol + c for r in range(nrow) if r * ncol + c < n]
+            if used:
+                axb = axes.flat[used[-1]]
+                axb.set_xlabel(r"$Q$ ($10^{3}\,e^{-}$)")
+                axb.tick_params(labelbottom=True)
+        for r in range(nrow):
+            if r * ncol < n:
+                axes[r, 0].set_ylabel("Single-hit pixels")
         h, l = axes.flat[0].get_legend_handles_labels()
         fig.legend(h, l, loc="upper center", ncol=4, fontsize=9.5, bbox_to_anchor=(0.5, 1.02))
         fig.suptitle(title, y=1.06, fontsize=12)
@@ -838,7 +849,7 @@ def run_fixed_induction_scan(ctx, evs, knob_name, knob_vals, base_threshold,
 
 
 def run_induction_scan(ctx, raw_events, scales, base_threshold, base_reset,
-                       n_events, seed0, qmax=None):
+                       n_events, seed0, qmax=None, collect_frac=0.15):
     """Induction scan: re-induce the pre-FEE current at each response scale.
 
     This is the expensive scan -- scaling the response changes tracks_current_mc's
@@ -853,7 +864,8 @@ def run_induction_scan(ctx, raw_events, scales, base_threshold, base_reset,
         set_induction(ctx, s)
         evs = []
         for i, raw in enumerate(raw_events):
-            ev = event_presignals(ctx, raw, seed=seed0 + j * 777 + i)
+            ev = event_presignals(ctx, raw, seed=seed0 + j * 777 + i,
+                                  collect_frac=collect_frac)
             if ev is not None:
                 evs.append(ev)
         q, tr = aggregate_singlehits(ctx, evs, base_threshold, base_reset, s,
@@ -918,18 +930,22 @@ def parse_args():
     ap.add_argument("--n-events", type=int, default=30, help="shower events per config")
     ap.add_argument("--shower-energy", type=float, default=300.0, help="MeV")
     ap.add_argument("--n-dep", type=int, default=400, help="deposits per shower")
-    ap.add_argument("--truth-cut", type=float, default=1500.0,
-                    help="net collected e- above which a single-hit pixel is 'shower'")
+    ap.add_argument("--collect-frac", type=float, default=0.15,
+                    help="a (segment,pad) counts as collection if its net charge > this "
+                         "fraction of that segment's peak-collecting pad (backtrack truth "
+                         "split; relative, so threshold-independent)")
     ap.add_argument("--thresholds", type=float, nargs="+",
-                    default=[3000, 4000, 5000, 7000, 10000], help="e-")
+                    default=[3000, 4000, 5000, 6000, 8000, 10000], help="e-")
     ap.add_argument("--resets", type=int, nargs="+",
-                    default=[-1, 400, 200, 100, 50],
+                    default=[-1, 400, 200, 100, 66, 50],
                     help="PERIODIC_RESET_CYCLES (-1 = off)")
     ap.add_argument("--inductions", type=float, nargs="+",
-                    default=[0.0, 0.5, 1.0, 1.5, 2.0], help="response scale")
+                    default=[0.0, 0.5, 1.0, 1.5, 2.0, 3.0], help="response scale")
     ap.add_argument("--seed", type=int, default=12345)
-    ap.add_argument("--pretrigger-frac", type=float, default=0.5,
-                    help="recorded/collected below this = pre-trigger hit (3-way truth split)")
+    ap.add_argument("--truth-cut", type=float, default=None,
+                    help="(deprecated; ignored -- truth is now a collection backtrack)")
+    ap.add_argument("--pretrigger-frac", type=float, default=None,
+                    help="(deprecated; ignored -- the 3-way pre-trigger split was removed)")
     ap.add_argument("--outdir", default="tistudy")
     return ap.parse_args()
 
@@ -1014,7 +1030,8 @@ def main():
     set_periodic_reset(ctx, base_reset)
     evs = []
     for i, raw in enumerate(raw_events):
-        ev = event_presignals(ctx, raw, seed=args.seed + 100 + i)
+        ev = event_presignals(ctx, raw, seed=args.seed + 100 + i,
+                              collect_frac=args.collect_frac)
         if ev is not None:
             evs.append(ev)
     n_eff = len(evs)
@@ -1034,14 +1051,15 @@ def main():
     mpv_ylim = (0.0, 50.0)
     fit0 = fit_two_langaus(q0, base_thr, truth=tr0, qmax=qmax)
     if fit0 and fit0.get("ok"):
+        coll0 = np.asarray(tr0, bool)
         print(f"  single-hit pixels: {fit0['n_single']}  "
               f"Ind.MPV={fit0['mpv_ind']:.0f} e-  Shower.MPV={fit0['mpv_shw']:.0f} e-  "
               f"f_ind={fit0['frac_ind']:.2f}  chi2/ndf={fit0['chi2ndf']:.2f}")
-        lo_med = float(np.median(q0[tr0 <= args.truth_cut])) if np.any(tr0 <= args.truth_cut) else np.nan
-        hi_med = float(np.median(q0[tr0 > args.truth_cut])) if np.any(tr0 > args.truth_cut) else np.nan
-        print(f"  truth medians (seed check): induction={lo_med:.0f} e-  shower={hi_med:.0f} e-")
-        plot_headline(ctx, q0, tr0, fit0, args.outdir, args.truth_cut, xlim=xlim,
-                      thr_sigma=thr_sigma, f_pre=args.pretrigger_frac)
+        lo_med = float(np.median(q0[~coll0])) if np.any(~coll0) else np.nan
+        hi_med = float(np.median(q0[coll0])) if np.any(coll0) else np.nan
+        print(f"  backtrack medians (seed check): induction={lo_med:.0f} e-  "
+              f"shower={hi_med:.0f} e-  (N_ind={int((~coll0).sum())}, N_shw={int(coll0.sum())})")
+        plot_headline(ctx, q0, tr0, fit0, args.outdir, xlim=xlim, thr_sigma=thr_sigma)
     else:
         print("  !! nominal fit failed:", fit0.get("reason") if fit0 else "no data")
 
@@ -1060,7 +1078,7 @@ def main():
     plot_scan_distributions(dist_panels(thr_fits, thr_disp),
                             r"Readout-$Q$ spectra vs pixel charge threshold",
                             lambda d: r"$Q_{\mathrm{thr}}=%.1f$" % d, r"$Q_{\mathrm{thr}}$",
-                            "ti_dist_threshold.png", args.outdir, args.truth_cut, xlim=xlim, thr_sigma=thr_sigma, f_pre=args.pretrigger_frac)
+                            "ti_dist_threshold.png", args.outdir, xlim=xlim, thr_sigma=thr_sigma)
 
     # --- periodic-reset scan (recompile per value; FEE-only on cached signals)
     print("\n=== Periodic-reset scan ===")
@@ -1076,19 +1094,20 @@ def main():
     plot_scan_distributions(dist_panels(rst_fits, reset_rate),
                             r"Readout-$Q$ spectra vs periodic-reset rate",
                             lambda d: ("reset off" if d == 0 else r"%.0f kHz" % d), r"kHz",
-                            "ti_dist_periodic_reset.png", args.outdir, args.truth_cut, xlim=xlim, thr_sigma=thr_sigma, f_pre=args.pretrigger_frac)
+                            "ti_dist_periodic_reset.png", args.outdir, xlim=xlim, thr_sigma=thr_sigma)
 
     # --- induction scan (expensive: re-induce per scale)
     print("\n=== Induction-response scan ===")
     ind_scan, ind_fits = run_induction_scan(ctx, raw_events, args.inductions, base_thr,
-                                            base_reset, n_eff, seed0=args.seed + 4000, qmax=qmax)
+                                            base_reset, n_eff, seed0=args.seed + 4000,
+                                            qmax=qmax, collect_frac=args.collect_frac)
     ind_disp = np.asarray(args.inductions, float)
     plot_scan(ctx, ind_scan, r"Neighbour-pad induction-response scale",
               "ti_scan_induction.png", args.outdir, knob_vals_disp=ind_disp)
     plot_scan_distributions(dist_panels(ind_fits, ind_disp),
                             r"Readout-$Q$ spectra vs induction-response scale",
                             lambda d: r"induction $\times%.1f$" % d, r"scale",
-                            "ti_dist_induction.png", args.outdir, args.truth_cut, xlim=xlim, thr_sigma=thr_sigma, f_pre=args.pretrigger_frac)
+                            "ti_dist_induction.png", args.outdir, xlim=xlim, thr_sigma=thr_sigma)
 
     # --- disentanglement money plot
     print("\n=== Sensitivity matrix ===")
