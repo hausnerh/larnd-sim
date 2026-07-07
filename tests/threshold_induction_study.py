@@ -21,13 +21,20 @@ THE IDEA
        threshold before its negative lobe could cancel it. It records only that
        small transient: a LOW-Q peak, piled just above threshold.
 
-  The Q distribution of single-hit pixels is therefore BIMODAL. We fit it with a
-  sum of two Landau*Gauss (langaus) peaks -- one per population -- and ask:
+  The two populations OVERLAP near threshold, so a free two-langaus fit mis-assigns
+  them. Instead we TEMPLATE the shower: with induction turned OFF (neighbour-pad
+  response scaled to 0) the single-hit sample is PURE shower, so we fit that clean
+  spectrum with a near-threshold langaus + a higher-Q Gaussian and FREEZE the langaus
+  (the near-threshold shower is peripheral -> its weak neighbours induce little on it,
+  so it is induction-immune). We build this frozen langaus over the full (threshold x
+  reset) grid and look for a CLOSED-FORM law for its parameters. The induction-ON fit
+  is then: frozen shower langaus + a floating Gaussian (the core-adjacent bump, which
+  IS induction-shadowed) + a floating induction langau -- so the turn-on excess is
+  cleanly attributed to induction. The per-pixel TRUTH label is a backtrack (did
+  drifting charge land on the pad?) used only to colour the histograms. We ask:
 
-    * Are the fits reasonable? (validated against a per-pixel TRUTH label: the
-      net integrated charge tells us which pixels actually collected charge.)
-    * Do threshold / periodic-reset / induction-response each move the fitted
-      parameters in CLEAR, MEASURABLE, and DISENTANGLED ways?
+    * Do threshold / periodic-reset / induction-response each move the extracted
+      observables in CLEAR, MEASURABLE, and DISENTANGLED ways?
 
 WHY THE THREE KNOBS SEPARATE (the hypothesis this script tests)
   * THRESHOLD sets where the induction peak sits: induction hits barely cross
@@ -251,19 +258,30 @@ def collection_pixels_from_signals(signals, neigh, f_collect):
     return np.unique(neigh_h[landed])
 
 
-def event_presignals(ctx, tracks, seed, collect_frac=0.15):
-    """Drift -> get_pixels -> induce -> sum, returned as HOST arrays + truth.
+def event_drift(ctx, tracks):
+    """The induction-scale-INDEPENDENT pre-FEE work: quench -> drift -> get_pixels.
 
-    Everything needed to re-run only the FEE stage later. `is_collection[ip]` is the
-    per-pixel TRUTH label from a backtrack (collection_pixels_from_signals): True if
-    drifting charge landed on pixel ip (a shower/collection hit), False if it only
-    ever saw induced current from a neighbour (a pure-induction hit). `truth_e[ip]`
-    (net integrated charge) is kept only for the diagnostic seed-check print.
-    """
+    Returns (drifted_host, neigh, radius) or None if the event drifts no electrons.
+    Drift and pixel-finding depend only on the deposited charge geometry, NOT on the
+    response/induction scale, so this is computed ONCE per event and reused across the
+    nominal pass, the induction-off pass, and every induction-scan scale -- only
+    induce_current + sum_pixel_signals downstream have to re-run per scale."""
     drifted = vd.quench_and_drift(ctx, tracks)
     if float(np.sum(drifted["n_electrons"])) <= 0:
         return None
     neigh, radius = vd.find_pixels(ctx, drifted)
+    return drifted, neigh, radius
+
+
+def event_induce(ctx, drifted, neigh, radius, seed, collect_frac=0.15):
+    """Induce + sum on a cached (drifted, neigh, radius) -> the pre-FEE signal dict.
+
+    The only induction-scale-DEPENDENT stage (callers vary ctx.response between calls).
+    `is_collection[ip]` is the per-pixel TRUTH label from a backtrack
+    (collection_pixels_from_signals): True if drifting charge landed on pixel ip (a
+    shower/collection hit), False if it only ever saw induced current from a neighbour.
+    `truth_e[ip]` (net integrated charge) is kept only for the diagnostic seed-check.
+    """
     signals = vd.induce_current(ctx, drifted, neigh, seed=seed)
     collect_ids = collection_pixels_from_signals(signals, neigh, collect_frac)
     summed = vd.sum_to_pixels(ctx, signals, neigh, radius, drifted)
@@ -292,6 +310,14 @@ def event_presignals(ctx, tracks, seed, collect_frac=0.15):
         truth_e=ps_host.sum(axis=1, dtype=np.float64) * ts,   # net collected charge (e-)
         max_time=ps_host.shape[1] * ts,
     )
+
+
+def event_presignals(ctx, tracks, seed, collect_frac=0.15):
+    """Thin wrapper: event_drift then event_induce (for callers that don't reuse drift)."""
+    d = event_drift(ctx, tracks)
+    if d is None:
+        return None
+    return event_induce(ctx, d[0], d[1], d[2], seed, collect_frac)
 
 
 def event_fee_singlehits(ctx, ev, threshold_e, seed):
@@ -404,111 +430,127 @@ def _hist(q, threshold_e, nbins=45, qmax=None):
     return centres, counts.astype(float), edges[1] - edges[0], edges
 
 
-def _guess(centres, counts, threshold_e):
-    """Seed (m1,e1,s1,A1, m2,e2,s2,A2) from peak heuristics (truth-free).
+def _gaussian(x, mu, sig, area):
+    """Area-normalised Gaussian (the higher-Q shower bump in the template model)."""
+    sig = max(float(sig), 1e-6)
+    return area * np.exp(-0.5 * ((x - mu) / sig) ** 2) / (sig * SQRT2PI)
 
-    Physical roles: component 1 (induction) is a NARROW peak that rides just above
-    threshold; component 2 (shower) is a BROADER langaus at higher Q. The band
-    `2*threshold` only splits the seed *amplitudes*, not the fit -- the populations
-    may overlap.
-    """
+
+def _guess_shower(centres, counts, threshold_e):
+    """Seed (mpv,eta,sg,A_L, mu,sig,A_G) for the induction-off shower model."""
     w = centres[1] - centres[0]
-    band = 2.0 * threshold_e
-    near, far = centres < band, centres >= band
-    if near.any() and counts[near].sum() > 0:
-        m1 = float(centres[near][np.argmax(counts[near])])
-        A1 = float(counts[near].sum() * w)
-    else:
-        m1, A1 = 1.2 * threshold_e, float(counts.sum() * w * 0.5)
-    if far.any() and counts[far].sum() > 0:
-        m2 = float(np.average(centres[far], weights=counts[far]))
-        A2 = float(counts[far].sum() * w)
-    else:
-        m2, A2 = max(2.5 * threshold_e, 1.6 * m1), float(counts.sum() * w * 0.3)
-    return [m1, 0.15 * threshold_e, 0.12 * threshold_e, A1,
-            m2, 0.20 * m2, 0.15 * m2, A2]
-
-
-def _guess_from_truth(q, is_collection, threshold_e, w):
-    """Seed from the backtrack truth: MPVs at the induction/shower recorded-Q medians,
-    areas at the sub-sample counts. The fit still optimises on the data -- the truth
-    only provides the starting point (and anchors the shower MPV, which the heuristic
-    otherwise mis-places out in the sparse Landau tail)."""
     T = threshold_e
-    coll = np.asarray(is_collection, bool)
-    good = np.isfinite(q) & (q > 0)
-    qi = q[good & ~coll]
-    qs = q[good & coll]
-    m1 = float(np.median(qi)) if qi.size else 1.1 * T
-    m2 = float(np.median(qs)) if qs.size else 2.5 * T
-    m1 = min(max(m1, 0.95 * T), 1.9 * T)
-    m2 = max(m2, 1.35 * T, 1.08 * m1)
-    return [m1, 0.15 * T, 0.10 * T, float(qi.size * w),
-            m2, 0.45 * m2, 0.25 * m2, float(qs.size * w)]
+    total = float(counts.sum() * w)
+    mpv = float(centres[int(np.argmax(counts))])
+    mpv = min(max(mpv, 0.95 * T), 2.5 * T)
+    hi = centres > 1.6 * mpv                          # upper shoulder -> Gaussian bump
+    if hi.any() and counts[hi].sum() > 0:
+        mu = float(np.average(centres[hi], weights=counts[hi]))
+        sig = max(float(np.sqrt(np.average((centres[hi] - mu) ** 2, weights=counts[hi]))), w)
+        aG = float(counts[hi].sum() * w)
+    else:
+        mu, sig, aG = 2.5 * mpv, mpv, 0.3 * total
+    return [mpv, 0.15 * T, 0.12 * T, 0.6 * total, mu, sig, aG]
 
 
-def fit_two_langaus(q, threshold_e, truth=None, qmax=None):
-    """Fit the single-hit Q spectrum with two langaus peaks (induction + shower).
+def fit_shower_template(q_shower, threshold_e, qmax=None):
+    """Fit the induction-OFF shower single-hit spectrum with langaus + Gaussian and
+    return the FROZEN langaus part as a reusable template.
 
-    If `truth` (per-pixel backtrack collection flag, aligned with q) is given, the
-    fit is SEEDED from the induction/shower sub-sample medians/counts; it still
-    optimises on the data alone, so the extracted parameters remain a data
-    measurement. Returns a dict with the parameters, derived observables, chi2/ndf,
-    and histogram/edges for plotting.
-    """
+    The near-threshold langaus is the induction-immune shape (peripheral collection
+    pads whose weak neighbours induce little on them); it is what we reuse in the
+    induction-ON composite fit. The Gaussian (higher-Q, core-adjacent, and therefore
+    induction-shadowed) is fitted here only to soak up the upper shoulder so the
+    langaus lands correctly -- it is NOT reused (it floats in the composite fit).
+    Returns a 'template' dict with the langaus params + fit arrays for diagnostics."""
+    from scipy.optimize import curve_fit
+    h = _hist(q_shower, threshold_e, qmax=qmax)
+    if h is None:
+        return dict(ok=False, reason="too few shower hits", threshold_e=threshold_e)
+    centres, counts, width, edges = h
+    lg = Langaus(centres[0], centres[-1])
+    def model(x, mpv, eta, sg, aL, mu, sig, aG):
+        return lg.comp(x, mpv, eta, sg, aL) + _gaussian(x, mu, sig, aG)
+    T, span, cmax = threshold_e, centres[-1] - centres[0], centres[-1]
+    p0 = _guess_shower(centres, counts, threshold_e)
+    lb = [0.85 * T, 0.02 * T, 0.02 * T, 0.0,    T,    0.02 * T, 0.0]
+    ub = [3.0 * T,  0.90 * T, 0.90 * T, np.inf, cmax, span,     np.inf]
+    p0 = [min(max(v, lb[i] + 1e-9), ub[i] - 1e-9) for i, v in enumerate(p0)]
+    sigma = np.sqrt(counts) + 1.0
+    try:
+        popt, _ = curve_fit(model, centres, counts, p0=p0, bounds=(lb, ub),
+                            sigma=sigma, absolute_sigma=True, maxfev=20000)
+    except Exception as exc:
+        return dict(ok=False, reason=str(exc), threshold_e=threshold_e,
+                    centres=centres, counts=counts, width=width, edges=edges)
+    mpv, eta, sg, aL, mu, sig, aG = popt
+    pred = model(centres, *popt)
+    ndf = max(len(centres) - len(popt), 1)
+    chi2 = float(np.sum(((counts - pred) / sigma) ** 2))
+    return dict(ok=True, threshold_e=float(threshold_e),
+                mpv_L=float(mpv), eta_L=float(eta), sg_L=float(sg), A_L=float(aL),
+                mu_G=float(mu), sig_G=float(sig), A_G=float(aG),
+                popt=popt, model=model, lg=lg, centres=centres, counts=counts,
+                width=width, edges=edges, pred=pred, chi2=chi2, ndf=ndf,
+                chi2ndf=chi2 / ndf, n_shower=int(counts.sum()))
+
+
+def fit_shower_plus_induction(q, threshold_e, template, qmax=None):
+    """Composite induction-ON fit: FROZEN shower langaus (from `template`) + a floating
+    Gaussian (induction-shadowed high-Q shower bump) + a floating induction langau.
+
+    Freezing the shower langaus removes the near-threshold degeneracy that makes a free
+    two-langaus fit mis-assign the overlapping populations: the shower contribution at
+    the turn-on is pinned by the induction-off template, so the residual excess right
+    above threshold is cleanly attributed to induction. Free params
+    [mu, sig, A_G, mpv_i, eta_i, sg_i, A_i]. Returns a `kind='template'` fit dict."""
     from scipy.optimize import curve_fit
     h = _hist(q, threshold_e, qmax=qmax)
     if h is None:
         return None
     centres, counts, width, edges = h
-    model = Langaus(centres[0], centres[-1])
-    if truth is not None and np.size(truth) == np.size(q):
-        p0 = _guess_from_truth(np.asarray(q, float), np.asarray(truth, bool),
-                               threshold_e, width)
-    else:
-        p0 = _guess(centres, counts, threshold_e)
-    cmax = centres[-1]
-    span = centres[-1] - centres[0]
-    T = threshold_e
-    if truth is not None and np.size(truth) == np.size(q):
-        # Anchor the MPVs to a window around the truth-seed medians so the fit
-        # can't drift away from the truth-identified populations (the overlap
-        # otherwise pushes the broad shower langaus out into the Landau tail).
-        m1s, m2s = p0[0], p0[4]
-        lb = [max(0.85 * T, 0.70 * m1s), 0.02 * T, 0.02 * T, 0.0,
-              max(1.05 * T, 0.60 * m2s), 0.02 * T, 0.02 * T, 0.0]
-        ub = [min(2.2 * T, 1.30 * m1s), 0.80 * T, 0.80 * T, np.inf,
-              min(cmax,   1.45 * m2s),  span,     span,     np.inf]
-    else:
-        # No truth: induction is a NARROW peak pinned above threshold, shower a
-        # BROADER langaus higher up; overlapping MPV windows so merged populations
-        # still fit and it can't collapse to a single broad-flat component.
-        lb = [0.9 * T, 0.02 * T, 0.02 * T, 0.0,    1.3 * T, 0.02 * T, 0.02 * T, 0.0]
-        ub = [2.0 * T, 0.80 * T, 0.80 * T, np.inf, cmax,    span,     span,     np.inf]
-    ub = [max(u, lb[i] * 1.01 + 1e-6) for i, u in enumerate(ub)]   # guard lb < ub
-    split = 2.0 * T                                 # kept for the headline annotation
-    p0 = [min(max(v, lb[i] + 1e-6), ub[i] - 1e-6) for i, v in enumerate(p0)]
-    sigma = np.sqrt(counts) + 1.0                   # Poisson-ish weights
+    if not (template and template.get("ok")):
+        return dict(ok=False, reason="no shower template", centres=centres, counts=counts,
+                    width=width, edges=edges, threshold_e=threshold_e)
+    lg = Langaus(centres[0], centres[-1])
+    mpv_L, eta_L, sg_L, A_L = (template["mpv_L"], template["eta_L"],
+                               template["sg_L"], template["A_L"])
+    frozen_c = lg.comp(centres, mpv_L, eta_L, sg_L, A_L)   # frozen shower langaus on the bins
+    T, span, cmax = threshold_e, centres[-1] - centres[0], centres[-1]
+
+    def model(x, mu, sig, aG, mpv_i, eta_i, sg_i, aI):
+        return frozen_c + _gaussian(x, mu, sig, aG) + lg.comp(x, mpv_i, eta_i, sg_i, aI)
+
+    total = float(counts.sum() * width)
+    p0 = [min(max(template["mu_G"], 1.5 * T), cmax), max(template["sig_G"], width), 0.4 * total,
+          1.1 * T, 0.15 * T, 0.10 * T, 0.4 * total]
+    lb = [T,    0.02 * T, 0.0,    0.9 * T, 0.02 * T, 0.02 * T, 0.0]
+    ub = [cmax, span,     np.inf, 2.0 * T, 0.80 * T, 0.80 * T, np.inf]
+    p0 = [min(max(v, lb[i] + 1e-9), ub[i] - 1e-9) for i, v in enumerate(p0)]
+    sigma = np.sqrt(counts) + 1.0
     try:
-        popt, pcov = curve_fit(model.two, centres, counts, p0=p0,
-                               bounds=(lb, ub), sigma=sigma,
-                               absolute_sigma=True, maxfev=20000)
+        popt, pcov = curve_fit(model, centres, counts, p0=p0, bounds=(lb, ub),
+                               sigma=sigma, absolute_sigma=True, maxfev=20000)
     except Exception as exc:
         return dict(ok=False, reason=str(exc), centres=centres, counts=counts,
                     width=width, edges=edges, threshold_e=threshold_e)
-    m1, e1, s1, A1, m2, e2, s2, A2 = popt
-    pred = model.two(centres, *popt)
+    mu, sig, aG, mpv_i, eta_i, sg_i, aI = popt
+    pred = model(centres, *popt)
     ndf = max(len(centres) - len(popt), 1)
     chi2 = float(np.sum(((counts - pred) / sigma) ** 2))
     perr = np.sqrt(np.clip(np.diag(pcov), 0, np.inf))
-    f_ind = A1 / (A1 + A2) if (A1 + A2) > 0 else np.nan
+    tot_shw = A_L + aG
+    f_ind = float(aI / (aI + tot_shw)) if (aI + tot_shw) > 0 else np.nan
     peak_mpv, peak_height, tail_height = peak_tail_observables(centres, counts, threshold_e)
     return dict(
-        ok=True, popt=popt, perr=perr, model=model, centres=centres, edges=edges,
-        counts=counts, width=width, pred=pred, split=split, threshold_e=threshold_e,
-        mpv_ind=float(m1), mpv_shw=float(m2),
-        mpv_ind_err=float(perr[0]), mpv_shw_err=float(perr[4]),
-        area_ind=float(A1), area_shw=float(A2), frac_ind=float(f_ind),
+        ok=True, kind="template", centres=centres, counts=counts, width=width,
+        edges=edges, threshold_e=threshold_e, pred=pred, lg=lg,
+        frozen=(mpv_L, eta_L, sg_L, A_L), popt=popt, perr=perr,
+        mpv_ind=float(mpv_i), mpv_ind_err=float(perr[3]),
+        mpv_shw=float(mpv_L), mpv_shw_err=0.0,        # frozen -> no fit error
+        mu_G=float(mu), sig_G=float(sig), A_G=float(aG),
+        eta_ind=float(eta_i), sg_ind=float(sg_i),
+        area_ind=float(aI), area_shw=float(tot_shw), frac_ind=f_ind,
         peak_mpv=peak_mpv, peak_height=peak_height, tail_height=tail_height,
         chi2=chi2, ndf=ndf, chi2ndf=chi2 / ndf, n_single=int(np.sum(counts)))
 
@@ -594,6 +636,143 @@ def peak_tail_observables(centres, counts, threshold_e):
 
 
 # ===========================================================================
+# Shower-template library: fit the induction-OFF langaus over (threshold x reset)
+# and look for a closed-form law for each langaus parameter
+# ===========================================================================
+def reset_rate_khz(cycles, ts):
+    """Periodic-reset RATE (kHz) from PERIODIC_RESET_CYCLES; <=0 -> 0 (reset off)."""
+    cycles = np.asarray(cycles, float)
+    return np.where(cycles > 0, 1.0e3 / (cycles * ts), 0.0)
+
+
+def build_template_grid(ctx, evs_off, thresholds, resets, ts, qmax, seed0):
+    """Fit the shower template on the induction-OFF cache over the full (threshold x
+    reset) grid. Cheap: NO re-induction -- only FEE re-runs on the cached pre-signals
+    (reset changes recompile the fee kernel, so loop reset OUTER to share each recompile
+    across all thresholds). Returns (grid, node_fits): `grid` holds each langaus param as
+    a (n_reset, n_threshold) array plus the axes; `node_fits[(thr, cycles)]` is the
+    per-node template dict (the diagnostics + exact on-grid template for the fits)."""
+    thr_arr = np.asarray(thresholds, float)
+    rst_arr = np.asarray(resets, int)
+    keys = ("mpv_L", "eta_L", "sg_L", "A_L", "mu_G", "sig_G", "chi2ndf")
+    grid = {k: np.full((len(rst_arr), len(thr_arr)), np.nan) for k in keys}
+    node_fits = {}
+    for ir, rst in enumerate(rst_arr):                # reset OUTER -> one recompile per rate
+        for it, thr in enumerate(thr_arr):
+            q, tr = aggregate_singlehits(ctx, evs_off, float(thr), int(rst), 0.0,
+                                         seed0=seed0 + ir * 1000 + it)
+            coll = np.asarray(tr, bool)
+            qs = q[coll] if coll.any() else q         # induction-off => essentially all shower
+            tmpl = fit_shower_template(qs, float(thr), qmax=qmax)
+            node_fits[(float(thr), int(rst))] = tmpl
+            if tmpl.get("ok"):
+                for k in keys:
+                    grid[k][ir, it] = tmpl[k]
+    grid["thresholds"] = thr_arr
+    grid["resets"] = rst_arr
+    grid["rates"] = reset_rate_khz(rst_arr, ts)
+    return grid, node_fits
+
+
+def _cf_forms():
+    """Candidate closed forms p(x, r) for a langaus parameter; x = Q_thr/1e3 (10^3 e-),
+    r = reset rate (kHz). Physically: p rides threshold (affine in x) and is sculpted by
+    reset (a linear/bilinear rate term); A_L instead decays with threshold (exp)."""
+    def planar(X, c0, c1, c2):
+        x, r = X; return c0 + c1 * x + c2 * r
+    def bilinear(X, c0, c1, c2, c3):
+        x, r = X; return c0 + c1 * x + c2 * r + c3 * x * r
+    def affine_r(X, c0, c1, c2):
+        x, r = X; return (c0 + c1 * x) * (1.0 + c2 * r)
+    def expdecay_r(X, c0, c1, c2):
+        x, r = X; return c0 * np.exp(-x / (abs(c1) + 1e-6)) * (1.0 + c2 * r)
+    return [
+        (r"$c_0+c_1 Q_{thr}+c_2 f$", planar,
+         lambda y, x, r: [float(np.mean(y)), 0.0, 0.0]),
+        (r"$c_0+c_1 Q_{thr}+c_2 f+c_3 Q_{thr}f$", bilinear,
+         lambda y, x, r: [float(np.mean(y)), 0.0, 0.0, 0.0]),
+        (r"$(c_0+c_1 Q_{thr})(1+c_2 f)$", affine_r,
+         lambda y, x, r: [float(np.mean(y)), 0.0, 0.0]),
+        (r"$c_0 e^{-Q_{thr}/c_1}(1+c_2 f)$", expdecay_r,
+         lambda y, x, r: [float(np.max(y)) if y.size else 1.0, float(np.mean(x)) or 1.0, 0.0]),
+    ]
+
+
+def _fit_closed_form(x, r, y):
+    """Fit the candidate closed forms to param values y over (x=Q_thr/1e3, r=rate kHz);
+    return the lowest-AIC form as a dict (name, params, r2, aic, func) or None."""
+    from scipy.optimize import curve_fit
+    good = np.isfinite(y) & np.isfinite(x) & np.isfinite(r)
+    x, r, y = x[good], r[good], y[good]
+    if y.size < 3:
+        return None
+    X = np.vstack([x, r])
+    sst = float(np.sum((y - y.mean()) ** 2))
+    best = None
+    for name, func, seed in _cf_forms():
+        k = func.__code__.co_argcount - 1
+        if y.size <= k:
+            continue
+        try:
+            popt, _ = curve_fit(func, X, y, p0=seed(y, x, r), maxfev=20000)
+        except Exception:
+            continue
+        ssr = float(np.sum((y - func(X, *popt)) ** 2))
+        aic = y.size * np.log(ssr / y.size + 1e-30) + 2 * k
+        r2 = 1.0 - ssr / sst if sst > 0 else (1.0 if ssr < 1e-9 else 0.0)
+        cand = dict(name=name, params=[float(p) for p in popt], aic=float(aic),
+                    r2=float(r2), func=func, k=k)
+        if best is None or aic < best["aic"]:
+            best = cand
+    return best
+
+
+class TemplateParam:
+    """Closed-form (with grid-interpolation fallback) model of the shower langaus
+    parameters as functions of (Q_thr, reset rate), fitted from a build_template_grid
+    2-D grid. For each parameter the best closed form is kept; `value()` uses it when its
+    R^2 clears `r2_min`, else bilinearly interpolates the grid. `template_at()` returns a
+    synthesized template dict for the composite fit at any (on- or off-grid) point."""
+    PARAMS = ("mpv_L", "eta_L", "sg_L", "A_L", "mu_G", "sig_G")
+
+    def __init__(self, grid, ts, r2_min=0.9):
+        self.ts, self.r2_min = ts, r2_min
+        self.thr = np.asarray(grid["thresholds"], float)
+        rates = np.asarray(grid["rates"], float)
+        order = np.argsort(rates)                     # ascending rate (off=0 first)
+        self.rates = rates[order]
+        self.grid = {k: np.asarray(grid[k], float)[order] for k in self.PARAMS}
+        self.x = self.thr / 1e3
+        xx, rr = np.meshgrid(self.x, self.rates)      # (n_rate, n_thr), aligns with grid[k]
+        self.forms = {k: _fit_closed_form(xx.ravel(), rr.ravel(), self.grid[k].ravel())
+                      for k in self.PARAMS}
+
+    def _interp(self, key, thr, rate):
+        """Bilinear interp of grid[key] over (rate, threshold), clamped at the edges."""
+        g = self.grid[key]
+        xi = float(np.interp(thr / 1e3, self.x, np.arange(self.x.size)))
+        yi = float(np.interp(rate, self.rates, np.arange(self.rates.size)))
+        x0, y0 = int(np.floor(xi)), int(np.floor(yi))
+        x1, y1 = min(x0 + 1, self.x.size - 1), min(y0 + 1, self.rates.size - 1)
+        fx, fy = xi - x0, yi - y0
+        return float((1 - fx) * (1 - fy) * g[y0, x0] + fx * (1 - fy) * g[y0, x1]
+                     + (1 - fx) * fy * g[y1, x0] + fx * fy * g[y1, x1])
+
+    def value(self, key, thr, cycles):
+        rate = float(reset_rate_khz(cycles, self.ts))
+        f = self.forms.get(key)
+        if f is not None and f["r2"] >= self.r2_min:
+            return float(f["func"](np.array([[thr / 1e3], [rate]]), *f["params"])[0])
+        return self._interp(key, thr, rate)
+
+    def template_at(self, thr, cycles):
+        """Synthesized template dict (frozen langaus + Gaussian seed) at (thr, cycles)."""
+        d = {k: self.value(k, float(thr), int(cycles)) for k in self.PARAMS}
+        d.update(ok=True, threshold_e=float(thr), A_G=max(d["A_L"] * 0.3, 1.0), synthesized=True)
+        return d
+
+
+# ===========================================================================
 # Plots  -- publication style (Phys-Rev-like: serif/STIX, inward ticks, no grid)
 # ===========================================================================
 _C_IND = "#3B6FB6"   # induction (blue)
@@ -634,8 +813,9 @@ def _draw_charge_dist(ax, q, truth, fit, threshold_e, xlim=None,
                       compact=False, thr_sigma=0.0, logy=True):
     """Draw one FEE-readout single-hit Q spectrum (the noisy Q you trigger on in
     data), bins coloured by the per-pixel backtrack truth into induction vs shower
-    (collection) hits (see categorize()), the two-langauss fit overlaid, and the
-    pixel-charge-threshold line with a +/-sigma band: the discriminator fires on
+    (collection) hits (see categorize()), the composite template fit overlaid (frozen
+    shower langaus + floating Gaussian as one shower curve, plus the induction langau),
+    and the pixel-charge-threshold line with a +/-sigma band: the discriminator fires on
     `q+noise >= threshold + disc_noise`, so the threshold is Gaussian-smeared by
     sigma_disc -- which is why recorded charges land below the nominal line."""
     edges = fit["edges"] / 1e3
@@ -644,14 +824,18 @@ def _draw_charge_dist(ax, q, truth, fit, threshold_e, xlim=None,
             stacked=True, color=[_C_IND, _C_SHW], alpha=0.6, edgecolor="white",
             linewidth=(0.2 if compact else 0.35),
             label=["Induction", "Shower"])
-    if fit.get("ok"):
+    if fit.get("ok") and fit.get("kind") == "template":
         xs = np.linspace(fit["edges"][0], fit["edges"][-1], 700)
-        m1, e1, s1, A1, m2, e2, s2, A2 = fit["popt"]
+        lg = fit["lg"]
+        mpv_L, eta_L, sg_L, A_L = fit["frozen"]
+        mu, sig, aG, mpv_i, eta_i, sg_i, aI = fit["popt"]
+        shower = lg.comp(xs, mpv_L, eta_L, sg_L, A_L) + _gaussian(xs, mu, sig, aG)
+        induction = lg.comp(xs, mpv_i, eta_i, sg_i, aI)
         lw = 1.2 if compact else 1.6
-        ax.plot(xs / 1e3, fit["model"].comp(xs, m1, e1, s1, A1), color=_C_IND, ls="--", lw=lw)
-        ax.plot(xs / 1e3, fit["model"].comp(xs, m2, e2, s2, A2), color=_C_SHW, ls="--", lw=lw)
-        ax.plot(xs / 1e3, fit["model"].two(xs, *fit["popt"]), color=_C_SUM,
-                ls="-", lw=lw + 0.5, label="Two-Langauss fit")
+        ax.plot(xs / 1e3, induction, color=_C_IND, ls="--", lw=lw)
+        ax.plot(xs / 1e3, shower, color=_C_SHW, ls="--", lw=lw)
+        ax.plot(xs / 1e3, shower + induction, color=_C_SUM, ls="-", lw=lw + 0.5,
+                label="Template fit")
     if thr_sigma and thr_sigma > 0:
         ax.axvspan((threshold_e - thr_sigma) / 1e3, (threshold_e + thr_sigma) / 1e3,
                    color="0.45", alpha=0.18, lw=0,
@@ -673,9 +857,9 @@ def _draw_charge_dist(ax, q, truth, fit, threshold_e, xlim=None,
 
 def plot_headline(ctx, q, truth, fit, outdir, xlim=None, thr_sigma=0.0):
     """Nominal single-hit Q spectrum (the noisy Q triggered on, induction/shower
-    coloured) + two-langauss fit + threshold-with-noise band. Saved both log-y
-    (ti_hist_nominal.png, shows the tail) and linear-y (ti_hist_nominal_lin.png,
-    shows the peak region where the two langauss separate)."""
+    coloured) + composite template fit (frozen shower langaus + floating Gaussian +
+    induction langau) + threshold-with-noise band. Saved both log-y (ti_hist_nominal.png,
+    the tail) and linear-y (ti_hist_nominal_lin.png, the peak region)."""
     import matplotlib.pyplot as plt
     for logy, suf in ((True, ""), (False, "_lin")):
         fig, ax = plt.subplots(figsize=(7.2, 5.0))
@@ -684,7 +868,8 @@ def plot_headline(ctx, q, truth, fit, outdir, xlim=None, thr_sigma=0.0):
         if fit.get("ok"):
             stats = "\n".join((
                 r"$\mathrm{MPV}_{\mathrm{ind}}=%.1f\times10^{3}\,e^{-}$" % (fit["mpv_ind"] / 1e3),
-                r"$\mathrm{MPV}_{\mathrm{shw}}=%.1f\times10^{3}\,e^{-}$" % (fit["mpv_shw"] / 1e3),
+                r"$\mathrm{MPV}_{\mathrm{shw}}^{\mathrm{L}}=%.1f\times10^{3}\,e^{-}$" % (fit["mpv_shw"] / 1e3),
+                r"$\mu_{\mathrm{G}}=%.1f\times10^{3}\,e^{-}$" % (fit.get("mu_G", np.nan) / 1e3),
                 r"$f_{\mathrm{ind}}=%.2f$" % fit["frac_ind"],
                 r"$\chi^{2}/\mathrm{ndf}=%.2f$" % fit["chi2ndf"]))
             ax.text(0.975, 0.965, stats, transform=ax.transAxes, ha="right", va="top",
@@ -813,77 +998,168 @@ def plot_sensitivity(matrix, knobs, observables, outdir):
     _savefig(fig, f"{outdir}/ti_sensitivity_matrix.png")
 
 
+def plot_shower_templates(node_fits, thresholds, base_reset, outdir):
+    """Diagnostic: induction-OFF shower spectra + langaus+Gaussian template fits across
+    thresholds (at base reset). Verifies the hypothesised shape and that the near-
+    threshold langaus tracks threshold. Red dashed = langaus, green dashed = Gaussian,
+    black = sum. Saved log-y and linear-y."""
+    import matplotlib.pyplot as plt
+    items = [(thr, node_fits.get((float(thr), int(base_reset)))) for thr in thresholds]
+    items = [(thr, f) for thr, f in items if f and f.get("ok")]
+    if not items:
+        return
+    n = len(items); ncol = min(max(n, 1), 3); nrow = int(np.ceil(n / ncol))
+    for logy, suf in ((True, ""), (False, "_lin")):
+        fig, axes = plt.subplots(nrow, ncol, figsize=(3.8 * ncol, 2.9 * nrow),
+                                 sharex=True, sharey=True, squeeze=False)
+        for ax, (thr, f) in zip(axes.flat, items):
+            edges = f["edges"]
+            ax.hist(f["centres"] / 1e3, bins=edges / 1e3, weights=f["counts"],
+                    color=_C_SHW, alpha=0.5, edgecolor="white", linewidth=0.2,
+                    label="Induction-off shower")
+            xs = np.linspace(edges[0], edges[-1], 700)
+            mpv, eta, sg, aL, mu, sig, aG = f["popt"]
+            ax.plot(xs / 1e3, f["lg"].comp(xs, mpv, eta, sg, aL), color=_C_SHW, ls="--", lw=1.2)
+            ax.plot(xs / 1e3, _gaussian(xs, mu, sig, aG), color=_C_GRN, ls="--", lw=1.2)
+            ax.plot(xs / 1e3, f["model"](xs, *f["popt"]), color=_C_SUM, ls="-", lw=1.6,
+                    label="langaus + Gaussian")
+            ax.axvline(thr / 1e3, color="0.3", ls=":", lw=1.0)
+            ax.text(0.95, 0.93, "\n".join((
+                r"$Q_{\mathrm{thr}}=%.1f$" % (thr / 1e3),
+                r"$\mathrm{MPV}_L=%.1f$" % (mpv / 1e3),
+                r"$\chi^{2}/\mathrm{ndf}=%.1f$" % f["chi2ndf"])),
+                transform=ax.transAxes, ha="right", va="top", fontsize=8.0,
+                linespacing=1.35, bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="0.7", lw=0.6))
+            ax.set_yscale("log" if logy else "linear")
+            ax.set_ylim(bottom=0.6 if logy else 0.0)
+            ax.set_xlim(0, 50)
+        for ax in axes.flat[n:]:
+            ax.set_visible(False)
+        for c in range(ncol):
+            used = [r * ncol + c for r in range(nrow) if r * ncol + c < n]
+            if used:
+                axes.flat[used[-1]].set_xlabel(r"$Q$ ($10^{3}\,e^{-}$)")
+                axes.flat[used[-1]].tick_params(labelbottom=True)
+        for r in range(nrow):
+            if r * ncol < n:
+                axes[r, 0].set_ylabel("Single-hit pixels")
+        h, l = axes.flat[0].get_legend_handles_labels()
+        fig.legend(h, l, loc="upper center", ncol=3, fontsize=9.5, bbox_to_anchor=(0.5, 1.02))
+        fig.suptitle(r"Induction-off shower template (langaus + Gaussian) vs threshold",
+                     y=1.06, fontsize=12)
+        fig.tight_layout()
+        _savefig(fig, f"{outdir}/ti_shower_template{suf}.png")
+
+
+def plot_template_params(grid, tparam, ts, outdir):
+    """Diagnostic + deliverable: each frozen-langaus parameter vs threshold, one series
+    per reset rate, with the best closed-form fit overlaid (lines) and its formula + R^2
+    annotated. Answers 'is there a closed form for the langaus in (threshold, reset)?'
+    In the annotated formulae, f is the reset rate (kHz) and Q_thr is in 10^3 e-."""
+    import matplotlib.pyplot as plt
+    thr = np.asarray(grid["thresholds"], float)
+    rates = reset_rate_khz(np.asarray(grid["resets"], int), ts)
+    params = [("mpv_L", r"$\mathrm{MPV}_L$ ($10^{3}e^{-}$)", 1e3),
+              ("A_L", r"$A_L$ (a.u.)", 1.0),
+              ("eta_L", r"$\eta_L$ ($10^{3}e^{-}$)", 1e3),
+              ("sg_L", r"$\sigma_L$ ($10^{3}e^{-}$)", 1e3)]
+    cmap = plt.get_cmap("viridis")
+    order = np.argsort(rates)
+    fig, axes = plt.subplots(2, 2, figsize=(11, 8))
+    for ax, (key, ylab, sc) in zip(axes.flat, params):
+        g = np.asarray(grid[key], float)               # (n_reset, n_thr)
+        f = tparam.forms.get(key)
+        for ir in order:
+            c = cmap(0.12 + 0.76 * (ir / max(len(rates) - 1, 1)))
+            lab = "off" if rates[ir] == 0 else "%.0f kHz" % rates[ir]
+            ax.plot(thr / 1e3, g[ir] / sc, "o", color=c, ms=5, label=lab)
+            if f is not None:
+                xs = np.linspace(thr.min(), thr.max(), 60)
+                yhat = f["func"](np.vstack([xs / 1e3, np.full_like(xs, rates[ir])]), *f["params"])
+                ax.plot(xs / 1e3, yhat / sc, "-", color=c, lw=1.2, alpha=0.85)
+        ax.set_xlabel(r"$Q_{\mathrm{thr}}$ ($10^{3}\,e^{-}$)")
+        ax.set_ylabel(ylab)
+        if f is not None:
+            ax.text(0.03, 0.97, "%s\n$R^{2}=%.3f$" % (f["name"], f["r2"]),
+                    transform=ax.transAxes, ha="left", va="top", fontsize=8.5,
+                    bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="0.7", lw=0.6))
+    axes.flat[0].legend(title="reset rate", fontsize=8, ncol=2, loc="upper right")
+    fig.suptitle("Frozen shower-langaus parameters vs threshold and reset "
+                 "(points) with closed-form fits (lines)", y=1.0, fontsize=12)
+    fig.tight_layout()
+    _savefig(fig, f"{outdir}/ti_template_params.png")
+
+
 # ===========================================================================
 # Scans
 # ===========================================================================
+# fit-dict keys copied into every scan's output arrays (composite template fit)
+_SCAN_FIT_KEYS = ("mpv_ind", "mpv_ind_err", "mpv_shw", "mpv_shw_err", "frac_ind",
+                  "chi2ndf", "n_single", "peak_mpv", "peak_height", "tail_height",
+                  "area_ind", "mu_G", "sig_G", "A_G")
+
+
+def _record_fit(out, fit, n_events):
+    """Append one fit's observables to the scan-output lists (nan-fill on failure)."""
+    if fit and fit.get("ok"):
+        for k in _SCAN_FIT_KEYS:
+            out[k].append(fit[k])
+        out["rate"].append(fit["n_single"] / max(n_events, 1))
+    else:
+        for k in _SCAN_FIT_KEYS:
+            out[k].append(np.nan)
+        out["rate"].append(np.nan)
+
+
 def run_fixed_induction_scan(ctx, evs, knob_name, knob_vals, base_threshold,
-                             base_reset, n_events, seed0, set_fn, qmax=None):
+                             base_reset, n_events, seed0, set_fn, template_fn, qmax=None):
     """Threshold or reset scan: reuse cached nominal-induction pre-signals.
 
-    `set_fn(value)` returns (threshold_e, reset_cycles) for that knob value; the
-    other parameter is held at its base. Fits each aggregated spectrum.
-    """
-    out = {k: [] for k in ("knob", "mpv_ind", "mpv_ind_err", "mpv_shw",
-                           "mpv_shw_err", "frac_ind", "rate", "chi2ndf", "n_single",
-                           "peak_mpv", "peak_height", "tail_height")}
+    `set_fn(value)` returns (threshold_e, reset_cycles) for that knob value (the other
+    is held at base); `template_fn(threshold_e, reset_cycles)` returns the frozen shower
+    template for that operating point. Each aggregated spectrum is fit with the composite
+    frozen-shower + floating-induction model."""
+    out = {k: [] for k in ("knob", "rate") + _SCAN_FIT_KEYS}
     fits = []
     for j, val in enumerate(knob_vals):
         thr, rst = set_fn(val)
-        q, tr = aggregate_singlehits(ctx, evs, thr, rst, 1.0,
-                                     seed0=seed0 + j * 1000)
-        fit = fit_two_langaus(q, thr, truth=tr, qmax=qmax)
+        q, tr = aggregate_singlehits(ctx, evs, thr, rst, 1.0, seed0=seed0 + j * 1000)
+        fit = fit_shower_plus_induction(q, thr, template_fn(thr, rst), qmax=qmax)
         fits.append((val, fit, q, tr))
         out["knob"].append(val)
-        if fit and fit.get("ok"):
-            for k in ("mpv_ind", "mpv_ind_err", "mpv_shw", "mpv_shw_err",
-                      "frac_ind", "chi2ndf", "n_single",
-                      "peak_mpv", "peak_height", "tail_height"):
-                out[k].append(fit[k])
-            out["rate"].append(fit["n_single"] / max(n_events, 1))
-        else:
-            for k in ("mpv_ind", "mpv_ind_err", "mpv_shw", "mpv_shw_err",
-                      "frac_ind", "chi2ndf", "n_single", "rate",
-                      "peak_mpv", "peak_height", "tail_height"):
-                out[k].append(np.nan)
+        _record_fit(out, fit, n_events)
     return {k: np.asarray(v, float) for k, v in out.items()}, fits
 
 
-def run_induction_scan(ctx, raw_events, scales, base_threshold, base_reset,
-                       n_events, seed0, qmax=None, collect_frac=0.15):
-    """Induction scan: re-induce the pre-FEE current at each response scale.
-
-    This is the expensive scan -- scaling the response changes tracks_current_mc's
-    output, so the pre-FEE stage is recomputed for every scale.
-    """
+def run_induction_scan(ctx, drift_cache, scales, base_threshold, base_reset,
+                       n_events, seed0, template_fn, evs_off=None, qmax=None,
+                       collect_frac=0.15):
+    """Induction scan: re-INDUCE (only) the pre-FEE current at each response scale, on the
+    cached drift/pixel geometry (`drift_cache`, which is induction-scale-independent).
+    `evs_off` (the induction-off pre-signals) is reused verbatim for the scale=0 point.
+    Threshold and reset stay at base, so one base template is used throughout. Caching
+    drift keeps quench/drift/find-pixels out of the per-scale loop (the timeout fix)."""
     set_periodic_reset(ctx, base_reset)
-    out = {k: [] for k in ("knob", "mpv_ind", "mpv_ind_err", "mpv_shw",
-                           "mpv_shw_err", "frac_ind", "rate", "chi2ndf", "n_single",
-                           "peak_mpv", "peak_height", "tail_height")}
+    out = {k: [] for k in ("knob", "rate") + _SCAN_FIT_KEYS}
     fits = []
+    template = template_fn(base_threshold, base_reset)
     for j, s in enumerate(scales):
-        set_induction(ctx, s)
-        evs = []
-        for i, raw in enumerate(raw_events):
-            ev = event_presignals(ctx, raw, seed=seed0 + j * 777 + i,
+        if s == 0.0 and evs_off is not None:
+            evs = evs_off                              # induction-off cache == scale-0
+        else:
+            set_induction(ctx, s)
+            evs = []
+            for i, dc in enumerate(drift_cache):
+                ev = event_induce(ctx, dc[0], dc[1], dc[2], seed=seed0 + j * 777 + i,
                                   collect_frac=collect_frac)
-            if ev is not None:
-                evs.append(ev)
+                if ev is not None:
+                    evs.append(ev)
         q, tr = aggregate_singlehits(ctx, evs, base_threshold, base_reset, s,
                                      seed0=seed0 + j * 1000 + 50000)
-        fit = fit_two_langaus(q, base_threshold, truth=tr, qmax=qmax)
+        fit = fit_shower_plus_induction(q, base_threshold, template, qmax=qmax)
         fits.append((s, fit, q, tr))
         out["knob"].append(s)
-        if fit and fit.get("ok"):
-            for k in ("mpv_ind", "mpv_ind_err", "mpv_shw", "mpv_shw_err",
-                      "frac_ind", "chi2ndf", "n_single",
-                      "peak_mpv", "peak_height", "tail_height"):
-                out[k].append(fit[k])
-            out["rate"].append(fit["n_single"] / max(n_events, 1))
-        else:
-            for k in ("mpv_ind", "mpv_ind_err", "mpv_shw", "mpv_shw_err",
-                      "frac_ind", "chi2ndf", "n_single", "rate",
-                      "peak_mpv", "peak_height", "tail_height"):
-                out[k].append(np.nan)
+        _record_fit(out, fit, n_events)
     set_induction(ctx, 1.0)
     return {k: np.asarray(v, float) for k, v in out.items()}, fits
 
@@ -1024,41 +1300,85 @@ def main():
                                          n_dep=args.n_dep)
                       for _ in range(args.n_events)]
 
-    # --- nominal-induction pre-signals (cached, reused by threshold + reset scans)
-    print("Computing nominal-induction pre-FEE signals (cached)...")
-    set_induction(ctx, 1.0)
-    set_periodic_reset(ctx, base_reset)
-    evs = []
-    for i, raw in enumerate(raw_events):
-        ev = event_presignals(ctx, raw, seed=args.seed + 100 + i,
-                              collect_frac=args.collect_frac)
-        if ev is not None:
-            evs.append(ev)
-    n_eff = len(evs)
+    ts = ctx.detector.TIME_SAMPLING
+
+    # --- drift + pixel geometry, computed ONCE per event. Induction-scale-independent,
+    #     so it is reused for the nominal pass, the induction-off template pass, and
+    #     every induction-scan scale (this is the induction-scan timeout fix).
+    print("Computing drift + pixel geometry (cached, once)...")
+    drift_cache = []
+    for raw in raw_events:
+        dc = event_drift(ctx, raw)
+        if dc is not None:
+            drift_cache.append(dc)
+    n_eff = len(drift_cache)
     print(f"  {n_eff}/{args.n_events} events produced collectable charge")
     if n_eff == 0:
         sys.exit("No events produced any pixels -- check shower placement / config.")
 
-    # --- headline: nominal spectrum + fit. A common charge range (q99.7 of the
-    #     nominal data) is used for every fit & plot so the test cases share axes.
-    print("\n=== Nominal single-hit spectrum + two-langaus fit ===")
+    # --- nominal-induction pre-signals (reused by the threshold + reset scans)
+    print("Inducing nominal-induction pre-FEE signals (cached)...")
+    set_induction(ctx, 1.0)
+    set_periodic_reset(ctx, base_reset)
+    evs = [event_induce(ctx, d[0], d[1], d[2], seed=args.seed + 100 + i,
+                        collect_frac=args.collect_frac) for i, d in enumerate(drift_cache)]
+    evs = [e for e in evs if e is not None]
+
+    # --- nominal spectrum -> the common charge range (qmax) shared by every fit/plot.
+    #     Bin/fit out to the actual high-Q extent (capped at the 50k display edge) so the
+    #     spectrum isn't truncated -- the natural fall-off is the single-hit ceiling.
+    print("\n=== Nominal single-hit spectrum ===")
     q0, tr0 = aggregate_singlehits(ctx, evs, base_thr, base_reset, 1.0, seed0=args.seed + 1)
-    # Bin/fit out to the actual high-Q extent (capped at the 50k display edge) so the
-    # spectrum isn't truncated -- the natural fall-off is the single-hit ceiling
-    # (high-charge pads fire repeatedly -> multi-hit -> removed), not a binning cut.
     qmax = float(min(np.max(q0[q0 > 0]), 50000.0)) if np.any(q0 > 0) else 30000.0
     xlim = (0.0, 50.0)
     mpv_ylim = (0.0, 50.0)
-    fit0 = fit_two_langaus(q0, base_thr, truth=tr0, qmax=qmax)
+
+    # --- induction-OFF pre-signals: a PURE-shower single-hit sample for the templates.
+    print("Inducing induction-OFF pre-FEE signals (pure shower, for templates)...")
+    set_induction(ctx, 0.0)
+    evs_off = [event_induce(ctx, d[0], d[1], d[2], seed=args.seed + 200 + i,
+                            collect_frac=args.collect_frac) for i, d in enumerate(drift_cache)]
+    evs_off = [e for e in evs_off if e is not None]
+
+    # --- shower-template library over the FULL (threshold x reset) grid + closed forms
+    print("\n=== Shower-template grid (induction-off) + closed-form parametrization ===")
+    thr_grid = sorted(set(float(t) for t in args.thresholds) | {base_thr})
+    rst_grid = sorted(set(int(r) for r in args.resets) | {int(base_reset)})
+    grid, node_fits = build_template_grid(ctx, evs_off, thr_grid, rst_grid, ts, qmax,
+                                          seed0=args.seed + 6000)
+    tparam = TemplateParam(grid, ts)
+    for k in ("mpv_L", "A_L", "eta_L", "sg_L"):
+        f = tparam.forms.get(k)
+        if f:
+            print(f"  {k:>6}: R2={f['r2']:.3f}  best closed form  {f['name']}")
+    plot_shower_templates(node_fits, thr_grid, int(base_reset), args.outdir)
+    plot_template_params(grid, tparam, ts, args.outdir)
+
+    # restore the nominal operating point for the induction-ON passes
+    set_induction(ctx, 1.0)
+    set_periodic_reset(ctx, base_reset)
+
+    def template_fn(thr, cycles):
+        """Frozen shower template at (thr, reset cycles): the exact induction-off grid
+        node when available (all scan points sit on the grid), else the parametrized
+        closed-form / interpolated template for off-grid points."""
+        t = node_fits.get((float(thr), int(cycles)))
+        if t is not None and t.get("ok"):
+            return t
+        return tparam.template_at(thr, cycles)
+
+    # --- headline: nominal composite fit (frozen shower langaus + Gaussian + induction)
+    print("\n=== Nominal composite template fit ===")
+    fit0 = fit_shower_plus_induction(q0, base_thr, template_fn(base_thr, base_reset), qmax=qmax)
     if fit0 and fit0.get("ok"):
         coll0 = np.asarray(tr0, bool)
-        print(f"  single-hit pixels: {fit0['n_single']}  "
-              f"Ind.MPV={fit0['mpv_ind']:.0f} e-  Shower.MPV={fit0['mpv_shw']:.0f} e-  "
+        print(f"  single-hit pixels: {fit0['n_single']}  Ind.MPV={fit0['mpv_ind']:.0f} e-  "
+              f"Shower.MPV_L={fit0['mpv_shw']:.0f} e-  mu_G={fit0['mu_G']:.0f} e-  "
               f"f_ind={fit0['frac_ind']:.2f}  chi2/ndf={fit0['chi2ndf']:.2f}")
         lo_med = float(np.median(q0[~coll0])) if np.any(~coll0) else np.nan
         hi_med = float(np.median(q0[coll0])) if np.any(coll0) else np.nan
-        print(f"  backtrack medians (seed check): induction={lo_med:.0f} e-  "
-              f"shower={hi_med:.0f} e-  (N_ind={int((~coll0).sum())}, N_shw={int(coll0.sum())})")
+        print(f"  backtrack medians: induction={lo_med:.0f} e-  shower={hi_med:.0f} e-  "
+              f"(N_ind={int((~coll0).sum())}, N_shw={int(coll0.sum())})")
         plot_headline(ctx, q0, tr0, fit0, args.outdir, xlim=xlim, thr_sigma=thr_sigma)
     else:
         print("  !! nominal fit failed:", fit0.get("reason") if fit0 else "no data")
@@ -1067,12 +1387,13 @@ def main():
         """[(disp_value, fit, q, truth), ...] for the per-test-case distribution grid."""
         return [(d, f, q, tr) for d, (val, f, q, tr) in zip(disp, fits)]
 
-    # --- threshold scan (cheap: FEE-only on cached signals)
+    # --- threshold scan (cheap: FEE-only on cached nominal signals)
     print("\n=== Threshold scan ===")
     thr_disp = np.asarray(args.thresholds, float) / 1e3
     thr_scan, thr_fits = run_fixed_induction_scan(
         ctx, evs, "threshold", args.thresholds, base_thr, base_reset, n_eff,
-        seed0=args.seed + 2000, set_fn=lambda v: (float(v), base_reset), qmax=qmax)
+        seed0=args.seed + 2000, set_fn=lambda v: (float(v), base_reset),
+        template_fn=template_fn, qmax=qmax)
     plot_scan(ctx, thr_scan, r"Pixel charge threshold $Q_{\mathrm{thr}}$  ($10^{3}\,e^{-}$)",
               "ti_scan_threshold.png", args.outdir, knob_vals_disp=thr_disp, mpv_ylim=mpv_ylim)
     plot_scan_distributions(dist_panels(thr_fits, thr_disp),
@@ -1082,13 +1403,13 @@ def main():
 
     # --- periodic-reset scan (recompile per value; FEE-only on cached signals)
     print("\n=== Periodic-reset scan ===")
-    ts = ctx.detector.TIME_SAMPLING
     rst_scan, rst_fits = run_fixed_induction_scan(
         ctx, evs, "reset", args.resets, base_thr, base_reset, n_eff,
-        seed0=args.seed + 3000, set_fn=lambda v: (base_thr, int(v)), qmax=qmax)
-    set_periodic_reset(ctx, base_reset)  # restore nominal (off)
+        seed0=args.seed + 3000, set_fn=lambda v: (base_thr, int(v)),
+        template_fn=template_fn, qmax=qmax)
+    set_periodic_reset(ctx, base_reset)  # restore nominal
     # x-axis = reset RATE (1/period); "off" maps naturally to 0 (no resets)
-    reset_rate = np.array([1.0e3 / (v * ts) if v > 0 else 0.0 for v in args.resets])
+    reset_rate = reset_rate_khz(np.asarray(args.resets, int), ts)
     plot_scan(ctx, rst_scan, r"Periodic-reset rate  (kHz)",
               "ti_scan_periodic_reset.png", args.outdir, knob_vals_disp=reset_rate)
     plot_scan_distributions(dist_panels(rst_fits, reset_rate),
@@ -1096,11 +1417,12 @@ def main():
                             lambda d: ("reset off" if d == 0 else r"%.0f kHz" % d), r"kHz",
                             "ti_dist_periodic_reset.png", args.outdir, xlim=xlim, thr_sigma=thr_sigma)
 
-    # --- induction scan (expensive: re-induce per scale)
+    # --- induction scan (re-induce per scale on the drift cache; reuse off-cache at 0)
     print("\n=== Induction-response scan ===")
-    ind_scan, ind_fits = run_induction_scan(ctx, raw_events, args.inductions, base_thr,
-                                            base_reset, n_eff, seed0=args.seed + 4000,
-                                            qmax=qmax, collect_frac=args.collect_frac)
+    ind_scan, ind_fits = run_induction_scan(
+        ctx, drift_cache, args.inductions, base_thr, base_reset, n_eff,
+        seed0=args.seed + 4000, template_fn=template_fn, evs_off=evs_off,
+        qmax=qmax, collect_frac=args.collect_frac)
     ind_disp = np.asarray(args.inductions, float)
     plot_scan(ctx, ind_scan, r"Neighbour-pad induction-response scale",
               "ti_scan_induction.png", args.outdir, knob_vals_disp=ind_disp)
@@ -1124,8 +1446,11 @@ def main():
         print(f"  {kn:>13} " + "  ".join(f"{v:13.2f}" if np.isfinite(v) else f"{'--':>13}"
                                          for v in row))
 
-    # --- save everything
+    # --- save everything (incl. the template grid + closed-form coefficients)
     det_name, det_geom, det_path = vd.detector_identity(ctx)
+    closed_form = {k: dict(name=tparam.forms[k]["name"], r2=tparam.forms[k]["r2"],
+                           params=tparam.forms[k]["params"])
+                   for k in tparam.PARAMS if tparam.forms.get(k)}
     np.savez(f"{args.outdir}/threshold_induction_results.npz",
              detector_name=np.array(det_name), detector_path=np.array(det_path),
              base_threshold=base_thr, base_reset=base_reset,
@@ -1133,6 +1458,12 @@ def main():
              **{f"thr_{k}": v for k, v in thr_scan.items()},
              **{f"rst_{k}": v for k, v in rst_scan.items()},
              **{f"ind_{k}": v for k, v in ind_scan.items()},
+             template_thresholds=np.asarray(thr_grid, float),
+             template_resets=np.asarray(rst_grid, int),
+             template_rates=reset_rate_khz(np.asarray(rst_grid, int), ts),
+             **{f"template_{k}": grid[k] for k in
+                ("mpv_L", "eta_L", "sg_L", "A_L", "mu_G", "sig_G", "chi2ndf")},
+             template_closed_form=np.array(repr(closed_form)),
              sensitivity=np.array(matrix, float),
              sensitivity_knobs=np.array(knobs),
              sensitivity_observables=np.array(obs_lbl))
