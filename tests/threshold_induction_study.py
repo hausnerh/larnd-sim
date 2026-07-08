@@ -21,17 +21,19 @@ THE IDEA
        threshold before its negative lobe could cancel it. It records only that
        small transient: a LOW-Q peak, piled just above threshold.
 
-  The two populations OVERLAP near threshold, so a free two-langaus fit mis-assigns
-  them. Instead we TEMPLATE the shower: with induction turned OFF (neighbour-pad
-  response scaled to 0) the single-hit sample is PURE shower, so we fit that clean
-  spectrum with a near-threshold langaus + a higher-Q Gaussian and FREEZE the langaus
-  (the near-threshold shower is peripheral -> its weak neighbours induce little on it,
-  so it is induction-immune). We build this frozen langaus over the full (threshold x
-  reset) grid and look for a CLOSED-FORM law for its parameters. The induction-ON fit
-  is then: frozen shower langaus + a floating Gaussian (the core-adjacent bump, which
-  IS induction-shadowed) + a floating induction langau -- so the turn-on excess is
-  cleanly attributed to induction. The per-pixel TRUTH label is a backtrack (did
-  drifting charge land on the pad?) used only to colour the histograms. We ask:
+  The two populations OVERLAP near threshold, so a free two-peak fit mis-assigns them.
+  Instead we TEMPLATE the shower: with induction turned OFF (neighbour-pad response
+  scaled to 0) the single-hit sample is PURE shower, so we fit that clean spectrum with
+  a near-threshold bare LANDAU + a higher-Q Gaussian and FREEZE the Landau -- shape and
+  crucially AMPLITUDE (the near-threshold shower is peripheral -> its weak neighbours
+  induce little on it, so it is induction-immune). A single Landau (not a Landau*Gauss)
+  keeps that amplitude well determined: the noise smear is sub-bin, so an extra Gaussian
+  width would only add a degeneracy. We build the frozen Landau over the full (threshold
+  x reset) grid and look for a CLOSED-FORM law for its parameters. The induction-ON fit
+  is then: frozen shower Landau + a floating Gaussian (the core-adjacent bump, which IS
+  induction-shadowed) + a floating induction Landau -- so the turn-on excess is cleanly
+  attributed to induction. The per-pixel TRUTH label is a backtrack (did drifting charge
+  land on the pad?) used only to colour the histograms. We ask:
 
     * Do threshold / periodic-reset / induction-response each move the extracted
       observables in CLEAR, MEASURABLE, and DISENTANGLED ways?
@@ -384,8 +386,13 @@ class Langaus:
     def comp(self, x, mpv, eta, sigma_g, area):
         return area * self.density(x, mpv, eta, sigma_g)
 
-    def two(self, x, m1, e1, s1, A1, m2, e2, s2, A2):
-        return (self.comp(x, m1, e1, s1, A1) + self.comp(x, m2, e2, s2, A2))
+    def landau(self, x, mpv, eta, area):
+        """Bare Landau (Moyal), NO Gaussian convolution. Used for the near-threshold
+        peaks: the electronics-noise smear (sigma ~ 500-650 e-) is below the LSB-scale
+        bin width here, so the Gaussian width is unresolvable and only adds an eta<->sigma
+        degeneracy that destabilises the peak AMPLITUDE -- the quantity the induction
+        extraction depends on most. One width (eta) => a well-determined area."""
+        return area * self.density(x, mpv, eta, 0.0)
 
 
 def _adc_lsb(q):
@@ -437,7 +444,8 @@ def _gaussian(x, mu, sig, area):
 
 
 def _guess_shower(centres, counts, threshold_e):
-    """Seed (mpv,eta,sg,A_L, mu,sig,A_G) for the induction-off shower model."""
+    """Seed (mpv,eta,A_L, mu,sig,A_G) for the induction-off shower model
+    (bare Landau near threshold + Gaussian bump)."""
     w = centres[1] - centres[0]
     T = threshold_e
     total = float(counts.sum() * w)
@@ -450,31 +458,36 @@ def _guess_shower(centres, counts, threshold_e):
         aG = float(counts[hi].sum() * w)
     else:
         mu, sig, aG = 2.5 * mpv, mpv, 0.3 * total
-    return [mpv, 0.15 * T, 0.12 * T, 0.6 * total, mu, sig, aG]
+    return [mpv, 0.15 * T, 0.6 * total, mu, sig, aG]
 
 
 def fit_shower_template(q_shower, threshold_e, qmax=None):
-    """Fit the induction-OFF shower single-hit spectrum with langaus + Gaussian and
-    return the FROZEN langaus part as a reusable template.
+    """Fit the induction-OFF shower single-hit spectrum with a bare LANDAU (near-threshold
+    peak) + a Gaussian (high-Q bump) and return the FROZEN Landau as a reusable template.
 
-    The near-threshold langaus is the induction-immune shape (peripheral collection
-    pads whose weak neighbours induce little on them); it is what we reuse in the
-    induction-ON composite fit. The Gaussian (higher-Q, core-adjacent, and therefore
-    induction-shadowed) is fitted here only to soak up the upper shoulder so the
-    langaus lands correctly -- it is NOT reused (it floats in the composite fit).
-    Returns a 'template' dict with the langaus params + fit arrays for diagnostics."""
+    The near-threshold Landau is the induction-immune shape (peripheral collection pads
+    whose weak neighbours induce little on them); it is what we reuse in the induction-ON
+    composite fit, and its AMPLITUDE is the number the induction extraction hinges on. We
+    use a single Landau (no Gaussian convolution) precisely so that amplitude is well
+    determined: the electronics-noise smear is sub-bin here, so a convolved langaus only
+    adds an eta<->sigma degeneracy that makes the area scatter. The Gaussian (higher-Q,
+    core-adjacent, induction-shadowed) soaks up the upper shoulder so the Landau lands
+    correctly -- it is NOT reused (it floats in the composite fit). Returns a 'template'
+    dict with the Landau params + fit arrays for diagnostics."""
     from scipy.optimize import curve_fit
     h = _hist(q_shower, threshold_e, qmax=qmax)
     if h is None:
         return dict(ok=False, reason="too few shower hits", threshold_e=threshold_e)
     centres, counts, width, edges = h
     lg = Langaus(centres[0], centres[-1])
-    def model(x, mpv, eta, sg, aL, mu, sig, aG):
-        return lg.comp(x, mpv, eta, sg, aL) + _gaussian(x, mu, sig, aG)
+    def model(x, mpv, eta, aL, mu, sig, aG):
+        return lg.landau(x, mpv, eta, aL) + _gaussian(x, mu, sig, aG)
     T, span, cmax = threshold_e, centres[-1] - centres[0], centres[-1]
     p0 = _guess_shower(centres, counts, threshold_e)
-    lb = [0.85 * T, 0.02 * T, 0.02 * T, 0.0,    T,    0.02 * T, 0.0]
-    ub = [3.0 * T,  0.90 * T, 0.90 * T, np.inf, cmax, span,     np.inf]
+    # One width (eta) for the Landau -> well-conditioned amplitude. Keep the Gaussian
+    # centred clearly above the Landau peak so it soaks up the bump, not the turn-on.
+    lb = [0.85 * T, 0.02 * T, 0.0,    1.6 * T, 0.05 * T, 0.0]
+    ub = [3.0 * T,  0.60 * T, np.inf, cmax,    span,     np.inf]
     p0 = [min(max(v, lb[i] + 1e-9), ub[i] - 1e-9) for i, v in enumerate(p0)]
     sigma = np.sqrt(counts) + 1.0
     try:
@@ -483,12 +496,12 @@ def fit_shower_template(q_shower, threshold_e, qmax=None):
     except Exception as exc:
         return dict(ok=False, reason=str(exc), threshold_e=threshold_e,
                     centres=centres, counts=counts, width=width, edges=edges)
-    mpv, eta, sg, aL, mu, sig, aG = popt
+    mpv, eta, aL, mu, sig, aG = popt
     pred = model(centres, *popt)
     ndf = max(len(centres) - len(popt), 1)
     chi2 = float(np.sum(((counts - pred) / sigma) ** 2))
     return dict(ok=True, threshold_e=float(threshold_e),
-                mpv_L=float(mpv), eta_L=float(eta), sg_L=float(sg), A_L=float(aL),
+                mpv_L=float(mpv), eta_L=float(eta), A_L=float(aL),
                 mu_G=float(mu), sig_G=float(sig), A_G=float(aG),
                 popt=popt, model=model, lg=lg, centres=centres, counts=counts,
                 width=width, edges=edges, pred=pred, chi2=chi2, ndf=ndf,
@@ -496,14 +509,14 @@ def fit_shower_template(q_shower, threshold_e, qmax=None):
 
 
 def fit_shower_plus_induction(q, threshold_e, template, qmax=None):
-    """Composite induction-ON fit: FROZEN shower langaus (from `template`) + a floating
-    Gaussian (induction-shadowed high-Q shower bump) + a floating induction langau.
+    """Composite induction-ON fit: FROZEN shower Landau (from `template`) + a floating
+    Gaussian (induction-shadowed high-Q shower bump) + a floating induction Landau.
 
-    Freezing the shower langaus removes the near-threshold degeneracy that makes a free
-    two-langaus fit mis-assign the overlapping populations: the shower contribution at
-    the turn-on is pinned by the induction-off template, so the residual excess right
-    above threshold is cleanly attributed to induction. Free params
-    [mu, sig, A_G, mpv_i, eta_i, sg_i, A_i]. Returns a `kind='template'` fit dict."""
+    Freezing the shower Landau -- crucially its AMPLITUDE -- removes the near-threshold
+    degeneracy that makes a free two-peak fit mis-assign the overlapping populations: the
+    shower contribution at the turn-on is pinned by the induction-off template, so the
+    residual excess right above threshold is cleanly attributed to induction. Free params
+    [mu, sig, A_G, mpv_i, eta_i, A_i]. Returns a `kind='template'` fit dict."""
     from scipy.optimize import curve_fit
     h = _hist(q, threshold_e, qmax=qmax)
     if h is None:
@@ -513,19 +526,21 @@ def fit_shower_plus_induction(q, threshold_e, template, qmax=None):
         return dict(ok=False, reason="no shower template", centres=centres, counts=counts,
                     width=width, edges=edges, threshold_e=threshold_e)
     lg = Langaus(centres[0], centres[-1])
-    mpv_L, eta_L, sg_L, A_L = (template["mpv_L"], template["eta_L"],
-                               template["sg_L"], template["A_L"])
-    frozen_c = lg.comp(centres, mpv_L, eta_L, sg_L, A_L)   # frozen shower langaus on the bins
+    mpv_L, eta_L, A_L = template["mpv_L"], template["eta_L"], template["A_L"]
+    frozen_c = lg.landau(centres, mpv_L, eta_L, A_L)   # frozen shower Landau on the bins
     T, span, cmax = threshold_e, centres[-1] - centres[0], centres[-1]
 
-    def model(x, mu, sig, aG, mpv_i, eta_i, sg_i, aI):
-        return frozen_c + _gaussian(x, mu, sig, aG) + lg.comp(x, mpv_i, eta_i, sg_i, aI)
+    def model(x, mu, sig, aG, mpv_i, eta_i, aI):
+        return frozen_c + _gaussian(x, mu, sig, aG) + lg.landau(x, mpv_i, eta_i, aI)
 
     total = float(counts.sum() * width)
-    p0 = [min(max(template["mu_G"], 1.5 * T), cmax), max(template["sig_G"], width), 0.4 * total,
-          1.1 * T, 0.15 * T, 0.10 * T, 0.4 * total]
-    lb = [T,    0.02 * T, 0.0,    0.9 * T, 0.02 * T, 0.02 * T, 0.0]
-    ub = [cmax, span,     np.inf, 2.0 * T, 0.80 * T, 0.80 * T, np.inf]
+    p0 = [min(max(template["mu_G"], 1.6 * T), cmax), max(template["sig_G"], width), 0.4 * total,
+          1.1 * T, 0.15 * T, 0.4 * total]
+    # Keep the induction Landau a NARROW turn-on spike near threshold (eta_i capped) so it
+    # cannot broaden to absorb the frozen shower -- the separation is meant to come from
+    # the shower being fixed, not from the induction component fattening.
+    lb = [1.6 * T, 0.05 * T, 0.0,    0.9 * T, 0.02 * T, 0.0]
+    ub = [cmax,    span,     np.inf, 2.0 * T, 0.30 * T, np.inf]
     p0 = [min(max(v, lb[i] + 1e-9), ub[i] - 1e-9) for i, v in enumerate(p0)]
     sigma = np.sqrt(counts) + 1.0
     try:
@@ -534,7 +549,7 @@ def fit_shower_plus_induction(q, threshold_e, template, qmax=None):
     except Exception as exc:
         return dict(ok=False, reason=str(exc), centres=centres, counts=counts,
                     width=width, edges=edges, threshold_e=threshold_e)
-    mu, sig, aG, mpv_i, eta_i, sg_i, aI = popt
+    mu, sig, aG, mpv_i, eta_i, aI = popt
     pred = model(centres, *popt)
     ndf = max(len(centres) - len(popt), 1)
     chi2 = float(np.sum(((counts - pred) / sigma) ** 2))
@@ -545,11 +560,11 @@ def fit_shower_plus_induction(q, threshold_e, template, qmax=None):
     return dict(
         ok=True, kind="template", centres=centres, counts=counts, width=width,
         edges=edges, threshold_e=threshold_e, pred=pred, lg=lg,
-        frozen=(mpv_L, eta_L, sg_L, A_L), popt=popt, perr=perr,
+        frozen=(mpv_L, eta_L, A_L), popt=popt, perr=perr,
         mpv_ind=float(mpv_i), mpv_ind_err=float(perr[3]),
         mpv_shw=float(mpv_L), mpv_shw_err=0.0,        # frozen -> no fit error
         mu_G=float(mu), sig_G=float(sig), A_G=float(aG),
-        eta_ind=float(eta_i), sg_ind=float(sg_i),
+        eta_ind=float(eta_i),
         area_ind=float(aI), area_shw=float(tot_shw), frac_ind=f_ind,
         peak_mpv=peak_mpv, peak_height=peak_height, tail_height=tail_height,
         chi2=chi2, ndf=ndf, chi2ndf=chi2 / ndf, n_single=int(np.sum(counts)))
@@ -654,7 +669,7 @@ def build_template_grid(ctx, evs_off, thresholds, resets, ts, qmax, seed0):
     per-node template dict (the diagnostics + exact on-grid template for the fits)."""
     thr_arr = np.asarray(thresholds, float)
     rst_arr = np.asarray(resets, int)
-    keys = ("mpv_L", "eta_L", "sg_L", "A_L", "mu_G", "sig_G", "chi2ndf")
+    keys = ("mpv_L", "eta_L", "A_L", "mu_G", "sig_G", "chi2ndf")
     grid = {k: np.full((len(rst_arr), len(thr_arr)), np.nan) for k in keys}
     node_fits = {}
     for ir, rst in enumerate(rst_arr):                # reset OUTER -> one recompile per rate
@@ -733,9 +748,9 @@ class TemplateParam:
     2-D grid. For each parameter the best closed form is kept; `value()` uses it when its
     R^2 clears `r2_min`, else bilinearly interpolates the grid. `template_at()` returns a
     synthesized template dict for the composite fit at any (on- or off-grid) point."""
-    PARAMS = ("mpv_L", "eta_L", "sg_L", "A_L", "mu_G", "sig_G")
+    PARAMS = ("mpv_L", "eta_L", "A_L", "mu_G", "sig_G")
 
-    def __init__(self, grid, ts, r2_min=0.9):
+    def __init__(self, grid, ts, r2_min=0.9, chi2_cut=3.0):
         self.ts, self.r2_min = ts, r2_min
         self.thr = np.asarray(grid["thresholds"], float)
         rates = np.asarray(grid["rates"], float)
@@ -744,8 +759,15 @@ class TemplateParam:
         self.grid = {k: np.asarray(grid[k], float)[order] for k in self.PARAMS}
         self.x = self.thr / 1e3
         xx, rr = np.meshgrid(self.x, self.rates)      # (n_rate, n_thr), aligns with grid[k]
-        self.forms = {k: _fit_closed_form(xx.ravel(), rr.ravel(), self.grid[k].ravel())
-                      for k in self.PARAMS}
+        # Drop nodes whose template fit was poor (chi2/ndf > chi2_cut) before fitting the
+        # closed form -- a single bad node otherwise drags a clean law's R^2 right down.
+        chi2 = np.asarray(grid.get("chi2ndf", np.zeros_like(self.grid["mpv_L"])), float)[order]
+        node_ok = np.isfinite(chi2) & (chi2 <= chi2_cut)
+        self.forms = {}
+        for k in self.PARAMS:
+            yv = self.grid[k].ravel()
+            m = node_ok.ravel() & np.isfinite(yv)
+            self.forms[k] = _fit_closed_form(xx.ravel()[m], rr.ravel()[m], yv[m])
 
     def _interp(self, key, thr, rate):
         """Bilinear interp of grid[key] over (rate, threshold), clamped at the edges."""
@@ -827,10 +849,10 @@ def _draw_charge_dist(ax, q, truth, fit, threshold_e, xlim=None,
     if fit.get("ok") and fit.get("kind") == "template":
         xs = np.linspace(fit["edges"][0], fit["edges"][-1], 700)
         lg = fit["lg"]
-        mpv_L, eta_L, sg_L, A_L = fit["frozen"]
-        mu, sig, aG, mpv_i, eta_i, sg_i, aI = fit["popt"]
-        shower = lg.comp(xs, mpv_L, eta_L, sg_L, A_L) + _gaussian(xs, mu, sig, aG)
-        induction = lg.comp(xs, mpv_i, eta_i, sg_i, aI)
+        mpv_L, eta_L, A_L = fit["frozen"]
+        mu, sig, aG, mpv_i, eta_i, aI = fit["popt"]
+        shower = lg.landau(xs, mpv_L, eta_L, A_L) + _gaussian(xs, mu, sig, aG)
+        induction = lg.landau(xs, mpv_i, eta_i, aI)
         lw = 1.2 if compact else 1.6
         ax.plot(xs / 1e3, induction, color=_C_IND, ls="--", lw=lw)
         ax.plot(xs / 1e3, shower, color=_C_SHW, ls="--", lw=lw)
@@ -1018,11 +1040,11 @@ def plot_shower_templates(node_fits, thresholds, base_reset, outdir):
                     color=_C_SHW, alpha=0.5, edgecolor="white", linewidth=0.2,
                     label="Induction-off shower")
             xs = np.linspace(edges[0], edges[-1], 700)
-            mpv, eta, sg, aL, mu, sig, aG = f["popt"]
-            ax.plot(xs / 1e3, f["lg"].comp(xs, mpv, eta, sg, aL), color=_C_SHW, ls="--", lw=1.2)
+            mpv, eta, aL, mu, sig, aG = f["popt"]
+            ax.plot(xs / 1e3, f["lg"].landau(xs, mpv, eta, aL), color=_C_SHW, ls="--", lw=1.2)
             ax.plot(xs / 1e3, _gaussian(xs, mu, sig, aG), color=_C_GRN, ls="--", lw=1.2)
             ax.plot(xs / 1e3, f["model"](xs, *f["popt"]), color=_C_SUM, ls="-", lw=1.6,
-                    label="langaus + Gaussian")
+                    label="Landau + Gaussian")
             ax.axvline(thr / 1e3, color="0.3", ls=":", lw=1.0)
             ax.text(0.95, 0.93, "\n".join((
                 r"$Q_{\mathrm{thr}}=%.1f$" % (thr / 1e3),
@@ -1045,24 +1067,25 @@ def plot_shower_templates(node_fits, thresholds, base_reset, outdir):
                 axes[r, 0].set_ylabel("Single-hit pixels")
         h, l = axes.flat[0].get_legend_handles_labels()
         fig.legend(h, l, loc="upper center", ncol=3, fontsize=9.5, bbox_to_anchor=(0.5, 1.02))
-        fig.suptitle(r"Induction-off shower template (langaus + Gaussian) vs threshold",
+        fig.suptitle(r"Induction-off shower template (Landau + Gaussian) vs threshold",
                      y=1.06, fontsize=12)
         fig.tight_layout()
         _savefig(fig, f"{outdir}/ti_shower_template{suf}.png")
 
 
 def plot_template_params(grid, tparam, ts, outdir):
-    """Diagnostic + deliverable: each frozen-langaus parameter vs threshold, one series
+    """Diagnostic + deliverable: each frozen-Landau parameter vs threshold, one series
     per reset rate, with the best closed-form fit overlaid (lines) and its formula + R^2
-    annotated. Answers 'is there a closed form for the langaus in (threshold, reset)?'
-    In the annotated formulae, f is the reset rate (kHz) and Q_thr is in 10^3 e-."""
+    annotated. Answers 'is there a closed form for the Landau in (threshold, reset)?'
+    In the annotated formulae, f is the reset rate (kHz) and Q_thr is in 10^3 e-.
+    A_L (top-right) is the amplitude the induction extraction hinges on."""
     import matplotlib.pyplot as plt
     thr = np.asarray(grid["thresholds"], float)
     rates = reset_rate_khz(np.asarray(grid["resets"], int), ts)
     params = [("mpv_L", r"$\mathrm{MPV}_L$ ($10^{3}e^{-}$)", 1e3),
               ("A_L", r"$A_L$ (a.u.)", 1.0),
               ("eta_L", r"$\eta_L$ ($10^{3}e^{-}$)", 1e3),
-              ("sg_L", r"$\sigma_L$ ($10^{3}e^{-}$)", 1e3)]
+              ("mu_G", r"$\mu_G$ ($10^{3}e^{-}$)", 1e3)]
     cmap = plt.get_cmap("viridis")
     order = np.argsort(rates)
     fig, axes = plt.subplots(2, 2, figsize=(11, 8))
@@ -1084,7 +1107,7 @@ def plot_template_params(grid, tparam, ts, outdir):
                     transform=ax.transAxes, ha="left", va="top", fontsize=8.5,
                     bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="0.7", lw=0.6))
     axes.flat[0].legend(title="reset rate", fontsize=8, ncol=2, loc="upper right")
-    fig.suptitle("Frozen shower-langaus parameters vs threshold and reset "
+    fig.suptitle("Frozen shower-Landau parameters vs threshold and reset "
                  "(points) with closed-form fits (lines)", y=1.0, fontsize=12)
     fig.tight_layout()
     _savefig(fig, f"{outdir}/ti_template_params.png")
@@ -1217,6 +1240,11 @@ def parse_args():
                     help="PERIODIC_RESET_CYCLES (-1 = off)")
     ap.add_argument("--inductions", type=float, nargs="+",
                     default=[0.0, 0.5, 1.0, 1.5, 2.0, 3.0], help="response scale")
+    ap.add_argument("--induction-events", type=int, default=60,
+                    help="events for the EXPENSIVE induction scan (it re-runs the pre-FEE "
+                         "induction stage per scale). Subsamples the first N of --n-events "
+                         "to avoid wall-time timeouts; the cheap threshold/reset/template "
+                         "scans still use all --n-events. 0 = use all.")
     ap.add_argument("--seed", type=int, default=12345)
     ap.add_argument("--truth-cut", type=float, default=None,
                     help="(deprecated; ignored -- truth is now a collection backtrack)")
@@ -1347,7 +1375,7 @@ def main():
     grid, node_fits = build_template_grid(ctx, evs_off, thr_grid, rst_grid, ts, qmax,
                                           seed0=args.seed + 6000)
     tparam = TemplateParam(grid, ts)
-    for k in ("mpv_L", "A_L", "eta_L", "sg_L"):
+    for k in ("mpv_L", "A_L", "eta_L", "mu_G"):
         f = tparam.forms.get(k)
         if f:
             print(f"  {k:>6}: R2={f['r2']:.3f}  best closed form  {f['name']}")
@@ -1417,11 +1445,14 @@ def main():
                             lambda d: ("reset off" if d == 0 else r"%.0f kHz" % d), r"kHz",
                             "ti_dist_periodic_reset.png", args.outdir, xlim=xlim, thr_sigma=thr_sigma)
 
-    # --- induction scan (re-induce per scale on the drift cache; reuse off-cache at 0)
-    print("\n=== Induction-response scan ===")
+    # --- induction scan (re-induce per scale on the drift cache; reuse off-cache at 0).
+    #     Subsampled to --induction-events: this scan is the only one that re-runs the
+    #     expensive pre-FEE induction per point, so it is the wall-time bottleneck.
+    ind_n = min(args.induction_events, n_eff) if args.induction_events else n_eff
+    print(f"\n=== Induction-response scan ({ind_n} of {n_eff} events) ===")
     ind_scan, ind_fits = run_induction_scan(
-        ctx, drift_cache, args.inductions, base_thr, base_reset, n_eff,
-        seed0=args.seed + 4000, template_fn=template_fn, evs_off=evs_off,
+        ctx, drift_cache[:ind_n], args.inductions, base_thr, base_reset, ind_n,
+        seed0=args.seed + 4000, template_fn=template_fn, evs_off=evs_off[:ind_n],
         qmax=qmax, collect_frac=args.collect_frac)
     ind_disp = np.asarray(args.inductions, float)
     plot_scan(ctx, ind_scan, r"Neighbour-pad induction-response scale",
@@ -1462,7 +1493,7 @@ def main():
              template_resets=np.asarray(rst_grid, int),
              template_rates=reset_rate_khz(np.asarray(rst_grid, int), ts),
              **{f"template_{k}": grid[k] for k in
-                ("mpv_L", "eta_L", "sg_L", "A_L", "mu_G", "sig_G", "chi2ndf")},
+                ("mpv_L", "eta_L", "A_L", "mu_G", "sig_G", "chi2ndf")},
              template_closed_form=np.array(repr(closed_form)),
              sensitivity=np.array(matrix, float),
              sensitivity_knobs=np.array(knobs),
