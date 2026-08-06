@@ -170,6 +170,52 @@ def build_shower_event(ctx, rng, plane=0, energy_mev=300.0, n_dep=400,
     return tracks
 
 
+def build_muon_event(ctx, rng, plane=0, theta_deg=45.0, length_cm=20.0,
+                     dedx=2.1, step_cm=0.3):
+    """A straight MIP muon track, parametrised by its angle to the PIXEL PLANE.
+
+    theta_deg is the angle between the track and the pixel (anode) plane:
+      * 0   -> track lies IN the plane at fixed drift depth: charge along the whole track
+               arrives at ~the same time (ISOCHRONOUS). Lights up a clean line of collection
+               pixels, each a temporally concentrated deposit (small sig_t_coll).
+      * 90  -> track runs ALONG the drift axis at fixed (x,y): a single pixel column collects
+               charge deposited at every drift depth, so it arrives spread over the drift time
+               (large sig_t_coll); that column is multi-hit, and the single-hit sample is the
+               transverse-neighbour induction.
+      * 45  -> tilted: each pixel sees charge over a time window set by the tilt.
+    The transverse position, depth and azimuth are randomised per event so different pixels
+    are sampled while the topology (angle) is held fixed. MIP dE/dx ~ 2.1 MeV/cm."""
+    from math import radians, cos, sin
+    det = ctx.detector
+    x0, x1, y0, y1 = vd.active_volume(det, plane, margin=3.0)
+    dmax = abs(det.DRIFT_LENGTH) - 3.0
+    th = radians(theta_deg)
+    ph = rng.uniform(0.0, 2.0 * np.pi)
+    dvec = np.array([cos(th) * cos(ph), cos(th) * sin(ph), sin(th)])   # (x, y, DEPTH)
+    cx = rng.uniform(x0 + 0.2 * (x1 - x0), x1 - 0.2 * (x1 - x0))
+    cy = rng.uniform(y0 + 0.2 * (y1 - y0), y1 - 0.2 * (y1 - y0))
+    cdepth = rng.uniform(0.3 * dmax, 0.7 * dmax)
+
+    n = max(int(length_cm / step_cm), 2)
+    s = (np.arange(n) - 0.5 * n) * step_cm
+    X, Y, D = cx + s * dvec[0], cy + s * dvec[1], cdepth + s * dvec[2]
+    inb = (X >= x0) & (X <= x1) & (Y >= y0) & (Y <= y1) & (D >= 0.5) & (D <= dmax)
+    X, Y, D = X[inb], Y[inb], D[inb]
+    if X.size < 2:
+        return vd.blank_tracks(0)
+    half = 0.5 * step_cm
+    tracks = vd.blank_tracks(X.size)
+    for i in range(X.size):
+        z0 = vd.depth_to_z(det, float(np.clip(D[i] - half * dvec[2], 0.5, dmax)), plane)
+        z1 = vd.depth_to_z(det, float(np.clip(D[i] + half * dvec[2], 0.5, dmax)), plane)
+        p0 = (X[i] - half * dvec[0], Y[i] - half * dvec[1], z0)
+        p1 = (X[i] + half * dvec[0], Y[i] + half * dvec[1], z1)
+        vd.fill_segment(tracks[i], plane, p0, p1, dedx)
+        tracks[i]["pdg_id"] = 13
+        tracks[i]["segment_id"] = i
+    return tracks
+
+
 # ===========================================================================
 # Induction-response knob -- scale neighbour-pad bins of the response table
 # ===========================================================================
@@ -251,13 +297,55 @@ def collection_pixels_from_signals(signals, neigh, f_collect):
     for that same segment: a footprint/shape criterion that says "charge terminated
     here", independent of any absolute charge cut or the discriminator threshold.
     This is the per-pixel truth used to split single-hit pixels into collection
-    (shower) vs pure-induction hits -- no arbitrary net-charge cut."""
+    (shower) vs pure-induction hits -- no arbitrary net-charge cut.
+
+    NOTE this is a purely SPATIAL test ("did charge ever land here"); it says nothing about
+    what actually made the hit fire, so a pad with sub-threshold real charge that was pushed
+    over by a neighbour's transient is still labelled shower. See collected_charge_truth()
+    for the timing information that makes the label causal.
+
+    Returns (collect_ids, landed, net_sp, neigh_h) so callers can also build the per-pixel
+    COLLECTED-charge truth (amount + arrival time), not just the pixel-id set."""
     import cupy as cp
     net_sp = cp.asnumpy(signals.sum(axis=2))          # (nseg, max_neigh) net per (seg,pad)
     neigh_h = cp.asnumpy(neigh)
     seg_peak = np.maximum(net_sp.max(axis=1), 0.0)    # per-segment peak collected net
     landed = (neigh_h >= 0) & (net_sp > 0) & (net_sp > f_collect * seg_peak[:, None])
-    return np.unique(neigh_h[landed])
+    return np.unique(neigh_h[landed]), landed, net_sp, neigh_h
+
+
+def collected_charge_truth(landed, net_sp, neigh_h, unique_pix, t0_seg):
+    """Per-pixel truth about the REAL charge that landed on it, from the collection
+    (segment, pad) pairs only:
+
+      q_coll   -- total collected charge on the pad (electrons),
+      t_coll   -- charge-weighted ARRIVAL TIME of that charge at the anode (us). After
+                  drift(), `tracks["t0"]` is the segment's arrival time, and
+                  sum_pixel_signals places each segment at t0/TIME_SAMPLING, so this is in
+                  the same global frame as the FEE's `adc_ticks`. NB it carries a constant
+                  offset (the response's internal t0 -> peak-current delay), so use it for
+                  RELATIVE timing (t_hit - t_coll), not as an absolute arrival.
+      sig_t    -- spread of that arrival time: small => one concentrated deposit,
+                  large => charge dribbling in over many segments/depths.
+
+    These are what distinguish "a pad with just enough charge to fire once" from "a pad
+    under a large, temporally concentrated deposit"."""
+    npix = int(np.size(unique_pix))
+    q = np.zeros(npix); m1 = np.zeros(npix); m2 = np.zeros(npix)
+    if landed.any():
+        ids = neigh_h[landed]
+        idx = np.searchsorted(unique_pix, ids)        # unique_pix is sorted (cp.unique)
+        w = net_sp[landed].astype(np.float64)
+        seg = np.nonzero(landed)[0]                   # segment index of each landed pair
+        t = np.asarray(t0_seg, float)[seg]
+        q = np.bincount(idx, weights=w, minlength=npix)
+        m1 = np.bincount(idx, weights=w * t, minlength=npix)
+        m2 = np.bincount(idx, weights=w * t * t, minlength=npix)
+    good = q > 0
+    t_coll = np.full(npix, np.nan); sig_t = np.full(npix, np.nan)
+    t_coll[good] = m1[good] / q[good]
+    sig_t[good] = np.sqrt(np.clip(m2[good] / q[good] - t_coll[good] ** 2, 0.0, None))
+    return q, t_coll, sig_t
 
 
 def event_drift(ctx, tracks):
@@ -285,7 +373,8 @@ def event_induce(ctx, drifted, neigh, radius, seed, collect_frac=0.15):
     `truth_e[ip]` (net integrated charge) is kept only for the diagnostic seed-check.
     """
     signals = vd.induce_current(ctx, drifted, neigh, seed=seed)
-    collect_ids = collection_pixels_from_signals(signals, neigh, collect_frac)
+    collect_ids, landed, net_sp, neigh_h = collection_pixels_from_signals(
+        signals, neigh, collect_frac)
     summed = vd.sum_to_pixels(ctx, signals, neigh, radius, drifted)
     unique_pix, pixels_signals = summed[0], summed[1]
     if pixels_signals is None:
@@ -297,6 +386,10 @@ def event_induce(ctx, drifted, neigh, radius, seed, collect_frac=0.15):
     # pixel rows of pixels_signals align 1:1 with unique_pix, so the backtrack set
     # maps straight onto a per-pixel boolean collection/induction label.
     is_collection = np.isin(uph, collect_ids)
+    # ... and the per-pixel COLLECTED-charge truth (amount + arrival time + spread), which
+    # is what lets us (a) anatomise the two shower peaks and (b) add a causal timing test.
+    q_coll, t_coll, sig_t_coll = collected_charge_truth(
+        landed, net_sp, neigh_h, uph, drifted["t0"])
     # The study uses only the ADC (q_sum), never the per-track backtracking. The
     # backtracking array (pixels_tracks_signals, size nt0*sum(num_backtrack)) is by
     # far the largest per-event object and OOM'd the 200-event cache -- so we DROP
@@ -309,6 +402,9 @@ def event_induce(ctx, drifted, neigh, radius, seed, collect_frac=0.15):
         num_backtrack=np.zeros(npix, dtype=np.int64),
         offset_backtrack=np.zeros(npix, dtype=np.int64),
         is_collection=is_collection,                          # per-pixel truth (backtrack)
+        q_coll=q_coll,                                        # real charge landed on pad (e-)
+        t_coll=t_coll,                                        # its arrival time (us, global frame)
+        sig_t_coll=sig_t_coll,                                # arrival-time spread (us)
         truth_e=ps_host.sum(axis=1, dtype=np.float64) * ts,   # net collected charge (e-)
         max_time=ps_host.shape[1] * ts,
     )
@@ -322,17 +418,25 @@ def event_presignals(ctx, tracks, seed, collect_frac=0.15):
     return event_induce(ctx, d[0], d[1], d[2], seed, collect_frac)
 
 
-def event_fee_singlehits(ctx, ev, threshold_e, seed):
-    """Run only the FEE on a cached pre-signal; return single-hit (Q, truth_e).
+# per-single-hit TRUTH auxiliaries carried alongside (q, is_collection): the hit time, the
+# real charge that landed on the pad and when/how spread-out it arrived. These drive the
+# two-peak anatomy and the causal (timing) shower-vs-induction separation.
+_AUX_KEYS = ("t_hit", "t_coll", "dt", "q_coll", "sig_t_coll")
 
-    A pixel is a SINGLE-HIT pixel iff it produced exactly one ADC sample. Its
-    recorded charge Q is recovered from the ADC the way a data analysis would
-    (vd.adc_to_charge, carrying the ~1-LSB quantization). Returns the measured Q
-    (electrons) and the per-pixel truth collection flag for each single-hit pixel.
-    """
+
+def event_fee_singlehits(ctx, ev, threshold_e, seed):
+    """Run only the FEE on a cached pre-signal; return single-hit (Q, truth, aux).
+
+    A pixel is a SINGLE-HIT pixel iff it produced exactly one ADC sample. Its recorded
+    charge Q is recovered from the ADC the way a data analysis would (vd.adc_to_charge,
+    carrying the ~1-LSB quantization). `truth` is the spatial backtrack flag (did charge
+    land here); `aux` carries the per-hit truth needed for the CAUSAL test -- the hit time
+    t_hit, the charge that landed (q_coll) and when it arrived (t_coll, sig_t_coll) -- so a
+    hit that fired BEFORE its own charge arrived can be recognised as induction-triggered
+    even though real charge sits above the pad."""
     import cupy as cp
     ctx.detector.DISCRIMINATION_THRESHOLD = float(threshold_e)
-    adc, _ticks = vd.run_fee(
+    adc, ticks = vd.run_fee(
         ctx,
         cp.asarray(ev["pixels_signals"]),
         cp.asarray(ev["pixels_tracks_signals"]),
@@ -340,13 +444,22 @@ def event_fee_singlehits(ctx, ev, threshold_e, seed):
         cp.asarray(ev["offset_backtrack"]),
         ev["max_time"], seed=seed)
     adc = np.asarray(adc)                            # (npix, MAX_ADC_VALUES)
+    ticks = np.asarray(ticks)                        # hit time (us), same grid as t_coll
     n_hits = (adc > 0).sum(axis=1)
     sel = n_hits == 1
     if not sel.any():
-        return np.empty(0), np.empty(0, bool)
-    single_adc = adc[sel].max(axis=1)               # the one nonzero sample per row
-    q = vd.adc_to_charge(ctx, single_adc)           # electrons
-    return np.asarray(q, float), ev["is_collection"][sel]
+        return np.empty(0), np.empty(0, bool), {k: np.empty(0) for k in _AUX_KEYS}
+    row = np.argmax(adc[sel], axis=1)                # index of the one nonzero sample
+    single_adc = adc[sel][np.arange(row.size), row]
+    t_hit = ticks[sel][np.arange(row.size), row]     # when that sample was taken (us)
+    q = vd.adc_to_charge(ctx, single_adc)            # electrons
+    t_coll = ev["t_coll"][sel]
+    aux = dict(t_hit=np.asarray(t_hit, float),
+               t_coll=np.asarray(t_coll, float),
+               dt=np.asarray(t_hit, float) - np.asarray(t_coll, float),
+               q_coll=np.asarray(ev["q_coll"][sel], float),
+               sig_t_coll=np.asarray(ev["sig_t_coll"][sel], float))
+    return np.asarray(q, float), ev["is_collection"][sel], aux
 
 
 # ===========================================================================
@@ -500,19 +613,22 @@ def fit_shower_template(q_shower, threshold_e, qmax=None, n_shower=1, noise_e=50
     p0 = [min(max(v, lb[i] + 1e-9), ub[i] - 1e-9) for i, v in enumerate(p0)]
     sigma = (np.sqrt(raw) + 1.0) / max(n_shower, 1)    # per-shower Poisson errors
     try:
-        popt, _ = curve_fit(model, centres, counts, p0=p0, bounds=(lb, ub),
-                            sigma=sigma, absolute_sigma=True, maxfev=20000)
+        popt, pcov = curve_fit(model, centres, counts, p0=p0, bounds=(lb, ub),
+                               sigma=sigma, absolute_sigma=True, maxfev=20000)
     except Exception as exc:
         return dict(ok=False, reason=str(exc), threshold_e=threshold_e,
                     centres=centres, counts=counts, width=width, edges=edges)
     mpv, eta, aL, mu, sig, aG = popt
+    perr = np.sqrt(np.clip(np.diag(pcov), 0, np.inf))  # 1-sigma parameter uncertainties
     pred = model(centres, *popt)
     ndf = max(len(centres) - len(popt), 1)
     chi2 = float(np.sum(((counts - pred) / sigma) ** 2))
     return dict(ok=True, threshold_e=float(threshold_e), noise_e=float(noise_e),
                 mpv_L=float(mpv), eta_L=float(eta), A_L=float(aL),
                 mu_G=float(mu), sig_G=float(sig), A_G=float(aG),
-                popt=popt, model=model, lg=lg, centres=centres, counts=counts,
+                mpv_L_err=float(perr[0]), eta_L_err=float(perr[1]), A_L_err=float(perr[2]),
+                mu_G_err=float(perr[3]), sig_G_err=float(perr[4]),
+                popt=popt, perr=perr, model=model, lg=lg, centres=centres, counts=counts,
                 width=width, edges=edges, pred=pred, chi2=chi2, ndf=ndf,
                 chi2ndf=chi2 / ndf, n_shower=int(n_shower), n_hits=int(raw.sum()))
 
@@ -550,8 +666,10 @@ def fit_shower_plus_induction(q, threshold_e, template, qmax=None, n_shower=1, n
     p0 = [min(max(template["mu_G"], 2.0 * T), cmax), max(template["sig_G"], width), 0.4 * total,
           1.1 * T, 0.15 * T, 0.4 * total]
     # Keep the induction langaus a NARROW turn-on spike near threshold (eta_i capped) so it
-    # cannot broaden to absorb the frozen shower -- the separation is meant to come from
-    # the shower being fixed, not from the induction component fattening.
+    # cannot broaden to absorb the frozen shower -- the separation comes from the shower being
+    # fixed. (Floating the shower amplitude was tried and made it WORSE: the near-threshold
+    # langaus overlap lets the fit pull A_L DOWN to feed the induction component, inflating
+    # f_ind. The induction-off template amplitude is the best available anchor.)
     lb = [2.0 * T, 0.05 * T, 0.0,    0.9 * T, 0.02 * T, 0.0]
     ub = [cmax,    span,     np.inf, 2.0 * T, 0.30 * T, np.inf]
     p0 = [min(max(v, lb[i] + 1e-9), ub[i] - 1e-9) for i, v in enumerate(p0)]
@@ -623,15 +741,92 @@ def aggregate_singlehits(ctx, evs, threshold_e, reset_cycles, induction_scale,
     re-induced pre-signals in `evs` (the pre-FEE current depends on induction).
     """
     set_periodic_reset(ctx, reset_cycles)
-    qs, tr = [], []
+    qs, tr, auxs = [], [], []
     with _silence_device_stdout():
         for i, ev in enumerate(evs):
-            q, t = event_fee_singlehits(ctx, ev, threshold_e, seed=seed0 + i)
+            q, t, a = event_fee_singlehits(ctx, ev, threshold_e, seed=seed0 + i)
             if q.size:
-                qs.append(q); tr.append(t)
+                qs.append(q); tr.append(t); auxs.append(a)
     if not qs:
-        return np.empty(0), np.empty(0, bool)
-    return np.concatenate(qs), np.concatenate(tr)
+        return np.empty(0), np.empty(0, bool), {k: np.empty(0) for k in _AUX_KEYS}
+    aux = {k: np.concatenate([a[k] for a in auxs]) for k in _AUX_KEYS}
+    return np.concatenate(qs), np.concatenate(tr), aux
+
+
+def _pixel_category(n_hits, is_coll, q_coll):
+    if n_hits == 1:
+        return "coll1" if is_coll else "ind1"
+    if n_hits > 1:
+        return "multi"
+    return "charged_nohit" if q_coll > 0 else "quiet"
+
+
+def _crop_downsample(wave, ts, npts=340, pad=20):
+    """Crop a per-tick waveform to its active window (+pad) and downsample to ~npts,
+    returning (t_us, current, cumulative_charge_e). Charge = running integral of current."""
+    w = np.asarray(wave, float)
+    nz = np.nonzero(np.abs(w) > 1e-6)[0]
+    if nz.size:
+        a, b = max(int(nz[0]) - pad, 0), min(int(nz[-1]) + pad, w.size)
+    else:
+        a, b = 0, min(w.size, npts)
+    idx = np.arange(a, b)
+    if idx.size > npts:                                # even stride downsample
+        idx = idx[np.linspace(0, idx.size - 1, npts).round().astype(int)]
+    cur = w[idx]
+    chg = np.cumsum(w[a:b])[idx - a] * ts               # integral over the FULL window
+    return (idx * ts).astype(np.float32), cur.astype(np.float32), chg.astype(np.float32)
+
+
+def capture_waveforms(ctx, evs, threshold_e, reset_cycles, seed0, label,
+                      wf_events, max_pix):
+    """Save per-pixel WAVEFORMS (induced current + running charge vs time) for a few events,
+    for the standalone viewer. Curated across hit categories (single-hit collection, single-hit
+    induction, multi-hit, charged-but-no-hit) so the viewer shows *why* each pixel did or
+    didn't fire, alongside the truth (charge landed, its arrival time) and the recorded hit(s).
+    Returns a list of per-pixel record dicts."""
+    import cupy as cp
+    if wf_events <= 0:
+        return []
+    set_periodic_reset(ctx, reset_cycles)
+    ts = float(ctx.detector.TIME_SAMPLING)
+    quotas = [("coll1", 14), ("ind1", 14), ("multi", 6), ("charged_nohit", 4), ("quiet", 2)]
+    recs = []
+    with _silence_device_stdout():
+        for iev, ev in enumerate(evs[:wf_events]):
+            adc, ticks = vd.run_fee(
+                ctx, cp.asarray(ev["pixels_signals"]), cp.asarray(ev["pixels_tracks_signals"]),
+                cp.asarray(ev["num_backtrack"]), cp.asarray(ev["offset_backtrack"]),
+                ev["max_time"], seed=seed0 + iev)
+            adc = np.asarray(adc); ticks = np.asarray(ticks)
+            nh = (adc > 0).sum(axis=1)
+            ps = ev["pixels_signals"]; ids = ev["unique_pix"]
+            coll = ev["is_collection"]; qc = ev["q_coll"]
+            xs, ys = vd.pixel_xy_from_id(ctx.detector, ids)
+            cats = np.array([_pixel_category(int(nh[r]), bool(coll[r]), float(qc[r]))
+                             for r in range(len(ids))])
+            picked = []
+            for cat, quota in quotas:                   # quota sample per category
+                rows = np.nonzero(cats == cat)[0]
+                if rows.size:
+                    take = rows if rows.size <= quota else rows[
+                        np.linspace(0, rows.size - 1, quota).round().astype(int)]
+                    picked.extend(int(r) for r in take)
+                if len(picked) >= max_pix:
+                    break
+            for r in picked[:max_pix]:
+                hitmask = adc[r] > 0
+                t_us, cur, chg = _crop_downsample(ps[r], ts)
+                recs.append(dict(
+                    sample=label, ev=int(iev), pix_id=int(ids[r]),
+                    x=float(xs[r]), y=float(ys[r]), cat=str(cats[r]),
+                    q_coll=float(qc[r]), t_coll=float(ev["t_coll"][r]),
+                    sig_t=float(ev["sig_t_coll"][r]), n_hits=int(nh[r]),
+                    thr=float(threshold_e), reset=int(reset_cycles),
+                    hit_t=np.asarray(ticks[r][hitmask], np.float32),
+                    hit_q=np.asarray(vd.adc_to_charge(ctx, adc[r][hitmask]), np.float32),
+                    t=t_us, cur=cur, chg=chg))
+    return recs
 
 
 def categorize(q, is_collection):
@@ -681,9 +876,9 @@ def aggregate_template_grid(ctx, evs_off, thresholds, resets, seed0):
     out = []
     for ir, rst in enumerate(np.asarray(resets, int)):    # reset OUTER -> one recompile per rate
         for it, thr in enumerate(np.asarray(thresholds, float)):
-            q, tr = aggregate_singlehits(ctx, evs_off, float(thr), int(rst), 0.0,
-                                         seed0=seed0 + ir * 1000 + it)
-            out.append((float(thr), int(rst), q, tr))
+            q, tr, aux = aggregate_singlehits(ctx, evs_off, float(thr), int(rst), 0.0,
+                                              seed0=seed0 + ir * 1000 + it)
+            out.append((float(thr), int(rst), q, tr, aux))
     return out
 
 
@@ -695,18 +890,19 @@ def fit_template_grid(grid_spectra, thresholds, resets, ts, qmax, n_shower, nois
     thr_arr = np.asarray(thresholds, float)
     rst_arr = np.asarray(resets, int)
     keys = ("mpv_L", "eta_L", "A_L", "mu_G", "sig_G", "chi2ndf")
-    grid = {k: np.full((len(rst_arr), len(thr_arr)), np.nan) for k in keys}
+    ekeys = ("mpv_L_err", "eta_L_err", "A_L_err", "mu_G_err", "sig_G_err")
+    grid = {k: np.full((len(rst_arr), len(thr_arr)), np.nan) for k in keys + ekeys}
     idx = {(float(t), int(r)): (ir, it)
            for ir, r in enumerate(rst_arr) for it, t in enumerate(thr_arr)}
     node_fits = {}
-    for (thr, rst, q, tr) in grid_spectra:
+    for (thr, rst, q, tr, _aux) in grid_spectra:
         coll = np.asarray(tr, bool)
         qs = np.asarray(q, float)[coll] if coll.any() else np.asarray(q, float)  # ~all shower
         tmpl = fit_shower_template(qs, float(thr), qmax=qmax, n_shower=n_shower, noise_e=noise_e)
         node_fits[(float(thr), int(rst))] = tmpl
         if tmpl.get("ok") and (float(thr), int(rst)) in idx:
             ir, it = idx[(float(thr), int(rst))]
-            for k in keys:
+            for k in keys + ekeys:
                 grid[k][ir, it] = tmpl[k]
     grid["thresholds"] = thr_arr
     grid["resets"] = rst_arr
@@ -714,54 +910,111 @@ def fit_template_grid(grid_spectra, thresholds, resets, ts, qmax, n_shower, nois
     return grid, node_fits
 
 
-def _cf_forms():
-    """Candidate closed forms p(x, r) for a langaus parameter; x = Q_thr/1e3 (10^3 e-),
-    r = reset rate (kHz). Physically: p rides threshold (affine in x) and is sculpted by
-    reset (a linear/bilinear rate term); A_L instead decays with threshold (exp)."""
-    def planar(X, c0, c1, c2):
-        x, r = X; return c0 + c1 * x + c2 * r
-    def bilinear(X, c0, c1, c2, c3):
-        x, r = X; return c0 + c1 * x + c2 * r + c3 * x * r
+def _cf_library():
+    """PHYSICALLY-MOTIVATED closed-form candidates for each frozen-template parameter as a
+    function of (Q_thr, reset rate f). x = Q_thr/1e3 (10^3 e-), r = f (kHz).
+
+    The template is fit to the induction-OFF single-hit shower spectrum, which is one
+    threshold-INDEPENDENT underlying peripheral-collection charge spectrum TRUNCATED at the
+    operating threshold. Each parameter is therefore a specific functional of that spectrum,
+    which fixes its form (not a free polynomial):
+
+      * mpv_L  -- the recorded peak RIDES the threshold: it sits an ~fixed distance above the
+                  turn-on, so MPV = c0 + c1*Q_thr with c1 ~ 1 (affine).
+      * A_L    -- the surviving shower yield is the spectrum's tail ABOVE threshold, i.e. the
+                  complementary CDF of the peripheral charge spectrum. Its decay form MEASURES
+                  that spectrum: exponential (scale Q0) if dN/dQ ~ e^{-Q/Q0}, or power-law if
+                  dN/dQ ~ Q^{-a}. Both are offered; AIC picks -> a physics result.
+      * eta_L  -- the Landau width tracks the LOCAL charge scale of the surviving slice, so it
+                  grows ~linearly from a noise/binning floor: eta = c0 + c1*Q_thr (affine).
+      * mu_G   -- the high-Q Gaussian is the core-adjacent shoulder; its centroid SLIDES UP as
+                  the threshold eats the shoulder's low-Q side: mu_G = c0 + c1*Q_thr (affine).
+
+    The reset factor (1 + c2*f) is a small linear charge-loss correction (reset periodically
+    chops accumulated charge); on this sample c2 comes out ~0 for the position parameters."""
     def affine_r(X, c0, c1, c2):
         x, r = X; return (c0 + c1 * x) * (1.0 + c2 * r)
-    def expdecay_r(X, c0, c1, c2):
+    def exp_r(X, c0, c1, c2):
         x, r = X; return c0 * np.exp(-x / (abs(c1) + 1e-6)) * (1.0 + c2 * r)
-    return [
-        (r"$c_0+c_1 Q_{thr}+c_2 f$", planar,
-         lambda y, x, r: [float(np.mean(y)), 0.0, 0.0]),
-        (r"$c_0+c_1 Q_{thr}+c_2 f+c_3 Q_{thr}f$", bilinear,
-         lambda y, x, r: [float(np.mean(y)), 0.0, 0.0, 0.0]),
-        (r"$(c_0+c_1 Q_{thr})(1+c_2 f)$", affine_r,
-         lambda y, x, r: [float(np.mean(y)), 0.0, 0.0]),
-        (r"$c_0 e^{-Q_{thr}/c_1}(1+c_2 f)$", expdecay_r,
-         lambda y, x, r: [float(np.max(y)) if y.size else 1.0, float(np.mean(x)) or 1.0, 0.0]),
-    ]
+    def power_r(X, c0, c1, c2):
+        x, r = X; return c0 * np.power(np.clip(x, 1e-3, None), c1) * (1.0 + c2 * r)
+
+    def seed_affine(y, x, r):
+        try:
+            c1, c0 = np.polyfit(x, y, 1)
+        except Exception:
+            c0, c1 = float(np.mean(y)), 0.0
+        return [float(c0), float(c1), 0.0]
+    def seed_exp(y, x, r):
+        ym = np.clip(y, 1e-9, None)
+        try:
+            b, a = np.polyfit(x, np.log(ym), 1)
+            c1 = (-1.0 / b) if b < 0 else float(np.mean(x)); c0 = float(np.exp(a))
+        except Exception:
+            c0, c1 = float(np.max(y)), float(np.mean(x))
+        return [c0, float(abs(c1)), 0.0]
+    def seed_power(y, x, r):
+        xm = np.clip(x, 1e-3, None); ym = np.clip(np.abs(y), 1e-9, None)
+        try:
+            c1 = float(np.clip(np.polyfit(np.log(xm), np.log(ym), 1)[0], -6.0, 6.0))
+        except Exception:
+            c1 = -1.0
+        return [float(np.median(y / np.power(xm, c1))), c1, 0.0]
+
+    AFF = (r"$(c_0+c_1 Q_{thr})(1+c_2 f)$", affine_r, seed_affine)
+    return dict(
+        mpv_L=[("peak rides threshold",) + AFF],
+        eta_L=[(r"width $\propto$ charge scale",) + AFF],
+        mu_G=[("high-Q centroid slides up",) + AFF],
+        sig_G=[(r"width $\propto$ charge scale",) + AFF],
+        A_L=[("spectrum tail above thr. (exp.)", r"$c_0\,e^{-Q_{thr}/c_1}(1+c_2 f)$", exp_r, seed_exp),
+             ("spectrum tail above thr. (power)", r"$c_0\,Q_{thr}^{c_1}(1+c_2 f)$", power_r, seed_power)],
+    )
 
 
-def _fit_closed_form(x, r, y):
-    """Fit the candidate closed forms to param values y over (x=Q_thr/1e3, r=rate kHz);
-    return the lowest-AIC form as a dict (name, params, r2, aic, func) or None."""
+def _fit_closed_form(x, r, y, yerr=None, forms=None):
+    """Fit the physically-motivated candidate form(s) for one parameter over (x=Q_thr/1e3,
+    r=rate kHz), WEIGHTED by the per-node fit uncertainties `yerr`. When a parameter has more
+    than one motivated form (A_L: exp vs power), AIC selects. Returns the best as a dict
+    (note, name, params, r2, red_chi2, aic, func) or None."""
     from scipy.optimize import curve_fit
+    if not forms:
+        return None
     good = np.isfinite(y) & np.isfinite(x) & np.isfinite(r)
+    if yerr is not None:
+        good &= np.isfinite(yerr)
     x, r, y = x[good], r[good], y[good]
     if y.size < 3:
         return None
+    if yerr is not None:
+        # floor tiny/zero errors at 3% of the value so no single node dominates the weight
+        w = np.maximum(np.asarray(yerr, float)[good], 0.03 * (np.abs(y) + 1e-9))
+    else:
+        w = None
     X = np.vstack([x, r])
     sst = float(np.sum((y - y.mean()) ** 2))
     best = None
-    for name, func, seed in _cf_forms():
+    for note, name, func, seed in forms:
         k = func.__code__.co_argcount - 1
         if y.size <= k:
             continue
         try:
-            popt, _ = curve_fit(func, X, y, p0=seed(y, x, r), maxfev=20000)
+            popt, _ = curve_fit(func, X, y, p0=seed(y, x, r), sigma=w,
+                                absolute_sigma=False, maxfev=30000)
         except Exception:
             continue
-        ssr = float(np.sum((y - func(X, *popt)) ** 2))
-        aic = y.size * np.log(ssr / y.size + 1e-30) + 2 * k
+        resid = y - func(X, *popt)
+        ssr = float(np.sum(resid ** 2))
+        if w is not None:
+            chi2 = float(np.sum((resid / w) ** 2))
+            aic = chi2 + 2 * k                       # Gaussian-likelihood AIC (weighted)
+            red_chi2 = chi2 / max(y.size - k, 1)
+        else:
+            aic = y.size * np.log(ssr / y.size + 1e-30) + 2 * k
+            red_chi2 = np.nan
         r2 = 1.0 - ssr / sst if sst > 0 else (1.0 if ssr < 1e-9 else 0.0)
-        cand = dict(name=name, params=[float(p) for p in popt], aic=float(aic),
-                    r2=float(r2), func=func, k=k)
+        cand = dict(note=note, name=name, params=[float(p) for p in popt], aic=float(aic),
+                    r2=float(r2), red_chi2=float(red_chi2), func=func, k=k)
         if best is None or aic < best["aic"]:
             best = cand
     return best
@@ -782,17 +1035,21 @@ class TemplateParam:
         order = np.argsort(rates)                     # ascending rate (off=0 first)
         self.rates = rates[order]
         self.grid = {k: np.asarray(grid[k], float)[order] for k in self.PARAMS}
+        self.err = {k: np.asarray(grid.get(k + "_err", np.full_like(self.grid[k], np.nan)),
+                                  float)[order] for k in self.PARAMS}
         self.x = self.thr / 1e3
         xx, rr = np.meshgrid(self.x, self.rates)      # (n_rate, n_thr), aligns with grid[k]
         # Drop nodes whose template fit was poor (chi2/ndf > chi2_cut) before fitting the
         # closed form -- a single bad node otherwise drags a clean law's R^2 right down.
         chi2 = np.asarray(grid.get("chi2ndf", np.zeros_like(self.grid["mpv_L"])), float)[order]
         node_ok = np.isfinite(chi2) & (chi2 <= chi2_cut)
+        lib = _cf_library()
         self.forms = {}
         for k in self.PARAMS:
-            yv = self.grid[k].ravel()
+            yv, ev = self.grid[k].ravel(), self.err[k].ravel()
             m = node_ok.ravel() & np.isfinite(yv)
-            self.forms[k] = _fit_closed_form(xx.ravel()[m], rr.ravel()[m], yv[m])
+            self.forms[k] = _fit_closed_form(xx.ravel()[m], rr.ravel()[m], yv[m],
+                                             yerr=ev[m], forms=lib.get(k))
 
     def _interp(self, key, thr, rate):
         """Bilinear interp of grid[key] over (rate, threshold), clamped at the edges."""
@@ -950,8 +1207,11 @@ def plot_scan_distributions(panels, title, fmt_val, col0_header, fname, outdir,
     nrow = int(np.ceil(n / ncol))
     base = fname[:-4] if fname.endswith(".png") else fname
     for logy, suf in ((True, ""), (False, "_lin")):   # log (tail) + linear (peak) versions
+        # Share y only on the LOG panels; let each LINEAR panel autoscale its own top so a
+        # tall induction peak (high induction scale / low threshold) isn't clipped by a
+        # neighbour's smaller range -- the linear view is for reading the peak SHAPE.
         fig, axes = plt.subplots(nrow, ncol, figsize=(3.8 * ncol, 2.9 * nrow),
-                                 sharex=True, sharey=True, squeeze=False)
+                                 sharex=True, sharey=logy, squeeze=False)
         for ax, (d, f, q, tr) in zip(axes.flat, items):
             _draw_charge_dist(ax, q, tr, f, f["threshold_e"], xlim=xlim,
                               compact=True, thr_sigma=thr_sigma, logy=logy)
@@ -1120,11 +1380,15 @@ def plot_template_params(grid, tparam, ts, outdir):
     fig, axes = plt.subplots(2, 2, figsize=(11, 8))
     for ax, (key, ylab, sc) in zip(axes.flat, params):
         g = np.asarray(grid[key], float)               # (n_reset, n_thr)
+        ge = np.asarray(grid.get(key + "_err", np.full_like(g, np.nan)), float)
         f = tparam.forms.get(key)
         for ir in order:
             c = cmap(0.12 + 0.76 * (ir / max(len(rates) - 1, 1)))
             lab = "off" if rates[ir] == 0 else "%.0f kHz" % rates[ir]
-            ax.plot(thr / 1e3, g[ir] / sc, "o", color=c, ms=5, label=lab)
+            yerr = ge[ir] / sc
+            yerr = np.where(np.isfinite(yerr), yerr, 0.0)
+            ax.errorbar(thr / 1e3, g[ir] / sc, yerr=yerr, fmt="o", color=c, ms=5,
+                        elinewidth=1.0, capsize=2.5, mfc=c, mec=c, label=lab)
             if f is not None:
                 xs = np.linspace(thr.min(), thr.max(), 60)
                 yhat = f["func"](np.vstack([xs / 1e3, np.full_like(xs, rates[ir])]), *f["params"])
@@ -1132,14 +1396,155 @@ def plot_template_params(grid, tparam, ts, outdir):
         ax.set_xlabel(r"$Q_{\mathrm{thr}}$ ($10^{3}\,e^{-}$)")
         ax.set_ylabel(ylab)
         if f is not None:
-            ax.text(0.03, 0.97, "%s\n$R^{2}=%.3f$" % (f["name"], f["r2"]),
-                    transform=ax.transAxes, ha="left", va="top", fontsize=8.5,
-                    bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="0.7", lw=0.6))
+            gof = (r"$R^{2}=%.3f$" % f["r2"] if not np.isfinite(f.get("red_chi2", np.nan))
+                   else r"$R^{2}=%.3f,\ \chi^{2}_\nu=%.1f$" % (f["r2"], f["red_chi2"]))
+            ax.text(0.03, 0.975, "%s\n%s\n%s" % (f.get("note", ""), f["name"], gof),
+                    transform=ax.transAxes, ha="left", va="top", fontsize=8.2, linespacing=1.4,
+                    bbox=dict(boxstyle="round,pad=0.32", fc="white", ec="0.7", lw=0.6))
     axes.flat[0].legend(title="reset rate", fontsize=8, ncol=2, loc="upper right")
     fig.suptitle("Frozen shower-Landau parameters vs threshold and reset "
                  "(points) with closed-form fits (lines)", y=1.0, fontsize=12)
     fig.tight_layout()
     _savefig(fig, f"{outdir}/ti_template_params.png")
+
+
+def plot_offpeak_anatomy(q, tr, aux, threshold_e, outdir, qmax=None, n_shower=1,
+                         suffix="", title=None):
+    """(1) WHAT ARE THE TWO PEAKS of the induction-off shower template?
+
+    Splits the induction-OFF single-hit spectrum by the truth quantities that the
+    hypothesis is about: how much REAL charge landed on the pad (q_coll) and how
+    concentrated in time it arrived (sig_t_coll). Hypothesis under test:
+      * near-threshold peak = pads with just enough charge to fire ONCE (low q_coll),
+      * high-Q bump        = large, temporally CONCENTRATED deposits (high q_coll, small sig_t).
+    """
+    import matplotlib.pyplot as plt
+    q = np.asarray(q, float); qc = np.asarray(aux.get("q_coll", []), float)
+    st = np.asarray(aux.get("sig_t_coll", []), float)
+    if qc.size != q.size or q.size < 20:
+        return
+    T, nsh = float(threshold_e), max(int(n_shower), 1)
+    h = _hist(q, T, qmax=qmax)
+    if h is None:
+        return
+    centres, raw, width, edges = h
+    bands = [(0.0, 1.0, "$q_{coll}<Q_{thr}$", "#4E79A7"),
+             (1.0, 3.0, "$1-3\\,Q_{thr}$", "#F0A73A"),
+             (3.0, np.inf, "$>3\\,Q_{thr}$", "#C24A4A")]
+    fig, ax = plt.subplots(1, 3, figsize=(15.5, 4.4))
+    # (a) spectrum stacked by how much real charge landed
+    stacks, labels, colors = [], [], []
+    for lo, hi, lab, c in bands:
+        m = (qc >= lo * T) & (qc < hi * T)
+        stacks.append(q[m] / 1e3); labels.append(lab); colors.append(c)
+    ax[0].hist(stacks, bins=edges / 1e3, stacked=True, color=colors, label=labels,
+               edgecolor="white", linewidth=0.2,
+               weights=[np.full(x.size, 1.0 / nsh) for x in stacks])
+    ax[0].axvline(T / 1e3, color="0.3", ls="--", lw=1.1)
+    ax[0].set_xlabel(r"recorded $Q$ ($10^{3}e^{-}$)")
+    ax[0].set_ylabel("single-hit pixels / shower")
+    ax[0].set_title("Induction-off spectrum, split by charge that landed", fontsize=11)
+    ax[0].set_xlim(0, 40); ax[0].legend(fontsize=9, title="real charge on pad")
+    # (b) recorded Q vs collected charge
+    ok = np.isfinite(qc) & (qc > 0)
+    ax[1].hist2d(q[ok] / 1e3, qc[ok] / 1e3, bins=[45, 45],
+                 range=[[0, 40], [0, 40]], cmap="cividis", cmin=1)
+    lim = np.array([0, 40])
+    ax[1].plot(lim, lim, "-", color="w", lw=1.0, alpha=.7)
+    ax[1].axvline(T / 1e3, color="w", ls="--", lw=1.0, alpha=.7)
+    ax[1].set_xlabel(r"recorded $Q$ ($10^{3}e^{-}$)")
+    ax[1].set_ylabel(r"real charge landed $q_{coll}$ ($10^{3}e^{-}$)")
+    ax[1].set_title("Recorded vs actual collected charge", fontsize=11)
+    # (c) time concentration of the deposit, for the two recorded-Q regions
+    near = q < 2.0 * T
+    for m, lab, c in ((near, "near-threshold peak", _C_IND),
+                      (~near, "high-$Q$ bump", _C_SHW)):
+        v = st[m & np.isfinite(st)]
+        if v.size > 5:
+            ax[2].hist(v, bins=40, histtype="step", lw=1.8, color=c, density=True, label=lab)
+    ax[2].set_xlabel(r"arrival-time spread $\sigma_t$ of the landed charge ($\mu$s)")
+    ax[2].set_ylabel("normalised")
+    ax[2].set_title("Is the deposit concentrated in time?", fontsize=11)
+    ax[2].legend(fontsize=9)
+    if title:
+        fig.suptitle("Two-peak anatomy: %s" % title, y=1.02, fontsize=12)
+    fig.tight_layout()
+    _savefig(fig, f"{outdir}/ti_offpeak_anatomy{suffix}.png")
+
+
+def plot_hit_timing(q, tr, aux, threshold_e, outdir, n_shower=1, n_mad=4.0,
+                    suffix="", title=None):
+    """(2) CAUSAL shower/induction separation using timing.
+
+    The spatial backtrack only asks "did charge land here". A hit that fired BEFORE its own
+    charge arrived was triggered by a neighbour's induced transient even though real charge
+    sits above the pad. dt = t_hit - t_coll measures exactly that (up to a constant response
+    delay). The collection-timed window is taken from the DATA (median +/- n_mad*MAD of the
+    charge-carrying population), not hard-coded, and the causal label is
+        collection  <=>  charge landed AND dt inside that window.
+    """
+    import matplotlib.pyplot as plt
+    q = np.asarray(q, float); spatial = np.asarray(tr, bool)
+    dt = np.asarray(aux.get("dt", []), float); qc = np.asarray(aux.get("q_coll", []), float)
+    if dt.size != q.size or q.size < 20:
+        return None
+    nsh = max(int(n_shower), 1)
+    fin = np.isfinite(dt)
+    ref = dt[spatial & fin]                       # charge-carrying pads define the window
+    if ref.size < 10:
+        return None
+    med = float(np.median(ref))
+    mad = float(np.median(np.abs(ref - med))) * 1.4826
+    lo, hi = med - n_mad * max(mad, 1e-6), med + n_mad * max(mad, 1e-6)
+    causal = spatial & fin & (dt >= lo) & (dt <= hi)
+    flipped = int((spatial & ~causal).sum())
+
+    fig, ax = plt.subplots(1, 3, figsize=(15.5, 4.4))
+    # (a) dt distribution, split by the spatial label
+    b = np.linspace(np.nanpercentile(dt, 0.5), np.nanpercentile(dt, 99.5), 70)
+    ax[0].hist(dt[spatial & fin], bins=b, color=_C_SHW, alpha=.65,
+               label="charge landed (spatial 'shower')")
+    ax[0].hist(dt[~spatial & fin], bins=b, color=_C_IND, alpha=.65,
+               label="no charge (spatial 'induction')")
+    for x in (lo, hi):
+        ax[0].axvline(x, color="0.25", ls="--", lw=1.2)
+    ax[0].set_xlabel(r"$\Delta t = t_{hit}-t_{coll}$ ($\mu$s)")
+    ax[0].set_ylabel("single-hit pixels")
+    ax[0].set_title("Hit time vs charge-arrival time", fontsize=11)
+    ax[0].set_yscale("log"); ax[0].legend(fontsize=8.5)
+    # (b) where the mislabelled hits sit in (Q, dt)
+    m = spatial & fin
+    ax[1].scatter(q[m & causal] / 1e3, dt[m & causal], s=4, c=_C_SHW, alpha=.4,
+                  label="collection-timed")
+    ax[1].scatter(q[m & ~causal] / 1e3, dt[m & ~causal], s=6, c=_C_IND, alpha=.6,
+                  label="charge landed, but MIS-TIMED")
+    ax[1].axhline(lo, color="0.25", ls="--", lw=1.0); ax[1].axhline(hi, color="0.25", ls="--", lw=1.0)
+    ax[1].set_xlabel(r"recorded $Q$ ($10^{3}e^{-}$)"); ax[1].set_ylabel(r"$\Delta t$ ($\mu$s)")
+    ax[1].set_xlim(0, 30)
+    ax[1].set_title("Induction-triggered hits on charged pads", fontsize=11)
+    ax[1].legend(fontsize=8.5, markerscale=2)
+    # (c) spectrum relabelled: spatial vs causal
+    h = _hist(q, float(threshold_e))
+    if h is not None:
+        edges = h[3]
+        w = lambda mask: np.full(int(mask.sum()), 1.0 / nsh)
+        ax[2].hist([q[~spatial] / 1e3, q[spatial] / 1e3], bins=edges / 1e3, stacked=True,
+                   color=[_C_IND, _C_SHW], alpha=.35, edgecolor="white", linewidth=.2,
+                   weights=[w(~spatial), w(spatial)], label=["induction (spatial)", "shower (spatial)"])
+        ax[2].step(edges[:-1] / 1e3, np.histogram(q[~causal], bins=edges)[0] / nsh,
+                   where="post", color=_C_IND, lw=2.0, label="induction (causal, timed)")
+        ax[2].axvline(float(threshold_e) / 1e3, color="0.3", ls="--", lw=1.1)
+        ax[2].set_xlabel(r"recorded $Q$ ($10^{3}e^{-}$)")
+        ax[2].set_ylabel("single-hit pixels / shower")
+        ax[2].set_xlim(0, 30); ax[2].legend(fontsize=8.5)
+        ax[2].set_title("Induction grows when timing is required", fontsize=11)
+    head = ("%s -- " % title) if title else ""
+    fig.suptitle(head + r"causal shower/induction: window $\Delta t\in[%.2f,%.2f]\,\mu$s, "
+                 r"$%d/%d$ 'shower' hits induction-triggered"
+                 % (lo, hi, flipped, int(spatial.sum())), y=1.03, fontsize=11)
+    fig.tight_layout()
+    _savefig(fig, f"{outdir}/ti_hit_timing{suffix}.png")
+    return dict(lo=lo, hi=hi, med=med, mad=mad, causal=causal, n_flipped=flipped)
 
 
 # ===========================================================================
@@ -1169,8 +1574,8 @@ def aggregate_fixed_scan(ctx, evs, knob_vals, set_fn, seed0):
     out = []
     for j, val in enumerate(knob_vals):
         thr, rst = set_fn(val)
-        q, tr = aggregate_singlehits(ctx, evs, thr, rst, 1.0, seed0=seed0 + j * 1000)
-        out.append((val, q, tr))
+        q, tr, aux = aggregate_singlehits(ctx, evs, thr, rst, 1.0, seed0=seed0 + j * 1000)
+        out.append((val, q, tr, aux))
     return out
 
 
@@ -1189,9 +1594,9 @@ def aggregate_induction_scan(ctx, drift_cache, scales, base_threshold, base_rese
             evs = [event_induce(ctx, dc[0], dc[1], dc[2], seed=seed0 + j * 777 + i,
                                 collect_frac=collect_frac) for i, dc in enumerate(drift_cache)]
             evs = [e for e in evs if e is not None]
-        q, tr = aggregate_singlehits(ctx, evs, base_threshold, base_reset, s,
-                                     seed0=seed0 + j * 1000 + 50000)
-        out.append((float(s), q, tr))
+        q, tr, aux = aggregate_singlehits(ctx, evs, base_threshold, base_reset, s,
+                                          seed0=seed0 + j * 1000 + 50000)
+        out.append((float(s), q, tr, aux))
     set_induction(ctx, 1.0)
     return out
 
@@ -1253,6 +1658,17 @@ def parse_args():
     ap.add_argument("--n-events", type=int, default=30, help="shower events per config")
     ap.add_argument("--shower-energy", type=float, default=300.0, help="MeV")
     ap.add_argument("--n-dep", type=int, default=400, help="deposits per shower")
+    # --- muon control samples (run ALONGSIDE the showers in the same job) ---
+    ap.add_argument("--muon-thetas", type=float, nargs="*", default=[0.0, 90.0],
+                    help="also generate straight MIP MUON samples at these angles to the "
+                         "PIXEL PLANE (deg): 0 = in-plane / isochronous (charge arrives "
+                         "together), 90 = along the drift axis (charge spread over drift "
+                         "time). Default runs both extremes; pass none to skip muons. Muons "
+                         "get the truth diagnostics + waveforms, not the full template scan.")
+    ap.add_argument("--muon-events", type=int, default=400,
+                    help="events per muon sample (a MIP track lights up ~40 pixels, so a few "
+                         "hundred is plenty). Capped at --n-events.")
+    ap.add_argument("--muon-length", type=float, default=20.0, help="muon track length (cm)")
     ap.add_argument("--collect-frac", type=float, default=0.15,
                     help="a (segment,pad) counts as collection if its net charge > this "
                          "fraction of that segment's peak-collecting pad (backtrack truth "
@@ -1284,6 +1700,11 @@ def parse_args():
     ap.add_argument("--spectra-out", default=None,
                     help="write the raw single-hit spectra to this .npz after the sim "
                          "(default <outdir>/ti_spectra.npz) for later --refit.")
+    ap.add_argument("--wf-events", type=int, default=6,
+                    help="events per sample whose per-pixel waveforms (current + charge vs "
+                         "time) are saved to ti_waveforms.npz for the standalone viewer. 0 = off.")
+    ap.add_argument("--wf-max-pix", type=int, default=40,
+                    help="max pixels saved per waveform event (sampled across hit categories)")
     ap.add_argument("--outdir", default="tistudy")
     return ap.parse_args()
 
@@ -1339,17 +1760,53 @@ def save_spectra(spectra, path):
         kw["meta_" + k] = np.asarray(v)
     kw["nominal_q"] = np.asarray(spectra["nominal"][0], float)
     kw["nominal_tr"] = np.asarray(spectra["nominal"][1], bool)
+    for k in _AUX_KEYS:
+        kw["nominal_aux_" + k] = np.asarray(spectra["nominal"][2][k], float)
     for name in ("threshold", "reset", "induction"):
         items = spectra[name]
         kw[name + "_vals"] = np.asarray([it[0] for it in items], float)
         kw[name + "_q"] = _obj_array([it[1] for it in items])
         kw[name + "_tr"] = _obj_array([it[2] for it in items])
+        for k in _AUX_KEYS:
+            kw[f"{name}_aux_{k}"] = _obj_array([it[3][k] for it in items])
     g = spectra["grid"]
     kw["grid_thr"] = np.asarray([it[0] for it in g], float)
     kw["grid_rst"] = np.asarray([it[1] for it in g], int)
     kw["grid_q"] = _obj_array([it[2] for it in g])
     kw["grid_tr"] = _obj_array([it[3] for it in g])
+    for k in _AUX_KEYS:
+        kw["grid_aux_" + k] = _obj_array([it[4][k] for it in g])
+    samples = spectra.get("samples", {})
+    kw["samp_names"] = np.asarray(list(samples.keys()))
+    for name, s in samples.items():
+        kw[f"samp_{name}_kind"] = np.asarray(str(s.get("kind", "")))
+        kw[f"samp_{name}_theta"] = np.asarray(float(s.get("theta", np.nan)))
+        kw[f"samp_{name}_n"] = np.asarray(int(s.get("n", 0)))
+        for which in ("nominal", "off"):
+            v = s.get(which)
+            if v is None:
+                continue
+            q, tr, aux = v
+            kw[f"samp_{name}_{which}_q"] = np.asarray(q, float)
+            kw[f"samp_{name}_{which}_tr"] = np.asarray(tr, bool)
+            for k in _AUX_KEYS:
+                kw[f"samp_{name}_{which}_aux_{k}"] = np.asarray(aux.get(k, []), float)
     np.savez(path, **kw)
+
+
+def save_waveforms(recs, path):
+    """Save per-pixel waveform records (from capture_waveforms) to an .npz for the viewer.
+    Scalar fields become parallel arrays; the variable-length arrays are object arrays."""
+    if not recs:
+        return
+    scal = ("sample", "ev", "pix_id", "x", "y", "cat", "q_coll", "t_coll", "sig_t",
+            "n_hits", "thr", "reset")
+    vararr = ("hit_t", "hit_q", "t", "cur", "chg")
+    kw = {k: np.asarray([r[k] for r in recs]) for k in scal}
+    for k in vararr:
+        kw[k] = _obj_array([r[k] for r in recs])
+    np.savez(path, **kw)
+    print(f"  wrote {len(recs)} pixel waveforms to {path}")
 
 
 def load_spectra(path):
@@ -1360,15 +1817,38 @@ def load_spectra(path):
         if k.startswith("meta_"):
             v = d[k]
             meta[k[5:]] = v.item() if v.ndim == 0 else v
+    has_aux = ("nominal_aux_dt" in d.files)
+    def _aux(prefix, i=None):
+        if not has_aux:
+            return {k: np.empty(0) for k in _AUX_KEYS}
+        if i is None:
+            return {k: np.asarray(d[f"{prefix}_aux_{k}"], float) for k in _AUX_KEYS}
+        return {k: np.asarray(d[f"{prefix}_aux_{k}"][i], float) for k in _AUX_KEYS}
     spectra = dict(meta=meta,
-                   nominal=(np.asarray(d["nominal_q"], float), np.asarray(d["nominal_tr"], bool)))
+                   nominal=(np.asarray(d["nominal_q"], float),
+                            np.asarray(d["nominal_tr"], bool), _aux("nominal")))
     for name in ("threshold", "reset", "induction"):
         vals, qs, trs = d[name + "_vals"], d[name + "_q"], d[name + "_tr"]
-        spectra[name] = [(float(vals[i]), np.asarray(qs[i], float), np.asarray(trs[i], bool))
-                         for i in range(len(vals))]
+        spectra[name] = [(float(vals[i]), np.asarray(qs[i], float), np.asarray(trs[i], bool),
+                          _aux(name, i)) for i in range(len(vals))]
     gthr, grst, gq, gtr = d["grid_thr"], d["grid_rst"], d["grid_q"], d["grid_tr"]
-    spectra["grid"] = [(float(gthr[i]), int(grst[i]), np.asarray(gq[i], float), np.asarray(gtr[i], bool))
+    spectra["grid"] = [(float(gthr[i]), int(grst[i]), np.asarray(gq[i], float),
+                        np.asarray(gtr[i], bool), _aux("grid", i))
                        for i in range(len(gthr))]
+    samples = {}
+    if "samp_names" in d.files:
+        for name in [str(x) for x in np.atleast_1d(d["samp_names"])]:
+            s = dict(kind=str(d[f"samp_{name}_kind"]), theta=float(d[f"samp_{name}_theta"]),
+                     n=int(d[f"samp_{name}_n"]))
+            for which in ("nominal", "off"):
+                qk = f"samp_{name}_{which}_q"
+                if qk in d.files:
+                    aux = {k: np.asarray(d[f"samp_{name}_{which}_aux_{k}"], float) for k in _AUX_KEYS}
+                    s[which] = (np.asarray(d[qk], float), np.asarray(d[f"samp_{name}_{which}_tr"], bool), aux)
+                else:
+                    s[which] = None
+            samples[name] = s
+    spectra["samples"] = samples
     return spectra
 
 
@@ -1413,7 +1893,7 @@ def produce_spectra(ctx, args):
                        for i, d in enumerate(drift_cache)) if e is not None]
 
     print("Aggregating nominal single-hit spectrum...")
-    q0, tr0 = aggregate_singlehits(ctx, evs, base_thr, base_reset, 1.0, seed0=args.seed + 1)
+    q0, tr0, aux0 = aggregate_singlehits(ctx, evs, base_thr, base_reset, 1.0, seed0=args.seed + 1)
     qmax = float(min(np.max(q0[q0 > 0]), 50000.0)) if np.any(q0 > 0) else 30000.0
 
     print("Inducing induction-OFF pre-FEE signals (pure shower, for templates)...")
@@ -1440,6 +1920,41 @@ def produce_spectra(ctx, args):
                                          base_reset, seed0=args.seed + 4000,
                                          evs_off=evs_off[:ind_n], collect_frac=args.collect_frac)
 
+    # --- control-sample DIAGNOSTICS: the shower plus straight-muon topologies, each with a
+    #     nominal (induction-on) and an induction-off single-hit sample for the anatomy /
+    #     timing checks, plus per-pixel waveforms for the viewer. -----------------------------
+    set_induction(ctx, 1.0); set_periodic_reset(ctx, base_reset)
+    off_node = next((g for g in grid_spectra
+                     if abs(g[0] - base_thr) < 1e-6 and int(g[1]) == base_reset), None)
+    samples = {"shower": dict(kind="shower", theta=float("nan"), n=n_eff,
+                              nominal=(q0, tr0, aux0),
+                              off=(off_node[2], off_node[3], off_node[4]) if off_node else None)}
+    waveforms = capture_waveforms(ctx, evs, base_thr, base_reset, args.seed + 9000, "shower",
+                                  args.wf_events, args.wf_max_pix)
+    for it, theta in enumerate(args.muon_thetas or []):
+        name = "muon_th%02d" % int(round(theta))
+        mu_n = min(int(args.muon_events), int(args.n_events))
+        print(f"\nMuon sample '{name}' (theta={theta:.0f} deg to pixel plane, {mu_n} events)...")
+        mu_raw = [build_muon_event(ctx, rng, theta_deg=float(theta), length_cm=args.muon_length)
+                  for _ in range(mu_n)]
+        mu_drift = [d for d in (event_drift(ctx, r) for r in mu_raw) if d is not None]
+        sd = args.seed + 7000 + it * 1000
+        set_induction(ctx, 1.0)
+        mu_evs = [e for e in (event_induce(ctx, d[0], d[1], d[2], seed=sd + i,
+                                           collect_frac=args.collect_frac)
+                              for i, d in enumerate(mu_drift)) if e is not None]
+        nom = aggregate_singlehits(ctx, mu_evs, base_thr, base_reset, 1.0, seed0=sd + 100)
+        set_induction(ctx, 0.0)
+        mu_off = [e for e in (event_induce(ctx, d[0], d[1], d[2], seed=sd + 500 + i,
+                                           collect_frac=args.collect_frac)
+                              for i, d in enumerate(mu_drift)) if e is not None]
+        off = aggregate_singlehits(ctx, mu_off, base_thr, base_reset, 0.0, seed0=sd + 600)
+        samples[name] = dict(kind="muon", theta=float(theta), n=len(mu_drift),
+                             nominal=nom, off=off)
+        waveforms += capture_waveforms(ctx, mu_evs, base_thr, base_reset, sd + 900, name,
+                                       args.wf_events, args.wf_max_pix)
+    set_induction(ctx, 1.0); set_periodic_reset(ctx, base_reset)
+
     det_name, _geom, det_path = vd.detector_identity(ctx)
     meta = dict(base_threshold=base_thr, base_reset=base_reset, ts=ts, noise_e=noise_e,
                 thr_sigma=thr_sigma, qmax=qmax, thresholds=np.asarray(args.thresholds, float),
@@ -1447,8 +1962,8 @@ def produce_spectra(ctx, args):
                 thr_grid=np.asarray(thr_grid, float), rst_grid=np.asarray(rst_grid, int),
                 n_shower_main=n_eff, n_shower_ind=ind_n,
                 detector_name=str(det_name), detector_path=str(det_path))
-    return dict(meta=meta, nominal=(q0, tr0), threshold=thr_items, reset=rst_items,
-                induction=ind_items, grid=grid_spectra)
+    return dict(meta=meta, nominal=(q0, tr0, aux0), threshold=thr_items, reset=rst_items,
+                induction=ind_items, grid=grid_spectra, samples=samples, waveforms=waveforms)
 
 
 def analyze_spectra(spectra, outdir):
@@ -1487,6 +2002,7 @@ def analyze_spectra(spectra, outdir):
 
     print("\n=== Nominal composite template fit ===")
     q0, tr0 = np.asarray(spectra["nominal"][0], float), np.asarray(spectra["nominal"][1], bool)
+    aux0 = spectra["nominal"][2] if len(spectra["nominal"]) > 2 else {}
     fit0 = fit_shower_plus_induction(q0, base_thr, template_fn(base_thr, base_reset),
                                      qmax=qmax, n_shower=n_main, noise_e=noise_e)
     if fit0 and fit0.get("ok"):
@@ -1502,10 +2018,42 @@ def analyze_spectra(spectra, outdir):
     else:
         print("  !! nominal fit failed:", fit0.get("reason") if fit0 else "no data")
 
+    # --- TRUTH DIAGNOSTICS over the control samples (shower + muon topologies) ---------
+    #  (1) plot_offpeak_anatomy: what the two peaks of the induction-off spectrum are, from
+    #      the collected-charge truth; (2) plot_hit_timing: how many spatial-"shower" hits
+    #      actually fired BEFORE their charge arrived (induction-triggered).
+    samples = spectra.get("samples", {})
+    if samples:
+        print("\n=== Truth diagnostics (control samples) ===")
+        for name, sm in samples.items():
+            nsh = int(sm.get("n", n_main)) or n_main
+            suf = "" if name == "shower" else "_" + name
+            lab = "shower" if name == "shower" else "%s (%.0f deg to plane)" % (name, sm.get("theta", np.nan))
+            off, nom = sm.get("off"), sm.get("nominal")
+            if off is not None:
+                qo, tro, auxo = off
+                coll = np.asarray(tro, bool)
+                m = coll if coll.any() else np.ones(qo.size, bool)
+                plot_offpeak_anatomy(np.asarray(qo, float)[m], coll[m],
+                                     {k: np.asarray(v, float)[m] for k, v in auxo.items()},
+                                     base_thr, outdir, qmax=qmax, n_shower=nsh,
+                                     suffix=suf, title=lab)
+            if nom is not None and np.size(nom[2].get("dt", [])) == np.size(nom[0]):
+                qn, trn, auxn = nom
+                tinfo = plot_hit_timing(qn, trn, auxn, base_thr, outdir, n_shower=nsh,
+                                        suffix=suf, title=lab)
+                if tinfo:
+                    n_sp = int(np.asarray(trn, bool).sum())
+                    print("  %-11s dt-window [%.2f,%.2f] us | %d/%d spatial-'shower' hits "
+                          "induction-triggered -> causal f_ind %.2f (spatial %.2f)"
+                          % (name, tinfo["lo"], tinfo["hi"], tinfo["n_flipped"], n_sp,
+                             1.0 - tinfo["causal"].sum() / max(qn.size, 1),
+                             1.0 - n_sp / max(qn.size, 1)))
+
     print("\n=== Threshold scan ===")
     thr_disp = thresholds / 1e3
     thr_items = [(v, q, tr, float(v), template_fn(float(v), base_reset))
-                 for (v, q, tr) in spectra["threshold"]]
+                 for (v, q, tr, _a) in spectra["threshold"]]
     thr_scan, thr_fits = fit_scan(thr_items, n_main, n_main, qmax, noise_e)
     plot_scan(None, thr_scan, r"Pixel charge threshold $Q_{\mathrm{thr}}$  ($10^{3}\,e^{-}$)",
               "ti_scan_threshold.png", outdir, knob_vals_disp=thr_disp, mpv_ylim=mpv_ylim)
@@ -1517,7 +2065,7 @@ def analyze_spectra(spectra, outdir):
     print("\n=== Periodic-reset scan ===")
     reset_rate = reset_rate_khz(resets, ts)
     rst_items = [(v, q, tr, base_thr, template_fn(base_thr, int(v)))
-                 for (v, q, tr) in spectra["reset"]]
+                 for (v, q, tr, _a) in spectra["reset"]]
     rst_scan, rst_fits = fit_scan(rst_items, n_main, n_main, qmax, noise_e)
     plot_scan(None, rst_scan, r"Periodic-reset rate  (kHz)",
               "ti_scan_periodic_reset.png", outdir, knob_vals_disp=reset_rate)
@@ -1529,7 +2077,7 @@ def analyze_spectra(spectra, outdir):
     print("\n=== Induction-response scan ===")
     ind_disp = inductions
     ind_items = [(v, q, tr, base_thr, template_fn(base_thr, base_reset))
-                 for (v, q, tr) in spectra["induction"]]
+                 for (v, q, tr, _a) in spectra["induction"]]
     ind_scan, ind_fits = fit_scan(ind_items, n_ind, n_ind, qmax, noise_e)
     plot_scan(None, ind_scan, r"Neighbour-pad induction-response scale",
               "ti_scan_induction.png", outdir, knob_vals_disp=ind_disp)
@@ -1567,7 +2115,8 @@ def analyze_spectra(spectra, outdir):
              template_thresholds=thr_grid, template_resets=rst_grid,
              template_rates=reset_rate_khz(rst_grid, ts),
              **{f"template_{k}": grid[k] for k in
-                ("mpv_L", "eta_L", "A_L", "mu_G", "sig_G", "chi2ndf")},
+                ("mpv_L", "eta_L", "A_L", "mu_G", "sig_G", "chi2ndf",
+                 "mpv_L_err", "eta_L_err", "A_L_err", "mu_G_err", "sig_G_err")},
              template_closed_form=np.array(repr(closed_form)),
              sensitivity=np.array(matrix, float),
              sensitivity_knobs=np.array(knobs),
@@ -1609,6 +2158,7 @@ def main():
         spectra = produce_spectra(ctx, args)
         spec_path = args.spectra_out or f"{args.outdir}/ti_spectra.npz"
         save_spectra(spectra, spec_path)
+        save_waveforms(spectra.get("waveforms", []), f"{args.outdir}/ti_waveforms.npz")
         print(f"Wrote raw spectra to {spec_path}\n  -> iterate fits locally with:  "
               f"python tests/threshold_induction_study.py --refit {spec_path} --outdir {args.outdir}")
 
