@@ -314,30 +314,44 @@ def collection_pixels_from_signals(signals, neigh, f_collect):
     return np.unique(neigh_h[landed]), landed, net_sp, neigh_h
 
 
-def collected_charge_truth(landed, net_sp, neigh_h, unique_pix, t0_seg):
+def collected_charge_truth(landed, net_sp, neigh_h, unique_pix, t_arrival, ts):
     """Per-pixel truth about the REAL charge that landed on it, from the collection
     (segment, pad) pairs only:
 
-      q_coll   -- total collected charge on the pad (electrons),
-      t_coll   -- charge-weighted ARRIVAL TIME of that charge at the anode (us). After
-                  drift(), `tracks["t0"]` is the segment's arrival time, and
-                  sum_pixel_signals places each segment at t0/TIME_SAMPLING, so this is in
-                  the same global frame as the FEE's `adc_ticks`. NB it carries a constant
-                  offset (the response's internal t0 -> peak-current delay), so use it for
-                  RELATIVE timing (t_hit - t_coll), not as an absolute arrival.
+      q_coll   -- total collected charge on the pad (ELECTRONS: net_sp is summed
+                  current-per-tick, so x TIME_SAMPLING converts to charge),
+      t_coll   -- charge-weighted ARRIVAL TIME of that charge at the anode (us).
+                  `t_arrival` must be the drift kernel's `tracks["t"]` (= drift_time + t0,
+                  written by drifting.drift) -- NOT `t0`, which is the segment's GENERATION
+                  time (~0 for our events). The FEE's `adc_ticks` live on the same clock
+                  (hits appear at ~ the drift time), so dt = t_hit - t_coll is meaningful,
+                  up to a small constant response delay -- use it RELATIVE, not absolute.
       sig_t    -- spread of that arrival time: small => one concentrated deposit,
                   large => charge dribbling in over many segments/depths.
 
     These are what distinguish "a pad with just enough charge to fire once" from "a pad
-    under a large, temporally concentrated deposit"."""
+    under a large, temporally concentrated deposit".
+
+    ALSO returns the NEIGHBOURHOOD arrival time:
+
+      t_near   -- charge-weighted arrival time of ALL the charge in this pad's
+                  neighbourhood, whether or not it landed on the pad itself.
+
+    This one is defined for essentially EVERY pixel, including pure-induction pads that
+    collect nothing (for which t_coll is undefined/NaN). It is the reference the induction
+    hits need: an induction pad fires because a NEIGHBOUR's charge is arriving, so
+    dt_near = t_hit - t_near tests whether the hit leads that arrival. Without it, induction
+    pixels drop out of the timing comparison entirely and only the collection population is
+    plotted."""
     npix = int(np.size(unique_pix))
+    t_arr = np.asarray(t_arrival, float)
     q = np.zeros(npix); m1 = np.zeros(npix); m2 = np.zeros(npix)
     if landed.any():
         ids = neigh_h[landed]
         idx = np.searchsorted(unique_pix, ids)        # unique_pix is sorted (cp.unique)
-        w = net_sp[landed].astype(np.float64)
+        w = net_sp[landed].astype(np.float64) * float(ts)   # current-sum -> electrons
         seg = np.nonzero(landed)[0]                   # segment index of each landed pair
-        t = np.asarray(t0_seg, float)[seg]
+        t = t_arr[seg]
         q = np.bincount(idx, weights=w, minlength=npix)
         m1 = np.bincount(idx, weights=w * t, minlength=npix)
         m2 = np.bincount(idx, weights=w * t * t, minlength=npix)
@@ -345,7 +359,25 @@ def collected_charge_truth(landed, net_sp, neigh_h, unique_pix, t0_seg):
     t_coll = np.full(npix, np.nan); sig_t = np.full(npix, np.nan)
     t_coll[good] = m1[good] / q[good]
     sig_t[good] = np.sqrt(np.clip(m2[good] / q[good] - t_coll[good] ** 2, 0.0, None))
-    return q, t_coll, sig_t
+
+    # --- neighbourhood arrival time: every (segment, pad) pair in the neighbourhood map,
+    #     weighted by that segment's OWN collected charge (its peak-pad net) -- i.e. how
+    #     much charge is driving the induction seen here.
+    valid = neigh_h >= 0
+    t_near = np.full(npix, np.nan)
+    if valid.any():
+        seg_q = np.maximum(net_sp.max(axis=1), 0.0) * float(ts)   # per-segment collected e-
+        segn = np.nonzero(valid)[0]
+        wn = seg_q[segn]
+        keep = wn > 0
+        if keep.any():
+            idxn = np.searchsorted(unique_pix, neigh_h[valid][keep])
+            wn = wn[keep]; tn = t_arr[segn[keep]]
+            qn = np.bincount(idxn, weights=wn, minlength=npix)
+            mn = np.bincount(idxn, weights=wn * tn, minlength=npix)
+            gn = qn > 0
+            t_near[gn] = mn[gn] / qn[gn]
+    return q, t_coll, sig_t, t_near
 
 
 def event_drift(ctx, tracks):
@@ -388,8 +420,8 @@ def event_induce(ctx, drifted, neigh, radius, seed, collect_frac=0.15):
     is_collection = np.isin(uph, collect_ids)
     # ... and the per-pixel COLLECTED-charge truth (amount + arrival time + spread), which
     # is what lets us (a) anatomise the two shower peaks and (b) add a causal timing test.
-    q_coll, t_coll, sig_t_coll = collected_charge_truth(
-        landed, net_sp, neigh_h, uph, drifted["t0"])
+    q_coll, t_coll, sig_t_coll, t_near = collected_charge_truth(
+        landed, net_sp, neigh_h, uph, drifted["t"], ts)
     # The study uses only the ADC (q_sum), never the per-track backtracking. The
     # backtracking array (pixels_tracks_signals, size nt0*sum(num_backtrack)) is by
     # far the largest per-event object and OOM'd the 200-event cache -- so we DROP
@@ -405,6 +437,7 @@ def event_induce(ctx, drifted, neigh, radius, seed, collect_frac=0.15):
         q_coll=q_coll,                                        # real charge landed on pad (e-)
         t_coll=t_coll,                                        # its arrival time (us, global frame)
         sig_t_coll=sig_t_coll,                                # arrival-time spread (us)
+        t_near=t_near,                                        # neighbourhood arrival time (us)
         truth_e=ps_host.sum(axis=1, dtype=np.float64) * ts,   # net collected charge (e-)
         max_time=ps_host.shape[1] * ts,
     )
@@ -421,7 +454,17 @@ def event_presignals(ctx, tracks, seed, collect_frac=0.15):
 # per-single-hit TRUTH auxiliaries carried alongside (q, is_collection): the hit time, the
 # real charge that landed on the pad and when/how spread-out it arrived. These drive the
 # two-peak anatomy and the causal (timing) shower-vs-induction separation.
-_AUX_KEYS = ("t_hit", "t_coll", "dt", "q_coll", "sig_t_coll")
+_AUX_KEYS = ("t_hit", "t_coll", "dt", "q_coll", "sig_t_coll", "t_near", "dt_near")
+
+
+def _aux_sel(aux, sel, n):
+    """Apply a boolean/index selection to an aux dict, skipping entries that are absent
+    (older spectra files predate some keys) so old files still analyse cleanly."""
+    out = {}
+    for k, v in (aux or {}).items():
+        v = np.asarray(v, float)
+        out[k] = v[sel] if v.size == n else np.empty(0)
+    return out
 
 
 def event_fee_singlehits(ctx, ev, threshold_e, seed):
@@ -453,12 +496,13 @@ def event_fee_singlehits(ctx, ev, threshold_e, seed):
     single_adc = adc[sel][np.arange(row.size), row]
     t_hit = ticks[sel][np.arange(row.size), row]     # when that sample was taken (us)
     q = vd.adc_to_charge(ctx, single_adc)            # electrons
-    t_coll = ev["t_coll"][sel]
-    aux = dict(t_hit=np.asarray(t_hit, float),
-               t_coll=np.asarray(t_coll, float),
-               dt=np.asarray(t_hit, float) - np.asarray(t_coll, float),
+    t_coll = np.asarray(ev["t_coll"][sel], float)
+    t_near = np.asarray(ev["t_near"][sel], float)
+    t_hit = np.asarray(t_hit, float)
+    aux = dict(t_hit=t_hit, t_coll=t_coll, dt=t_hit - t_coll,
                q_coll=np.asarray(ev["q_coll"][sel], float),
-               sig_t_coll=np.asarray(ev["sig_t_coll"][sel], float))
+               sig_t_coll=np.asarray(ev["sig_t_coll"][sel], float),
+               t_near=t_near, dt_near=t_hit - t_near)
     return np.asarray(q, float), ev["is_collection"][sel], aux
 
 
@@ -821,6 +865,7 @@ def capture_waveforms(ctx, evs, threshold_e, reset_cycles, seed0, label,
                     sample=label, ev=int(iev), pix_id=int(ids[r]),
                     x=float(xs[r]), y=float(ys[r]), cat=str(cats[r]),
                     q_coll=float(qc[r]), t_coll=float(ev["t_coll"][r]),
+                    t_near=float(ev["t_near"][r]),
                     sig_t=float(ev["sig_t_coll"][r]), n_hits=int(nh[r]),
                     thr=float(threshold_e), reset=int(reset_cycles),
                     hit_t=np.asarray(ticks[r][hitmask], np.float32),
@@ -1465,52 +1510,83 @@ def plot_offpeak_anatomy(q, tr, aux, threshold_e, outdir, qmax=None, n_shower=1,
     ax[2].set_xlabel(r"arrival-time spread $\sigma_t$ of the landed charge ($\mu$s)")
     ax[2].set_ylabel("normalised")
     ax[2].set_title("Is the deposit concentrated in time?", fontsize=11)
-    ax[2].legend(fontsize=9)
+    if ax[2].get_legend_handles_labels()[0]:      # empty for a pure-induction sample
+        ax[2].legend(fontsize=9)
     if title:
         fig.suptitle("Two-peak anatomy: %s" % title, y=1.02, fontsize=12)
     fig.tight_layout()
     _savefig(fig, f"{outdir}/ti_offpeak_anatomy{suffix}.png")
 
 
-def plot_hit_timing(q, tr, aux, threshold_e, outdir, n_shower=1, n_mad=4.0,
+def plot_hit_timing(q, tr, aux, threshold_e, outdir, n_shower=1, n_mad=3.0,
                     suffix="", title=None):
     """(2) CAUSAL shower/induction separation using timing.
 
-    The spatial backtrack only asks "did charge land here". A hit that fired BEFORE its own
-    charge arrived was triggered by a neighbour's induced transient even though real charge
-    sits above the pad. dt = t_hit - t_coll measures exactly that (up to a constant response
-    delay). The collection-timed window is taken from the DATA (median +/- n_mad*MAD of the
-    charge-carrying population), not hard-coded, and the causal label is
-        collection  <=>  charge landed AND dt inside that window.
+    Two reference times are used, because a pure-induction pad collects nothing and so has
+    no arrival time of its OWN:
+
+      dt      = t_hit - t_coll  -- vs the charge that landed on THIS pad. Defined only for
+                charged pads; a hit with dt < 0 fired BEFORE its own charge arrived, i.e. it
+                was induction-TRIGGERED even though the spatial backtrack calls it 'shower'.
+                This drives the causal relabelling.
+      dt_near = t_hit - t_near  -- vs the charge arriving in the pad's NEIGHBOURHOOD. Defined
+                for essentially every pad, so induction hits appear in the comparison at all;
+                induction leads the arrival (negative), collection tracks it (~0).
+
+    The collection-timed window is taken from the DATA (median +/- n_mad*MAD of the charged
+    population), never hard-coded, since t_coll carries a constant response delay. For a
+    near-pure-induction sample (too few charged pads to define a window) the distributions
+    are still drawn and the relabelling is simply skipped.
     """
     import matplotlib.pyplot as plt
     q = np.asarray(q, float); spatial = np.asarray(tr, bool)
     dt = np.asarray(aux.get("dt", []), float); qc = np.asarray(aux.get("q_coll", []), float)
+    dtn = np.asarray(aux.get("dt_near", []), float)
     if dt.size != q.size or q.size < 20:
         return None
+    if dtn.size != q.size:
+        dtn = dt                                   # older files without the neighbour clock
     nsh = max(int(n_shower), 1)
     fin = np.isfinite(dt)
     ref = dt[spatial & fin]                       # charge-carrying pads define the window
-    if ref.size < 10:
-        return None
-    med = float(np.median(ref))
-    mad = float(np.median(np.abs(ref - med))) * 1.4826
-    lo, hi = med - n_mad * max(mad, 1e-6), med + n_mad * max(mad, 1e-6)
-    causal = spatial & fin & (dt >= lo) & (dt <= hi)
+    have_ref = ref.size >= 10
+    if have_ref:
+        med = float(np.median(ref))
+        # Width from the UPPER half only. The population we are trying to find (hits that
+        # fired EARLY) contaminates the lower tail, so a two-sided MAD is inflated by the
+        # very outliers it is meant to catch -- which widens the window until nothing is
+        # flagged. Late hits have no such mechanism, so the upper half is a clean estimator.
+        hi_half = ref[ref >= med]
+        mad = float(np.median(np.abs(hi_half - med))) * 1.4826 if hi_half.size >= 5 \
+            else float(np.median(np.abs(ref - med))) * 1.4826
+        lo, hi = med - n_mad * max(mad, 1e-6), med + n_mad * max(mad, 1e-6)
+        causal = spatial & fin & (dt >= lo) & (dt <= hi)
+    else:                                          # near-pure induction: no window to define
+        med = mad = np.nan
+        lo, hi = np.nan, np.nan
+        causal = spatial & fin
     flipped = int((spatial & ~causal).sum())
 
     fig, ax = plt.subplots(1, 3, figsize=(15.5, 4.4))
-    # (a) dt distribution, split by the spatial label
-    b = np.linspace(np.nanpercentile(dt, 0.5), np.nanpercentile(dt, 99.5), 70)
-    ax[0].hist(dt[spatial & fin], bins=b, color=_C_SHW, alpha=.65,
-               label="charge landed (spatial 'shower')")
-    ax[0].hist(dt[~spatial & fin], bins=b, color=_C_IND, alpha=.65,
-               label="no charge (spatial 'induction')")
-    for x in (lo, hi):
-        ax[0].axvline(x, color="0.25", ls="--", lw=1.2)
-    ax[0].set_xlabel(r"$\Delta t = t_{hit}-t_{coll}$ ($\mu$s)")
+    # (a) dt_near: hit time vs the NEIGHBOURHOOD arrival -- defined for BOTH populations, so
+    #     the induction lead is directly visible.
+    fn = np.isfinite(dtn)
+    if fn.any():
+        b = np.linspace(np.nanpercentile(dtn[fn], 0.5), np.nanpercentile(dtn[fn], 99.5), 70)
+        if spatial.any():
+            ax[0].hist(dtn[spatial & fn], bins=b, color=_C_SHW, alpha=.65,
+                       label="charge landed (spatial 'shower')")
+        if (~spatial).any():
+            ax[0].hist(dtn[~spatial & fn], bins=b, color=_C_IND, alpha=.65,
+                       label="no charge (spatial 'induction')")
+        ax[0].axvline(0.0, color="0.25", ls="--", lw=1.2)
+        for lbl, v, c in (("induction", dtn[~spatial & fn], _C_IND),
+                          ("collection", dtn[spatial & fn], _C_SHW)):
+            if v.size > 5:
+                ax[0].axvline(np.median(v), color=c, ls=":", lw=1.6)
+    ax[0].set_xlabel(r"$\Delta t_{near} = t_{hit}-t_{near}$ ($\mu$s)")
     ax[0].set_ylabel("single-hit pixels")
-    ax[0].set_title("Hit time vs charge-arrival time", fontsize=11)
+    ax[0].set_title("Hit time vs neighbourhood charge arrival", fontsize=11)
     ax[0].set_yscale("log"); ax[0].legend(fontsize=8.5)
     # (b) where the mislabelled hits sit in (Q, dt)
     m = spatial & fin
@@ -1518,7 +1594,9 @@ def plot_hit_timing(q, tr, aux, threshold_e, outdir, n_shower=1, n_mad=4.0,
                   label="collection-timed")
     ax[1].scatter(q[m & ~causal] / 1e3, dt[m & ~causal], s=6, c=_C_IND, alpha=.6,
                   label="charge landed, but MIS-TIMED")
-    ax[1].axhline(lo, color="0.25", ls="--", lw=1.0); ax[1].axhline(hi, color="0.25", ls="--", lw=1.0)
+    if np.isfinite(lo):
+        ax[1].axhline(lo, color="0.25", ls="--", lw=1.0)
+        ax[1].axhline(hi, color="0.25", ls="--", lw=1.0)
     ax[1].set_xlabel(r"recorded $Q$ ($10^{3}e^{-}$)"); ax[1].set_ylabel(r"$\Delta t$ ($\mu$s)")
     ax[1].set_xlim(0, 30)
     ax[1].set_title("Induction-triggered hits on charged pads", fontsize=11)
@@ -1539,9 +1617,13 @@ def plot_hit_timing(q, tr, aux, threshold_e, outdir, n_shower=1, n_mad=4.0,
         ax[2].set_xlim(0, 30); ax[2].legend(fontsize=8.5)
         ax[2].set_title("Induction grows when timing is required", fontsize=11)
     head = ("%s -- " % title) if title else ""
-    fig.suptitle(head + r"causal shower/induction: window $\Delta t\in[%.2f,%.2f]\,\mu$s, "
-                 r"$%d/%d$ 'shower' hits induction-triggered"
-                 % (lo, hi, flipped, int(spatial.sum())), y=1.03, fontsize=11)
+    if have_ref:
+        tail = (r"causal shower/induction: window $\Delta t\in[%.2f,%.2f]\,\mu$s, "
+                r"$%d/%d$ 'shower' hits induction-triggered" % (lo, hi, flipped, int(spatial.sum())))
+    else:
+        tail = (r"near-pure induction sample (%d charged pads): timing shown, "
+                r"relabelling skipped" % int(spatial.sum()))
+    fig.suptitle(head + tail, y=1.03, fontsize=11)
     fig.tight_layout()
     _savefig(fig, f"{outdir}/ti_hit_timing{suffix}.png")
     return dict(lo=lo, hi=hi, med=med, mad=mad, causal=causal, n_flipped=flipped)
@@ -1799,8 +1881,8 @@ def save_waveforms(recs, path):
     Scalar fields become parallel arrays; the variable-length arrays are object arrays."""
     if not recs:
         return
-    scal = ("sample", "ev", "pix_id", "x", "y", "cat", "q_coll", "t_coll", "sig_t",
-            "n_hits", "thr", "reset")
+    scal = ("sample", "ev", "pix_id", "x", "y", "cat", "q_coll", "t_coll", "t_near",
+            "sig_t", "n_hits", "thr", "reset")
     vararr = ("hit_t", "hit_q", "t", "cur", "chg")
     kw = {k: np.asarray([r[k] for r in recs]) for k in scal}
     for k in vararr:
@@ -1819,11 +1901,16 @@ def load_spectra(path):
             meta[k[5:]] = v.item() if v.ndim == 0 else v
     has_aux = ("nominal_aux_dt" in d.files)
     def _aux(prefix, i=None):
-        if not has_aux:
-            return {k: np.empty(0) for k in _AUX_KEYS}
-        if i is None:
-            return {k: np.asarray(d[f"{prefix}_aux_{k}"], float) for k in _AUX_KEYS}
-        return {k: np.asarray(d[f"{prefix}_aux_{k}"][i], float) for k in _AUX_KEYS}
+        # tolerate files written before a given aux key existed (e.g. t_near/dt_near):
+        # missing entries come back empty and downstream code falls back gracefully.
+        out = {}
+        for k in _AUX_KEYS:
+            key = f"{prefix}_aux_{k}"
+            if not has_aux or key not in d.files:
+                out[k] = np.empty(0)
+            else:
+                out[k] = np.asarray(d[key] if i is None else d[key][i], float)
+        return out
     spectra = dict(meta=meta,
                    nominal=(np.asarray(d["nominal_q"], float),
                             np.asarray(d["nominal_tr"], bool), _aux("nominal")))
@@ -1843,7 +1930,9 @@ def load_spectra(path):
             for which in ("nominal", "off"):
                 qk = f"samp_{name}_{which}_q"
                 if qk in d.files:
-                    aux = {k: np.asarray(d[f"samp_{name}_{which}_aux_{k}"], float) for k in _AUX_KEYS}
+                    aux = {k: (np.asarray(d[f"samp_{name}_{which}_aux_{k}"], float)
+                               if f"samp_{name}_{which}_aux_{k}" in d.files else np.empty(0))
+                           for k in _AUX_KEYS}     # tolerate pre-t_near files
                     s[which] = (np.asarray(d[qk], float), np.asarray(d[f"samp_{name}_{which}_tr"], bool), aux)
                 else:
                     s[which] = None
@@ -2033,9 +2122,14 @@ def analyze_spectra(spectra, outdir):
             if off is not None:
                 qo, tro, auxo = off
                 coll = np.asarray(tro, bool)
-                m = coll if coll.any() else np.ones(qo.size, bool)
-                plot_offpeak_anatomy(np.asarray(qo, float)[m], coll[m],
-                                     {k: np.asarray(v, float)[m] for k, v in auxo.items()},
+                # NB do NOT name this `m` -- that shadows the `m = spectra["meta"]` dict
+                # used by the results-npz save at the end of this function.
+                # use the collection sub-sample, but fall back to the whole off-sample when
+                # there are too few charged pads (e.g. the theta=90 muon, which is ~pure
+                # induction) -- otherwise the plot silently never gets made.
+                selo = coll if coll.sum() >= 20 else np.ones(qo.size, bool)
+                plot_offpeak_anatomy(np.asarray(qo, float)[selo], coll[selo],
+                                     _aux_sel(auxo, selo, qo.size),
                                      base_thr, outdir, qmax=qmax, n_shower=nsh,
                                      suffix=suf, title=lab)
             if nom is not None and np.size(nom[2].get("dt", [])) == np.size(nom[0]):
@@ -2044,11 +2138,23 @@ def analyze_spectra(spectra, outdir):
                                         suffix=suf, title=lab)
                 if tinfo:
                     n_sp = int(np.asarray(trn, bool).sum())
-                    print("  %-11s dt-window [%.2f,%.2f] us | %d/%d spatial-'shower' hits "
-                          "induction-triggered -> causal f_ind %.2f (spatial %.2f)"
-                          % (name, tinfo["lo"], tinfo["hi"], tinfo["n_flipped"], n_sp,
-                             1.0 - tinfo["causal"].sum() / max(qn.size, 1),
-                             1.0 - n_sp / max(qn.size, 1)))
+                    sp_b = np.asarray(trn, bool)
+                    dtn = np.asarray(auxn.get("dt_near", []), float)
+                    if dtn.size == qn.size:         # the headline induction-lead numbers
+                        f = np.isfinite(dtn)
+                        mi = np.median(dtn[~sp_b & f]) if (~sp_b & f).any() else np.nan
+                        mc = np.median(dtn[sp_b & f]) if (sp_b & f).any() else np.nan
+                        print("  %-11s dt_near median: induction %+.2f us, collection %+.2f us "
+                              "-> induction leads by %.2f us" % (name, mi, mc, mc - mi))
+                    if np.isfinite(tinfo["lo"]):
+                        print("  %-11s dt-window [%.2f,%.2f] us | %d/%d spatial-'shower' hits "
+                              "induction-triggered -> causal f_ind %.2f (spatial %.2f)"
+                              % (name, tinfo["lo"], tinfo["hi"], tinfo["n_flipped"], n_sp,
+                                 1.0 - tinfo["causal"].sum() / max(qn.size, 1),
+                                 1.0 - n_sp / max(qn.size, 1)))
+                    else:
+                        print("  %-11s near-pure induction (%d charged pads): relabelling skipped"
+                              % (name, n_sp))
 
     print("\n=== Threshold scan ===")
     thr_disp = thresholds / 1e3
