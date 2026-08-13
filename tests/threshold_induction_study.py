@@ -97,7 +97,11 @@ from math import sqrt, log, pi
 import numpy as np
 
 # Reuse the proven kernel drivers / plot helpers from the diffusion suite.
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+_TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, _TESTS_DIR)
+# ...and the repo root, so `import larndsim` (for the named-config registry) works when the
+# script is run straight out of a checkout, not only when the package is pip-installed.
+sys.path.insert(1, os.path.dirname(_TESTS_DIR))
 import verify_diffusion as vd  # noqa: E402
 
 SQRT2PI = sqrt(2.0 * pi)
@@ -1877,12 +1881,20 @@ def sensitivity_row(scan, observables_keys, knob_axis=None, return_raw=False):
 def parse_args():
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--response", default="larndsim/bin/response_44_v2a_full.npz")
-    ap.add_argument("--detector", default="larndsim/detector_properties/module0.yaml")
-    ap.add_argument("--pixel-layout",
-                    default="larndsim/pixel_layouts/multi_tile_layout-2.4.16_v4.yaml")
-    ap.add_argument("--sim-properties",
-                    default="larndsim/simulation_properties/singles_sim.yaml")
+    ap.add_argument("--config", default="module0",
+                    help="NAMED larnd-sim config, resolved through larndsim/config/config.yaml "
+                         "-- the same registry simulate_pixels.py uses, so the detector "
+                         "properties / pixel layout / response / sim properties are always a "
+                         "self-consistent set (module0, 2x2_no_modvar, fsd, fsd_cube, ndlar, "
+                         "...). Use --list-configs to see them. Any of the four explicit flags "
+                         "below overrides the corresponding registry entry.")
+    ap.add_argument("--list-configs", action="store_true",
+                    help="print the available named configs (with their files) and exit")
+    # Explicit overrides. Default None -> taken from --config.
+    ap.add_argument("--response", default=None)
+    ap.add_argument("--detector", default=None)
+    ap.add_argument("--pixel-layout", default=None)
+    ap.add_argument("--sim-properties", default=None)
     ap.add_argument("--edep-h5", default=None,
                     help="dumpTree.py edep-sim HDF5; use its real 'segments' per "
                          "event instead of the parametric shower generator")
@@ -1944,6 +1956,77 @@ def parse_args():
                     help="max pixels saved per waveform event (sampled across hit categories)")
     ap.add_argument("--outdir", default="tistudy")
     return ap.parse_args()
+
+
+def list_named_configs():
+    """Print the named configs from larndsim/config/config.yaml and the files each resolves to,
+    flagging the ones this study cannot load (see resolve_config)."""
+    from larndsim.config import list_config_keys, get_config
+    print("Named larnd-sim configs (larndsim/config/config.yaml):\n")
+    for name in sorted(list_config_keys()):
+        try:
+            cfg = get_config(name)
+        except Exception as exc:
+            print(f"  {name:26s}  <unreadable: {exc}>"); continue
+        multi = [k for k in ("PIXEL_LAYOUT", "RESPONSE")
+                 if isinstance(cfg.get(k), list) and len(cfg[k]) > 1]
+        tag = "  [MULTI-MODULE - not supported here]" if multi else ""
+        print(f"  {name:26s}{tag}")
+        for k in ("DET_PROPERTIES", "PIXEL_LAYOUT", "RESPONSE", "SIM_PROPERTIES"):
+            v = cfg.get(k)
+            v = v if not isinstance(v, list) else "[" + ", ".join(os.path.basename(str(x)) for x in v) + "]"
+            print(f"      {k:16s} {os.path.basename(str(v)) if '/' in str(v) else v}")
+    print("\n  MULTI-MODULE configs vary the pixel layout / response BETWEEN modules; this study\n"
+          "  loads a single consistent set, so use the '_no_modvar' variant instead.")
+
+
+def resolve_config(args):
+    """Fill --detector/--pixel-layout/--response/--sim-properties from the named --config,
+    leaving any explicitly-given flag untouched.
+
+    Using the registry (rather than hand-pairing files) matters here: the response table is
+    tied to the PIXEL PITCH, so e.g. pairing module0's response_44 (4.434 mm) with the FSD
+    cube's 3.72 mm layout would silently mis-model the very induction physics being measured.
+    The registry pairings are the ones simulate_pixels.py uses.
+
+    Multi-module configs (2x2, ndlar) list SEVERAL layouts/responses -- one per module -- which
+    tests/verify_diffusion.py:load_simulation cannot represent (it loads one of each). Those are
+    rejected with a pointer to the single-configuration variant."""
+    from larndsim.config import get_config, list_config_keys
+    try:
+        cfg = get_config(args.config)
+    except KeyError:
+        sys.exit(f"ERROR: unknown --config '{args.config}'.\n  available: "
+                 f"{', '.join(sorted(list_config_keys()))}\n  (--list-configs for details)")
+
+    def pick(key, flag):
+        v = cfg.get(key)
+        if isinstance(v, list):
+            if len(v) != 1:                       # genuine module-to-module variation
+                alt = [n for n in list_config_keys() if n.startswith(args.config)
+                       and "no_modvar" in n]
+                sys.exit(
+                    f"ERROR: config '{args.config}' varies {key} between modules "
+                    f"({len(v)} entries) and this study loads a single detector "
+                    f"configuration.\n  Use "
+                    f"{'--config ' + alt[0] if alt else 'a single-module config'} instead, "
+                    f"or pass {flag} explicitly.")
+            v = v[0]
+        return v
+
+    args.detector = args.detector or pick("DET_PROPERTIES", "--detector")
+    args.pixel_layout = args.pixel_layout or pick("PIXEL_LAYOUT", "--pixel-layout")
+    args.response = args.response or pick("RESPONSE", "--response")
+    args.sim_properties = args.sim_properties or pick("SIM_PROPERTIES", "--sim-properties")
+    for flag, val in (("--detector", args.detector), ("--pixel-layout", args.pixel_layout),
+                      ("--response", args.response), ("--sim-properties", args.sim_properties)):
+        if not val or not os.path.exists(val):
+            sys.exit(f"ERROR: {flag} resolved to a missing file: {val}")
+    print(f"Config '{args.config}':")
+    for k, v in (("detector", args.detector), ("pixel_layout", args.pixel_layout),
+                 ("response", args.response), ("sim_properties", args.sim_properties)):
+        print(f"  {k:15s} {v}")
+    return args
 
 
 def load_edep_events(path, max_events=None):
@@ -2414,6 +2497,8 @@ def main():
         import scipy  # noqa: F401
     except Exception:
         sys.exit("ERROR: scipy is required (pip install scipy).")
+    if args.list_configs:
+        list_named_configs(); return
     os.makedirs(args.outdir, exist_ok=True)
 
     if args.refit:
@@ -2431,6 +2516,7 @@ def main():
         if not cuda.is_available():
             sys.exit("ERROR: no CUDA GPU available. Run on a GPU node, or use "
                      "--refit <spectra.npz> to re-fit saved spectra without a GPU.")
+        resolve_config(args)          # named config -> the four consistent file paths
         ctx = vd.load_simulation(args)
         vd.print_config(ctx)
         # pristine response + induction mask for the induction knob
