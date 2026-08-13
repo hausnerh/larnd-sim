@@ -700,22 +700,30 @@ def fit_shower_plus_induction(q, threshold_e, template, qmax=None, n_shower=1, n
                     width=width, edges=edges, threshold_e=threshold_e, n_shower=int(n_shower))
     lg = Langaus(centres[0], centres[-1])
     mpv_L, eta_L, A_L = template["mpv_L"], template["eta_L"], template["A_L"]
+    # The high-Q tail's SHAPE is frozen too. Measured across the scans, the tail POSITION and
+    # WIDTH are induction-blind (mu_G moves 3.6%, sig_G 6.0% from induction x0 -> x1, vs 58%
+    # and 38% from threshold) because they are set by collection physics -- exactly what the
+    # induction-off template measures. Only the tail AMPLITUDE swings with induction (84%),
+    # since induction promotes tail pixels to multi-hit and removes them from the sample. So
+    # freeze (mu_G, sig_G) and float only A_G: 6 free parameters -> 4, which sharpens A_ind,
+    # the quantity the whole induction extraction rests on.
+    mu_G, sig_G = float(template["mu_G"]), float(template["sig_G"])
     frozen_c = lg.comp(centres, mpv_L, eta_L, noise_e, A_L)   # frozen shower langaus (per shower)
+    frozen_g = _gaussian(centres, mu_G, sig_G, 1.0)           # frozen tail SHAPE (unit area)
     T, span, cmax = threshold_e, centres[-1] - centres[0], centres[-1]
 
-    def model(x, mu, sig, aG, mpv_i, eta_i, aI):
-        return frozen_c + _gaussian(x, mu, sig, aG) + lg.comp(x, mpv_i, eta_i, noise_e, aI)
+    def model(x, aG, mpv_i, eta_i, aI):
+        return frozen_c + aG * frozen_g + lg.comp(x, mpv_i, eta_i, noise_e, aI)
 
     total = float(counts.sum() * width)
-    p0 = [min(max(template["mu_G"], 2.0 * T), cmax), max(template["sig_G"], width), 0.4 * total,
-          1.1 * T, 0.15 * T, 0.4 * total]
+    p0 = [0.4 * total, 1.1 * T, 0.15 * T, 0.4 * total]
     # Keep the induction langaus a NARROW turn-on spike near threshold (eta_i capped) so it
     # cannot broaden to absorb the frozen shower -- the separation comes from the shower being
     # fixed. (Floating the shower amplitude was tried and made it WORSE: the near-threshold
     # langaus overlap lets the fit pull A_L DOWN to feed the induction component, inflating
     # f_ind. The induction-off template amplitude is the best available anchor.)
-    lb = [2.0 * T, 0.05 * T, 0.0,    0.9 * T, 0.02 * T, 0.0]
-    ub = [cmax,    span,     np.inf, 2.0 * T, 0.30 * T, np.inf]
+    lb = [0.0,    0.9 * T, 0.02 * T, 0.0]
+    ub = [np.inf, 2.0 * T, 0.30 * T, np.inf]
     p0 = [min(max(v, lb[i] + 1e-9), ub[i] - 1e-9) for i, v in enumerate(p0)]
     sigma = (np.sqrt(raw) + 1.0) / max(n_shower, 1)    # per-shower Poisson errors
     try:
@@ -724,25 +732,24 @@ def fit_shower_plus_induction(q, threshold_e, template, qmax=None, n_shower=1, n
     except Exception as exc:
         return dict(ok=False, reason=str(exc), centres=centres, counts=counts,
                     width=width, edges=edges, threshold_e=threshold_e, n_shower=int(n_shower))
-    mu, sig, aG, mpv_i, eta_i, aI = popt
+    aG, mpv_i, eta_i, aI = popt
     pred = model(centres, *popt)
     ndf = max(len(centres) - len(popt), 1)
     chi2 = float(np.sum(((counts - pred) / sigma) ** 2))
     perr = np.sqrt(np.clip(np.diag(pcov), 0, np.inf))
     tot_shw = A_L + aG
     f_ind = float(aI / (aI + tot_shw)) if (aI + tot_shw) > 0 else np.nan
-    peak_mpv, peak_height, tail_height = peak_tail_observables(centres, counts, threshold_e)
+    shape = peak_tail_observables(centres, counts, threshold_e)
     return dict(
         ok=True, kind="template", centres=centres, counts=counts, width=width,
         edges=edges, threshold_e=threshold_e, noise_e=float(noise_e), pred=pred, lg=lg,
-        frozen=(mpv_L, eta_L, A_L), popt=popt, perr=perr, n_shower=int(n_shower),
-        mpv_ind=float(mpv_i), mpv_ind_err=float(perr[3]),
+        frozen=(mpv_L, eta_L, A_L, mu_G, sig_G), popt=popt, perr=perr, n_shower=int(n_shower),
+        mpv_ind=float(mpv_i), mpv_ind_err=float(perr[1]),
         mpv_shw=float(mpv_L), mpv_shw_err=0.0,        # frozen -> no fit error
-        mu_G=float(mu), sig_G=float(sig), A_G=float(aG),
-        eta_ind=float(eta_i),
+        mu_G=mu_G, sig_G=sig_G, A_G=float(aG), A_G_err=float(perr[0]),
+        eta_ind=float(eta_i), area_ind_err=float(perr[3]),
         area_ind=float(aI), area_shw=float(tot_shw), frac_ind=f_ind,
-        peak_mpv=peak_mpv, peak_height=peak_height, tail_height=tail_height,
-        chi2=chi2, ndf=ndf, chi2ndf=chi2 / ndf, n_single=int(raw.sum()))
+        chi2=chi2, ndf=ndf, chi2ndf=chi2 / ndf, n_single=int(raw.sum()), **shape)
 
 
 # ===========================================================================
@@ -888,19 +895,56 @@ def categorize(q, is_collection):
 
 
 def peak_tail_observables(centres, counts, threshold_e):
-    """Three DATA-BLIND handles read straight off the recorded-Q spectrum (no truth,
-    no fit): the low-Q peak position (MPV), its height, and the high-Q tail height.
-    Per the disentanglement idea: MPV tracks THRESHOLD; peak height responds to
-    INDUCTION (and reset); tail height responds to periodic RESET (and induction)."""
+    """DATA-BLIND handles read straight off the recorded-Q spectrum -- no truth, no fit, and
+    no knowledge of the true threshold. Returns a dict.
+
+    POSITIONS (in electrons) -- these track THRESHOLD:
+      peak_mpv    -- the near-threshold peak position (mode of the spectrum),
+      tail_peak   -- the high-Q tail/shoulder maximum, found fit-free by smoothing the
+                     spectrum above 2*peak_mpv and taking its argmax. This is the observable
+                     behind "threshold pushes the fat tail to higher Q". NB it is the maximum
+                     of the TOTAL spectrum there (the falling langaus tail plus the Gaussian),
+                     so it sits systematically BELOW the fit's deconvolved mu_G -- ~25% low on
+                     this sample. The two are strongly correlated (both rise ~70% over
+                     Q_thr = 4->6 ke-) but are not the same quantity; use tail_peak as the
+                     data-blind threshold tracker, mu_G as the template's tail centroid.
+      peak_height, tail_height -- amplitudes, kept for continuity.
+
+    SHAPE (dimensionless) -- measured in x = Q / peak_mpv, i.e. charge in units of the
+    MEASURED peak position. Rescaling by the peak divides out the threshold, which is what
+    makes these nearly threshold-INDEPENDENT and therefore able to isolate reset/induction:
+      tail_over_core -- N(x>2) / N(x<1.5), the tail-to-core weight ratio,
+      shoulder_frac  -- N(2.5<x<5) / N, the mid-tail shoulder that periodic reset builds up
+                        (reset moves weight out of the near-threshold peak into the tail
+                        without moving where the tail sits).
+    """
     counts = np.asarray(counts, float)
+    centres = np.asarray(centres, float)
+    nan = dict(peak_mpv=np.nan, peak_height=np.nan, tail_height=np.nan, tail_peak=np.nan,
+               tail_over_core=np.nan, shoulder_frac=np.nan)
     if counts.sum() <= 0:
-        return np.nan, np.nan, np.nan
+        return nan
     i = int(np.argmax(counts))
-    peak_mpv = float(centres[i])
-    peak_height = float(counts[i])
+    peak_mpv = float(centres[i]); peak_height = float(counts[i])
     tail = (centres > 2.5 * threshold_e) & (counts > 0)
     tail_height = float(np.median(counts[tail])) if tail.any() else 0.0
-    return peak_mpv, peak_height, tail_height
+
+    # fit-free tail-peak locator: smooth (3-bin) above 2*peak, take the maximum
+    hi = centres > 2.0 * peak_mpv
+    tail_peak = np.nan
+    if hi.sum() >= 3:
+        c = counts[hi]
+        sm = np.convolve(c, np.ones(3) / 3.0, mode="same")
+        tail_peak = float(centres[hi][int(np.argmax(sm))])
+
+    x = centres / max(peak_mpv, 1e-9)          # scale-free charge
+    n_tot = counts.sum()
+    n_core = counts[x < 1.5].sum()
+    tail_over_core = float(counts[x > 2.0].sum() / n_core) if n_core > 0 else np.nan
+    shoulder_frac = float(counts[(x > 2.5) & (x < 5.0)].sum() / n_tot)
+    return dict(peak_mpv=peak_mpv, peak_height=peak_height, tail_height=tail_height,
+                tail_peak=tail_peak, tail_over_core=tail_over_core,
+                shoulder_frac=shoulder_frac)
 
 
 # ===========================================================================
@@ -913,14 +957,34 @@ def reset_rate_khz(cycles, ts):
     return np.where(cycles > 0, 1.0e3 / (cycles * ts), 0.0)
 
 
-def aggregate_template_grid(ctx, evs_off, thresholds, resets, seed0):
-    """GPU: induction-OFF single-hit spectra over the full (threshold x reset) grid.
-    Cheap -- NO re-induction, only FEE re-runs on the cached pre-signals; reset changes
-    recompile the fee kernel so loop reset OUTER to share each recompile across thresholds.
-    Returns [(thr, cycles, q, tr), ...] (raw arrays; fit them later with fit_template_grid)."""
+def aggregate_template_grid(ctx, evs_off, thresholds, resets, seed0,
+                            base_thr=None, base_reset=None, mode="cross"):
+    """GPU: induction-OFF single-hit spectra over the (threshold x reset) template grid.
+    Cheap per node -- NO re-induction, only FEE re-runs on the cached pre-signals; reset
+    changes recompile the fee kernel so loop reset OUTER to share each recompile.
+
+    `mode` controls WHICH nodes are computed, and this is the dominant cost knob of the whole
+    study (|thr| x |reset| FEE passes over every event):
+
+      "cross" (default) -- only nodes on the cross through the base point: every threshold at
+            the base reset, plus every reset at the base threshold. This is EXACTLY the set the
+            scans request (the threshold scan asks for (thr_i, base_reset), the reset scan for
+            (base_thr, reset_j), the nominal/induction fits for the centre), so no fit loses
+            any accuracy. The interior nodes only ever served to over-constrain the diagnostic
+            closed-form fit. For a 4x6 grid this is 9 nodes instead of 24 -- a 2.7x saving on
+            the study's largest cost.
+      "full"  -- the whole Cartesian product, for a better-constrained closed-form fit.
+
+    Returns [(thr, cycles, q, tr, aux), ...]; fit them later with fit_template_grid."""
+    thr_arr, rst_arr = np.asarray(thresholds, float), np.asarray(resets, int)
+    bt = float(base_thr) if base_thr is not None else float(thr_arr[0])
+    br = int(base_reset) if base_reset is not None else int(rst_arr[0])
     out = []
-    for ir, rst in enumerate(np.asarray(resets, int)):    # reset OUTER -> one recompile per rate
-        for it, thr in enumerate(np.asarray(thresholds, float)):
+    for ir, rst in enumerate(rst_arr):                    # reset OUTER -> one recompile per rate
+        for it, thr in enumerate(thr_arr):
+            on_cross = (int(rst) == br) or (abs(float(thr) - bt) < 1e-6)
+            if mode == "cross" and not on_cross:
+                continue
             q, tr, aux = aggregate_singlehits(ctx, evs_off, float(thr), int(rst), 0.0,
                                               seed0=seed0 + ir * 1000 + it)
             out.append((float(thr), int(rst), q, tr, aux))
@@ -1097,15 +1161,30 @@ class TemplateParam:
                                              yerr=ev[m], forms=lib.get(k))
 
     def _interp(self, key, thr, rate):
-        """Bilinear interp of grid[key] over (rate, threshold), clamped at the edges."""
+        """Bilinear interp of grid[key] over (rate, threshold), clamped at the edges.
+
+        A 'cross' grid leaves the interior nodes NaN, so the four bilinear corners are not
+        guaranteed to exist. Weight only the finite corners and renormalise; if none is finite
+        (an off-cross request with no closed form), fall back to the nearest finite node."""
         g = self.grid[key]
         xi = float(np.interp(thr / 1e3, self.x, np.arange(self.x.size)))
         yi = float(np.interp(rate, self.rates, np.arange(self.rates.size)))
         x0, y0 = int(np.floor(xi)), int(np.floor(yi))
         x1, y1 = min(x0 + 1, self.x.size - 1), min(y0 + 1, self.rates.size - 1)
         fx, fy = xi - x0, yi - y0
-        return float((1 - fx) * (1 - fy) * g[y0, x0] + fx * (1 - fy) * g[y0, x1]
-                     + (1 - fx) * fy * g[y1, x0] + fx * fy * g[y1, x1])
+        corners = (((1 - fx) * (1 - fy), g[y0, x0]), (fx * (1 - fy), g[y0, x1]),
+                   ((1 - fx) * fy, g[y1, x0]), (fx * fy, g[y1, x1]))
+        num = sum(w * v for w, v in corners if np.isfinite(v) and w > 0)
+        den = sum(w for w, v in corners if np.isfinite(v) and w > 0)
+        if den > 0:
+            return float(num / den)
+        fin = np.isfinite(g)
+        if not fin.any():
+            return float("nan")
+        iy, ix = np.nonzero(fin)                       # nearest finite node in (rate, thr)
+        d = ((ix - xi) ** 2 + (iy - yi) ** 2)
+        j = int(np.argmin(d))
+        return float(g[iy[j], ix[j]])
 
     def value(self, key, thr, cycles):
         rate = float(reset_rate_khz(cycles, self.ts))
@@ -1179,9 +1258,9 @@ def _draw_charge_dist(ax, q, truth, fit, threshold_e, xlim=None,
         xs = np.linspace(fit["edges"][0], fit["edges"][-1], 700)
         lg = fit["lg"]
         ne = fit.get("noise_e", 500.0)
-        mpv_L, eta_L, A_L = fit["frozen"]
-        mu, sig, aG, mpv_i, eta_i, aI = fit["popt"]
-        shower = lg.comp(xs, mpv_L, eta_L, ne, A_L) + _gaussian(xs, mu, sig, aG)
+        mpv_L, eta_L, A_L, mu_G, sig_G = fit["frozen"]
+        aG, mpv_i, eta_i, aI = fit["popt"]
+        shower = lg.comp(xs, mpv_L, eta_L, ne, A_L) + _gaussian(xs, mu_G, sig_G, aG)
         induction = lg.comp(xs, mpv_i, eta_i, ne, aI)
         lw = 1.2 if compact else 1.6
         ax.plot(xs / 1e3, induction, color=_C_IND, ls="--", lw=lw)
@@ -1312,6 +1391,61 @@ def plot_scan(ctx, scan, knob_label, fname, outdir, knob_vals_disp=None, mpv_yli
         axp.text(0.018, 0.93, "(%s)" % chr(97 + k), transform=axp.transAxes,
                  fontsize=11, va="top", ha="left")
     fig.align_ylabels(axes)
+    fig.tight_layout()
+    _savefig(fig, f"{outdir}/{fname}")
+
+
+def plot_shape_collapse(scans, outdir, fname="ti_shape_collapse.png"):
+    """The disentangling money plot: every scan's spectra redrawn in the SCALE-FREE variable
+    x = Q / (measured peak position), area-normalised.
+
+    Rescaling charge by the measured peak divides the threshold out of the spectrum. So the
+    THRESHOLD panel should COLLAPSE -- its curves land on top of one another, showing that
+    threshold only sets the scale and not the shape -- while the RESET and INDUCTION panels
+    stay visibly separated, because those change the shape itself (reset moves weight out of
+    the near-threshold peak into a mid-tail shoulder; induction piles hits at x~1). That
+    separation is what lets the three effects be told apart from the spectrum alone.
+
+    `scans` is [(title, [(label, q, threshold_e), ...]), ...]."""
+    import matplotlib.pyplot as plt
+    scans = [(t, items) for t, items in scans if items]
+    if not scans:
+        return
+    n = len(scans)
+    fig, axes = plt.subplots(1, n, figsize=(5.0 * n, 4.3), squeeze=False)
+    cmap = plt.get_cmap("viridis")
+    # x-bin width must hold >= 1 ADC level for EVERY curve, else the LSB quantisation aliases
+    # differently per threshold (one LSB is 0.33 in x at Q_thr=4ke- but 0.16 at 6ke-) and the
+    # curves look ragged for a purely instrumental reason.
+    prepped = []
+    xw = 0.0
+    for title, items in scans:
+        cur = []
+        for lab, q, thr in items:
+            q = np.asarray(q, float); q = q[np.isfinite(q) & (q > 0)]
+            h = _hist(q, float(thr)) if q.size >= 20 else None
+            if h is None:
+                continue
+            c, raw, _w, _e = h
+            pk = float(c[int(np.argmax(raw))])            # fit-free peak position
+            lsb = _adc_lsb(q)
+            if pk > 0 and lsb > 0:
+                xw = max(xw, lsb / pk)
+            cur.append((lab, q / max(pk, 1e-9)))
+        prepped.append((title, cur))
+    xw = max(xw, 0.15)
+    xb = np.arange(0.0, 6.0 + xw, xw)
+    for ax, (title, items) in zip(axes.flat, prepped):
+        for j, (lab, xq) in enumerate(items):
+            col = cmap(0.12 + 0.76 * (j / max(len(items) - 1, 1)))
+            ax.hist(xq, bins=xb, histtype="step", lw=1.9, color=col,
+                    density=True, label=lab)
+        ax.axvline(1.0, color="0.45", ls=":", lw=1.2)
+        ax.set_xlabel(r"$x = Q\;/\;Q_{\mathrm{peak}}$   (charge in units of the measured peak)")
+        ax.set_xlim(0, 6)
+        ax.set_title(title, fontsize=11)
+        ax.legend(fontsize=8.5)
+    axes.flat[0].set_ylabel("normalised single-hit pixels")
     fig.tight_layout()
     _savefig(fig, f"{outdir}/{fname}")
 
@@ -1635,7 +1769,9 @@ def plot_hit_timing(q, tr, aux, threshold_e, outdir, n_shower=1, n_mad=3.0,
 # fit-dict keys copied into every scan's output arrays (composite template fit)
 _SCAN_FIT_KEYS = ("mpv_ind", "mpv_ind_err", "mpv_shw", "mpv_shw_err", "frac_ind",
                   "chi2ndf", "n_single", "peak_mpv", "peak_height", "tail_height",
-                  "area_ind", "mu_G", "sig_G", "A_G")
+                  "area_ind", "area_ind_err", "mu_G", "sig_G", "A_G", "A_G_err",
+                  # scale-free / fit-free shape handles (see peak_tail_observables)
+                  "tail_peak", "tail_over_core", "shoulder_frac")
 
 
 def _record_fit(out, fit, n_events):
@@ -1698,28 +1834,41 @@ def fit_scan(items, n_events, n_shower, qmax, noise_e):
     return {k: np.asarray(v, float) for k, v in out.items()}, fits
 
 
-def sensitivity_row(scan, observables_keys):
-    """End-to-end |frac. obs. change / frac. knob change| for one scan."""
-    knob = scan["knob"]
-    kvals = knob.copy()
-    # map "off" reset (-1) to a large finite period so the fractional change is defined
-    kvals = np.where(kvals < 0, np.nan, kvals)
-    finite = np.isfinite(kvals)
-    if finite.sum() >= 2:
-        k0, k1 = np.nanmin(kvals[finite]), np.nanmax(kvals[finite])
-    else:
-        k0, k1 = knob[0], knob[-1]
+def sensitivity_row(scan, observables_keys, knob_axis=None, return_raw=False):
+    """End-to-end |frac. obs. change| / |frac. knob change| for one scan.
+
+    `knob_axis` overrides the knob values used for the normalisation -- pass the reset RATE
+    (kHz) rather than the raw PERIODIC_RESET_CYCLES, so the reset row is normalised on the
+    physical quantity being varied.
+
+    Two things this gets right that the naive version did not:
+      * dy and dk are taken at the SAME two points. Endpoints are chosen after sorting by the
+        knob, so a scan listed out of order (the reset scan is [-1, 400, 200, ...]) no longer
+        measures dy between one pair of points and dk between a different pair.
+      * "off" entries (reset < 0, mapped to rate 0) are dropped from BOTH dy and dk. Keeping
+        them makes the fractional knob change ~2 by construction, which silently divides the
+        reset sensitivity by ~5 relative to the other knobs and hides a real response.
+    Returns the sensitivity row, or (row, raw_relative_change) when `return_raw`."""
+    knob = np.asarray(scan["knob"], float)
+    kax = np.asarray(knob_axis, float) if knob_axis is not None else knob
+    use = np.isfinite(kax) & (kax > 0) & np.isfinite(knob)     # drop "off"/non-physical
+    if use.sum() < 2:                                          # fall back to whatever exists
+        use = np.isfinite(kax)
+    order = np.argsort(kax[use])
+    idx = np.nonzero(use)[0][order]                            # scan indices, knob-sorted
+    k0, k1 = kax[idx[0]], kax[idx[-1]]
     dk = abs(k1 - k0) / (abs(0.5 * (k1 + k0)) + 1e-9)
-    row = []
+    row, raw = [], []
     for key in observables_keys:
-        y = scan[key]
+        y = np.asarray(scan[key], float)[idx]
         good = np.isfinite(y)
         if good.sum() < 2:
-            row.append(np.nan); continue
-        y0, y1 = y[good][0], y[good][-1]
+            row.append(np.nan); raw.append(np.nan); continue
+        y0, y1 = y[good][0], y[good][-1]                       # same endpoints as dk
         dy = abs(y1 - y0) / (abs(0.5 * (y1 + y0)) + 1e-9)
         row.append(dy / dk if dk > 0 else np.nan)
-    return row
+        raw.append(100.0 * (y1 - y0) / (abs(y0) + 1e-9))       # signed % change, un-normalised
+    return (row, raw) if return_raw else row
 
 
 # ===========================================================================
@@ -1762,6 +1911,12 @@ def parse_args():
                     help="PERIODIC_RESET_CYCLES (-1 = off)")
     ap.add_argument("--inductions", type=float, nargs="+",
                     default=[0.0, 0.5, 1.0, 1.5, 2.0, 3.0], help="response scale")
+    ap.add_argument("--template-grid", choices=["cross", "full"], default="cross",
+                    help="which induction-off template nodes to compute. 'cross' (default) does "
+                         "every threshold at the base reset + every reset at the base threshold "
+                         "-- exactly the nodes the scans request, and the study's biggest cost "
+                         "saving (9 vs 24 nodes for a 4x6 grid). 'full' does the whole product, "
+                         "which only better-constrains the diagnostic closed-form fit.")
     ap.add_argument("--induction-events", type=int, default=60,
                     help="events for the EXPENSIVE induction scan (it re-runs the pre-FEE "
                          "induction stage per scale). Subsamples the first N of --n-events "
@@ -1993,8 +2148,13 @@ def produce_spectra(ctx, args):
 
     thr_grid = sorted(set(float(t) for t in args.thresholds) | {base_thr})
     rst_grid = sorted(set(int(r) for r in args.resets) | {int(base_reset)})
-    print(f"Aggregating induction-off template grid ({len(thr_grid)}x{len(rst_grid)})...")
-    grid_spectra = aggregate_template_grid(ctx, evs_off, thr_grid, rst_grid, seed0=args.seed + 6000)
+    n_nodes = (len(thr_grid) * len(rst_grid) if args.template_grid == "full"
+               else len(thr_grid) + len(rst_grid) - 1)
+    print(f"Aggregating induction-off template grid ({len(thr_grid)}x{len(rst_grid)}, "
+          f"{args.template_grid} -> {n_nodes} nodes)...")
+    grid_spectra = aggregate_template_grid(ctx, evs_off, thr_grid, rst_grid,
+                                           seed0=args.seed + 6000, base_thr=base_thr,
+                                           base_reset=base_reset, mode=args.template_grid)
 
     print("Aggregating threshold + reset scans...")
     thr_items = aggregate_fixed_scan(ctx, evs, args.thresholds,
@@ -2193,18 +2353,34 @@ def analyze_spectra(spectra, outdir):
                             "ti_dist_induction.png", outdir, xlim=xlim, thr_sigma=thr_sigma)
 
     print("\n=== Sensitivity matrix ===")
-    obs_keys = ["peak_mpv", "peak_height", "tail_height"]
-    obs_lbl = ["Peak MPV", "Peak height", "Tail height"]
-    matrix = [sensitivity_row(thr_scan, obs_keys),
-              sensitivity_row(rst_scan, obs_keys),
-              sensitivity_row(ind_scan, obs_keys)]
+    plot_shape_collapse([
+        ("Threshold  (should COLLAPSE)",
+         [(r"$Q_{thr}=%.0f$" % v, q, float(v)) for (v, q, tr, _a) in spectra["threshold"]]),
+        ("Periodic reset",
+         [("off" if v <= 0 else "%.0f kHz" % reset_rate_khz(v, ts), q, base_thr)
+          for (v, q, tr, _a) in spectra["reset"]]),
+        ("Induction response",
+         [(r"$\times%.1f$" % v, q, base_thr) for (v, q, tr, _a) in spectra["induction"]]),
+    ], outdir)
+
+    # POSITIONS track the threshold; the SCALE-FREE shape ratios (charge measured in units of
+    # the peak position) have the threshold divided out, so they isolate reset/induction.
+    obs_keys = ["peak_mpv", "tail_peak", "tail_over_core", "shoulder_frac"]
+    obs_lbl = ["Peak position", "Tail peak", "Tail/core (x)", "Shoulder frac (x)"]
+    rows = [sensitivity_row(thr_scan, obs_keys, return_raw=True),
+            sensitivity_row(rst_scan, obs_keys, knob_axis=reset_rate, return_raw=True),
+            sensitivity_row(ind_scan, obs_keys, return_raw=True)]
+    matrix = [r[0] for r in rows]; raws = [r[1] for r in rows]
     knobs = ["Threshold", "Periodic reset", "Induction"]
     plot_sensitivity(matrix, knobs, obs_lbl, outdir)
-    print("  sensitivity |frac obs / frac knob| (rows=knobs, cols=observables):")
-    print("            " + "  ".join(f"{l:>13}" for l in obs_lbl))
-    for kn, row in zip(knobs, matrix):
-        print(f"  {kn:>13} " + "  ".join(f"{v:13.2f}" if np.isfinite(v) else f"{'--':>13}"
-                                         for v in row))
+    print("  sensitivity |frac obs / frac knob|  (rows=knobs, cols=observables;")
+    print("  reset normalised on RATE with 'off' excluded; raw % change in parentheses):")
+    print("                 " + "  ".join(f"{l:>19}" for l in obs_lbl))
+    for kn, row, raw in zip(knobs, matrix, raws):
+        cells = []
+        for v, r in zip(row, raw):
+            cells.append(f"{v:7.2f} ({r:+6.0f}%)" if np.isfinite(v) else f"{'--':>19}")
+        print(f"  {kn:>13}  " + "  ".join(f"{c:>19}" for c in cells))
 
     closed_form = {k: dict(name=tparam.forms[k]["name"], r2=tparam.forms[k]["r2"],
                            params=tparam.forms[k]["params"])
