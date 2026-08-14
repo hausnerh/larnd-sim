@@ -84,7 +84,7 @@ def main():
     if args.reset is not None:
         base_reset = int(args.reset)
     noise_e = (float(args.noise_e) if args.noise_e is not None
-               else float(np.atleast_1d(getattr(ctx.detector, "UNCORRELATED_NOISE", 500.0)).ravel()[0]))
+               else float(np.atleast_1d(getattr(ctx.detector, "UNCORRELATED_NOISE_CHARGE", 500.0)).ravel()[0]))
     det = ctx.detector
     x0, x1, y0, y1 = vd.active_volume(det, 0, margin=3.0)
     print(f"\nMuon quick-check: config={args.config}  threshold={base_thr:.0f} e-  "

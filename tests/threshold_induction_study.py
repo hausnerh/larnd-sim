@@ -1152,10 +1152,19 @@ class TemplateParam:
                                   float)[order] for k in self.PARAMS}
         self.x = self.thr / 1e3
         xx, rr = np.meshgrid(self.x, self.rates)      # (n_rate, n_thr), aligns with grid[k]
-        # Drop nodes whose template fit was poor (chi2/ndf > chi2_cut) before fitting the
-        # closed form -- a single bad node otherwise drags a clean law's R^2 right down.
+        # Drop nodes whose template fit is poor *relative to the rest of the grid* before
+        # fitting the closed form -- a single bad node otherwise drags a clean law's R^2 down.
+        # The cut must be RELATIVE: chi2/ndf grows with shower statistics for a fixed model
+        # mismatch, so an absolute cut tuned at N=200 rejects every node at N=1000 (which
+        # silently killed the whole parametrization -- forms={} -> bilinear fallback). Compare
+        # each node to the grid's own median instead, keeping `chi2_cut` only as a floor so a
+        # uniformly excellent grid can still reject a genuine outlier.
         chi2 = np.asarray(grid.get("chi2ndf", np.zeros_like(self.grid["mpv_L"])), float)[order]
-        node_ok = np.isfinite(chi2) & (chi2 <= chi2_cut)
+        fin = np.isfinite(chi2)
+        lim = max(float(chi2_cut), 2.0 * float(np.median(chi2[fin]))) if fin.any() else np.inf
+        node_ok = fin & (chi2 <= lim)
+        if node_ok.sum() < 3 and fin.sum() >= 3:       # never leave the fit with nothing
+            node_ok = fin
         lib = _cf_library()
         self.forms = {}
         for k in self.PARAMS:
@@ -1898,6 +1907,13 @@ def parse_args():
     ap.add_argument("--edep-h5", default=None,
                     help="dumpTree.py edep-sim HDF5; use its real 'segments' per "
                          "event instead of the parametric shower generator")
+    ap.add_argument("--recenter-showers", action="store_true",
+                    help="rigidly translate each --edep-h5 event into THIS config's active "
+                         "volume (random transverse position + drift depth). Required to "
+                         "re-use a shower file across detector geometries, since edep "
+                         "coordinates are tied to the GDML they were generated in. Raw dE/dEdx "
+                         "is untouched, so recombination/drift/response are still applied per "
+                         "config -- i.e. the same showers read out by a different detector.")
     ap.add_argument("--n-events", type=int, default=30, help="shower events per config")
     ap.add_argument("--shower-energy", type=float, default=300.0, help="MeV")
     ap.add_argument("--n-dep", type=int, default=400, help="deposits per shower")
@@ -1941,7 +1957,7 @@ def parse_args():
                     help="(deprecated; ignored -- the 3-way pre-trigger split was removed)")
     ap.add_argument("--noise-e", type=float, default=None,
                     help="fixed Gaussian smear (e-) for the langaus peaks; default = the "
-                         "detector UNCORRELATED_NOISE (the recorded-Q electronics noise)")
+                         "detector UNCORRELATED_NOISE_CHARGE (the recorded-Q electronics noise)")
     ap.add_argument("--refit", default=None,
                     help="skip the GPU sim: load a saved spectra .npz (from --spectra-out) "
                          "and re-run ONLY the fitting + plotting. Runs anywhere (no GPU), so "
@@ -2053,6 +2069,76 @@ def load_edep_events(path, max_events=None):
             tr[name] = rows[name]
         events.append(tr)
     return events
+
+
+_POS_FIELDS = (("x", "x_start", "x_end"), ("y", "y_start", "y_end"), ("z", "z_start", "z_end"))
+
+
+def events_out_of_volume(events, ctx, plane=0, margin=3.0):
+    """Fraction of deposits that fall outside `plane`'s active volume (0.0 = all inside).
+
+    Used to catch the silent failure mode where an edep file generated in one detector's
+    GDML is handed to a different --config: nothing errors, the events simply drift through
+    the wrong volume and the sample comes out empty or clipped.
+    """
+    det = ctx.detector
+    x0, x1, y0, y1 = vd.active_volume(det, plane, margin=margin)
+    dmax = abs(det.DRIFT_LENGTH) - margin
+    z_anode, _, into = vd.plane_z(det, plane)
+    n_out = n_tot = 0
+    for tr in events:
+        x, y, z = (np.asarray(tr[c], float) for c in ("x", "y", "z"))
+        depth = (z - z_anode) * into
+        bad = (x < x0) | (x > x1) | (y < y0) | (y > y1) | (depth < 0.0) | (depth > dmax)
+        n_out += int(bad.sum()); n_tot += bad.size
+    return (n_out / n_tot) if n_tot else 0.0
+
+
+def recenter_events(events, ctx, rng, plane=0, margin=3.0):
+    """Rigidly translate each edep event so it lands inside THIS detector's active volume.
+
+    `load_edep_events` copies segment coordinates verbatim, so a shower file is tied to the
+    GDML frame it was generated in (module0 sits at tpc_offsets [0,-21.82,0] with a 4.434 mm
+    pitch; fsd_cube at [0,0,0] with 3.72 mm). Re-using it under another --config otherwise
+    drifts the showers through the wrong volume.
+
+    A rigid translation is sufficient AND sufficient-only: edep segments carry RAW energy
+    deposition (dE, dEdx) in LAr, and every detector-specific stage -- recombination at the
+    configured E field, v_drift, lifetime attenuation, diffusion, pixel response -- is applied
+    downstream by `quench_and_drift`. So the same shower sample read out by two geometries is a
+    controlled comparison: the deposits are identical, only the readout differs.
+
+    Shower structure and orientation relative to the drift axis are preserved; each event is
+    dropped at a random transverse position and drift depth (as `build_shower_event` does).
+    The target is drawn inset by the event's own half-extent so the shower fits when it can;
+    an event larger than the volume is centred instead (and will be clipped by the drift).
+    """
+    det = ctx.detector
+    x0, x1, y0, y1 = vd.active_volume(det, plane, margin=margin)
+    dmax = abs(det.DRIFT_LENGTH) - margin
+    z_anode, _, into = vd.plane_z(det, plane)
+    lo = {"x": x0, "y": y0, "z": 0.5}
+    hi = {"x": x1, "y": y1, "z": dmax}
+    out = []
+    for tr in events:
+        tr = tr.copy()
+        w = np.maximum(np.asarray(tr["dE"], float), 1e-12)
+        cen, half = {}, {}
+        for ax, (c, s, e) in zip("xyz", _POS_FIELDS):
+            span = np.concatenate([tr[c], tr[s], tr[e]]).astype(float)
+            cen[ax] = float(np.average(np.asarray(tr[c], float), weights=w))
+            half[ax] = 0.5 * float(span.max() - span.min())
+        delta = {}
+        for ax in "xyz":
+            a, b = lo[ax] + half[ax], hi[ax] - half[ax]
+            t = float(rng.uniform(a, b)) if b > a else 0.5 * (lo[ax] + hi[ax])
+            # z is chosen as a DRIFT DEPTH, then mapped back to a raw z coordinate.
+            delta[ax] = (z_anode + into * t - cen["z"]) if ax == "z" else t - cen[ax]
+        for ax, fields in zip("xyz", _POS_FIELDS):
+            for f in fields:
+                tr[f] = tr[f] + delta[ax]
+        out.append(tr)
+    return out
 
 
 def base_config(ctx, args):
@@ -2188,7 +2274,7 @@ def produce_spectra(ctx, args):
     ts = float(ctx.detector.TIME_SAMPLING)
     thr_sigma = float(np.atleast_1d(ctx.detector.DISCRIMINATOR_NOISE).ravel()[0])
     noise_e = (float(args.noise_e) if args.noise_e is not None
-               else float(np.atleast_1d(getattr(ctx.detector, "UNCORRELATED_NOISE", 500.0)).ravel()[0]))
+               else float(np.atleast_1d(getattr(ctx.detector, "UNCORRELATED_NOISE_CHARGE", 500.0)).ravel()[0]))
     reset_state = "off" if base_reset <= 0 else f"{base_reset} cycles"
     print(f"\nBase operating point: threshold={base_thr:.0f} e-, periodic_reset={reset_state}, "
           f"induction=1.0;  langaus noise sigma={noise_e:.0f} e-")
@@ -2199,6 +2285,18 @@ def produce_spectra(ctx, args):
         raw_events = load_edep_events(args.edep_h5, args.n_events)
         print(f"  loaded {len(raw_events)} events "
               f"({sum(len(e) for e in raw_events)} segments total)")
+        f_out = events_out_of_volume(raw_events, ctx)
+        if args.recenter_showers:
+            raw_events = recenter_events(raw_events, ctx, rng)
+            print(f"  re-centred into this config's active volume "
+                  f"({100 * f_out:.1f}% of deposits were outside it before)")
+        elif f_out > 0.01:
+            print(f"  *** WARNING: {100 * f_out:.1f}% of deposits fall OUTSIDE "
+                  f"{args.config}'s active volume.\n"
+                  f"  *** This edep file was almost certainly generated in a different "
+                  f"detector geometry.\n"
+                  f"  *** Pass --recenter-showers to place them in this one, or omit "
+                  f"--edep-h5 to use parametric showers.")
     else:
         print(f"\nGenerating {args.n_events} parametric shower events "
               f"(E={args.shower_energy:.0f} MeV, {args.n_dep} deposits each)...")
