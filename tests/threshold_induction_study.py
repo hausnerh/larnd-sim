@@ -1660,6 +1660,91 @@ def plot_shape_collapse(scans, outdir, fname="ti_shape_collapse.png"):
     _savefig(fig, f"{outdir}/{fname}")
 
 
+def plot_sample_knob_response(entries, knob_label, fname, outdir, xlog=False,
+                              base_x=None, title=None, xfn=None):
+    """Per-topology knob response: does lowering this knob buy INDUCTION hits?
+
+    One column per control sample (shower + each muon angle), two rows:
+      (a) single-hit pixels per event -- induction ON, induction OFF, and the
+          pure-induction subset of ON (pixels where no charge landed, from the spatial
+          backtrack). The ON/OFF gap is the hit count that exists only because of induced
+          current on neighbouring pads.
+      (b) the induction fraction of the ON sample, N(no charge landed)/N.
+
+    The question this exists to answer: fsd_cube records ZERO induction-triggered single
+    hits at its nominal 5 ke- threshold, because DISCRIMINATOR_NOISE is ~13x quieter than
+    module0's and the marginal crossings module0 gets for free never happen. Whether a
+    lower threshold recovers them is not something the shower scans can say -- showers and
+    muons expose completely different neighbour geometries -- so it has to be scanned on
+    the topology that isolates induction.
+
+    `entries` is [(label, xs, n_on, n_off, n_ind, n_ev), ...] with counts, not rates, and
+    `xs` in RAW knob units; `xfn` maps them to the plotted axis (e- -> ke-, reset cycles ->
+    kHz) so the console table can keep reporting the knob as it was actually set."""
+    import matplotlib.pyplot as plt
+    entries = [e for e in entries if np.size(e[1]) and np.isfinite(np.asarray(e[1], float)).any()]
+    if not entries:
+        return
+    ncol = len(entries)
+    fig, axes = plt.subplots(2, ncol, figsize=(3.9 * ncol, 5.8), squeeze=False, sharex="col")
+    ekw = dict(ms=6.0, mfc="white", mew=1.5, capsize=3, elinewidth=1.1, ls="none")
+    for j, (lab, xs, n_on, n_off, n_ind, n_ev) in enumerate(entries):
+        x = np.asarray(xs, float)
+        o = np.argsort(x)
+        x = x[o]
+        if xfn is not None:
+            x = np.asarray([xfn(v) for v in x], float)
+        ne = max(float(n_ev), 1.0)
+        on = np.asarray(n_on, float)[o] / ne
+        offv = np.asarray(n_off, float)[o] / ne
+        ind = np.asarray(n_ind, float)[o] / ne
+        a, b = axes[0, j], axes[1, j]
+        a.errorbar(x, on, fmt="o", color=_C_SHW, label="induction ON", **ekw)
+        a.errorbar(x, offv, fmt="s", color=_C_SUM, label="induction OFF", **ekw)
+        a.errorbar(x, ind, fmt="^", color=_C_IND, label="pure induction (ON)", **ekw)
+        a.set_yscale("log")
+        a.set_title(lab, fontsize=10.5)
+        with np.errstate(invalid="ignore", divide="ignore"):
+            frac = np.where(on > 0, ind / on, np.nan)
+        b.errorbar(x, frac, fmt="^", color=_C_IND, **ekw)
+        top = np.nanmax(frac) if np.isfinite(frac).any() else 0.0
+        b.set_ylim(0.0, max(1.25 * float(top), 0.02))
+        b.set_xlabel(knob_label)
+        for ax in (a, b):
+            if xlog:
+                ax.set_xscale("log")
+            if base_x is not None:
+                ax.axvline(base_x, color="0.55", ls=":", lw=1.1)
+            ax.grid(alpha=0.25, lw=0.6)
+        if j == 0:
+            a.set_ylabel("Single-hit pixels / event")
+            b.set_ylabel("Induction fraction of single hits")
+    axes[0, 0].legend(fontsize=8.5, loc="best")
+    for r in range(2):
+        axes[r, 0].text(0.02, 0.94, "(%s)" % chr(97 + r), transform=axes[r, 0].transAxes,
+                        fontsize=11, va="top", ha="left")
+    fig.suptitle(title or "Induction yield vs %s, by topology" % knob_label, fontsize=12)
+    fig.tight_layout()
+    _savefig(fig, f"{outdir}/{fname}")
+
+
+def _sample_scan_counts(scan):
+    """(vals, n_on, n_off, n_ind) from an aggregate_sample_scan result.
+
+    n_ind counts ON-sample pixels flagged pure-induction by the spatial backtrack (no charge
+    landed on the pad), which is the direct truth-level answer -- not an ON-minus-OFF
+    subtraction, which mixes in pixels that merely changed multiplicity."""
+    vals, n_on, n_off, n_ind = [], [], [], []
+    for (v, q_on, tr_on, q_off, _tr_off, _n2on, _n2off) in scan:
+        tr_on = np.asarray(tr_on, bool)
+        vals.append(float(v))
+        n_on.append(int(np.size(q_on)))
+        n_off.append(int(np.size(q_off)))
+        n_ind.append(int((~tr_on).sum()) if tr_on.size else 0)
+    return (np.asarray(vals, float), np.asarray(n_on, float),
+            np.asarray(n_off, float), np.asarray(n_ind, float))
+
+
 def plot_sensitivity(matrix, knobs, observables, outdir):
     """The money plot: |fractional response| of each observable to each knob.
 
@@ -2015,6 +2100,34 @@ def aggregate_fixed_scan(ctx, evs, knob_vals, set_fn, seed0):
     return out, out2
 
 
+def aggregate_sample_scan(ctx, evs_on, evs_off, knob_vals, set_fn, seed0):
+    """FEE-only knob scan on ONE control sample, with induction ON and OFF at every point.
+
+    The on/off pair at each knob value is a cheap two-point induction axis: the EXCESS of ON
+    over OFF is the hit count that exists only because of induced current on neighbouring
+    pads, and the spatial-truth flag splits the ON sample into collection vs pure-induction
+    pixels. Together they answer the operational question directly -- how far the threshold
+    has to drop before induction produces single-hit pixels at all, which in fsd_cube it
+    does not do at the nominal 5 ke- (DISCRIMINATOR_NOISE is 13x quieter than module0, so
+    the marginal crossings module0 gets for free never happen).
+
+    Both pre-signal caches already exist, so this costs FEE passes only -- no re-induction,
+    which is what makes scanning a muon sample affordable at all.
+
+    Returns [(val, q_on, tr_on, q_off, tr_off, n2_on, n2_off), ...]; the two-hit populations
+    are kept as COUNTS only (the migration fraction needs no more than that, and full muon
+    spectra at every knob value would dominate the spectra file).
+    """
+    out = []
+    for j, val in enumerate(knob_vals):
+        thr, rst = set_fn(val)
+        pon = aggregate_hits(ctx, evs_on, thr, rst, 1.0, seed0=seed0 + j * 1000)
+        pof = aggregate_hits(ctx, evs_off, thr, rst, 0.0, seed0=seed0 + j * 1000 + 500)
+        out.append((float(val), pon[1][0], pon[1][1], pof[1][0], pof[1][1],
+                    int(np.size(pon[2][0])), int(np.size(pof[2][0]))))
+    return out
+
+
 def aggregate_induction_scan(ctx, drift_cache, scales, base_threshold, base_reset,
                              seed0, evs_off=None, collect_frac=0.15):
     """GPU: induction-scan spectra -- re-INDUCE (only) the pre-FEE current at each response
@@ -2136,6 +2249,17 @@ def parse_args():
                     help="events per muon sample (a MIP track lights up ~40 pixels, so a few "
                          "hundred is plenty). Capped at --n-events.")
     ap.add_argument("--muon-length", type=float, default=20.0, help="muon track length (cm)")
+    ap.add_argument("--muon-scan-events", type=int, default=100,
+                    help="events per muon sample used for the THRESHOLD/RESET scans "
+                         "(0 disables them). Separate from --muon-events because the scans "
+                         "cost 2x|knob values| extra FEE passes per angle: they reuse the "
+                         "cached pre-signals, so no re-induction, but a muon lights far more "
+                         "pixels per event than a shower does.")
+    ap.add_argument("--muon-thresholds", type=float, nargs="*", default=None,
+                    help="thresholds (e-) for the muon scan; defaults to --thresholds. Set "
+                         "this LOWER than the shower scan to find where induction starts "
+                         "producing single-hit pixels -- in fsd_cube nothing induction-"
+                         "triggered survives the nominal 5 ke- cut.")
     ap.add_argument("--collect-frac", type=float, default=0.15,
                     help="a (segment,pad) counts as collection if its net charge > this "
                          "fraction of that segment's peak-collecting pad (backtrack truth "
@@ -2422,6 +2546,20 @@ def save_spectra(spectra, path):
             kw[f"samp_{name}_{which}_tr"] = np.asarray(tr, bool)
             for k in _AUX_KEYS:
                 kw[f"samp_{name}_{which}_aux_{k}"] = np.asarray(aux.get(k, []), float)
+        # per-sample knob scans (induction on/off at every point); aux is deliberately not
+        # stored -- the causal diagnostics only run at the base point.
+        kw[f"samp_{name}_n_scan"] = np.asarray(int(s.get("n_scan", 0)))
+        for knob in ("threshold", "reset"):
+            sc = s.get("scan_" + knob)
+            if not sc:
+                continue
+            pre = f"samp_{name}_scan_{knob}"
+            kw[pre + "_vals"] = np.asarray([r[0] for r in sc], float)
+            kw[pre + "_q_on"] = _obj_array([r[1] for r in sc])
+            kw[pre + "_tr_on"] = _obj_array([r[2] for r in sc])
+            kw[pre + "_q_off"] = _obj_array([r[3] for r in sc])
+            kw[pre + "_tr_off"] = _obj_array([r[4] for r in sc])
+            kw[pre + "_n2"] = np.asarray([[r[5], r[6]] for r in sc], float)
     np.savez(path, **kw)
 
 
@@ -2499,6 +2637,19 @@ def load_spectra(path):
                     s[which] = (np.asarray(d[qk], float), np.asarray(d[f"samp_{name}_{which}_tr"], bool), aux)
                 else:
                     s[which] = None
+            s["n_scan"] = int(d[f"samp_{name}_n_scan"]) if f"samp_{name}_n_scan" in d.files else 0
+            for knob in ("threshold", "reset"):
+                pre = f"samp_{name}_scan_{knob}"
+                if pre + "_vals" not in d.files:
+                    s["scan_" + knob] = []
+                    continue
+                v, n2 = d[pre + "_vals"], d[pre + "_n2"]
+                s["scan_" + knob] = [
+                    (float(v[i]), np.asarray(d[pre + "_q_on"][i], float),
+                     np.asarray(d[pre + "_tr_on"][i], bool),
+                     np.asarray(d[pre + "_q_off"][i], float),
+                     np.asarray(d[pre + "_tr_off"][i], bool),
+                     int(n2[i][0]), int(n2[i][1])) for i in range(len(v))]
             samples[name] = s
     spectra["samples"] = samples
     return spectra
@@ -2623,6 +2774,23 @@ def produce_spectra(ctx, args):
         off = aggregate_singlehits(ctx, mu_off, base_thr, base_reset, 0.0, seed0=sd + 600)
         samples[name] = dict(kind="muon", theta=float(theta), n=len(mu_drift),
                              nominal=nom, off=off)
+        # Knob scans on THIS topology. The shower scans above cannot answer "does a lower
+        # threshold buy induction hits" for a muon: showers and muons expose completely
+        # different neighbour geometries (a compact core vs a long pillar), and it is the
+        # muon that isolates induction cleanly.
+        ns = min(int(args.muon_scan_events), len(mu_evs), len(mu_off))
+        if ns > 0:
+            mu_thr = list(args.muon_thresholds) if args.muon_thresholds else list(args.thresholds)
+            print(f"  scanning threshold ({len(mu_thr)} pts) + reset ({len(args.resets)} pts) "
+                  f"on {ns} events, induction on/off...")
+            samples[name]["n_scan"] = ns
+            samples[name]["scan_threshold"] = aggregate_sample_scan(
+                ctx, mu_evs[:ns], mu_off[:ns], mu_thr,
+                lambda v: (float(v), base_reset), seed0=sd + 2000)
+            samples[name]["scan_reset"] = aggregate_sample_scan(
+                ctx, mu_evs[:ns], mu_off[:ns], args.resets,
+                lambda v: (base_thr, int(v)), seed0=sd + 4000)
+            set_periodic_reset(ctx, base_reset)
         waveforms += capture_waveforms(ctx, mu_evs, base_thr, base_reset, sd + 900, name,
                                        args.wf_events, args.wf_max_pix)
     set_induction(ctx, 1.0); set_periodic_reset(ctx, base_reset)
@@ -2748,6 +2916,75 @@ def analyze_spectra(spectra, outdir):
                     else:
                         print("  %-11s near-pure induction (%d charged pads): relabelling skipped"
                               % (name, n_sp))
+
+    # --- INDUCTION YIELD vs KNOB, per topology --------------------------------------------
+    # The shower side costs nothing extra: its induction-OFF counterpart at every scan point
+    # is already in the template grid, which was built over exactly these (threshold, reset)
+    # points. The muon side comes from aggregate_sample_scan.
+    def shower_scan(knob):
+        grid = spectra.get("grid") or []
+        if knob == "threshold":
+            offmap = {float(t): (q, tr) for (t, r, q, tr, _a) in grid if int(r) == base_reset}
+            items = spectra.get("threshold") or []
+        else:
+            offmap = {float(r): (q, tr) for (t, r, q, tr, _a) in grid
+                      if abs(float(t) - base_thr) < 1e-6}
+            items = spectra.get("reset") or []
+        out = []
+        for (v, q, tr, _a) in items:
+            qo, tro = offmap.get(float(v), (np.empty(0), np.empty(0, bool)))
+            out.append((float(v), q, tr, qo, tro, 0, 0))
+        return out
+
+    def _entry(label, scan, n_ev):
+        v, non, noff, nind = _sample_scan_counts(scan)
+        return (label, v, non, noff, nind, n_ev)
+
+    thr_entries, rst_entries = [], []
+    if spectra.get("grid"):
+        thr_entries.append(_entry("shower", shower_scan("threshold"), n_main))
+        rst_entries.append(_entry("shower", shower_scan("reset"), n_main))
+    for _nm, _sm in samples.items():
+        if _nm == "shower":
+            continue
+        _ns = int(_sm.get("n_scan", 0)) or int(_sm.get("n", 1))
+        _lab = "%s (%.0f deg)" % (_nm, _sm.get("theta", np.nan))
+        if _sm.get("scan_threshold"):
+            thr_entries.append(_entry(_lab, _sm["scan_threshold"], _ns))
+        if _sm.get("scan_reset"):
+            rst_entries.append(_entry(_lab, _sm["scan_reset"], _ns))
+
+    if thr_entries:
+        print("\n=== Induction yield vs knob, by topology ===")
+        plot_sample_knob_response(
+            thr_entries, r"$Q_{\mathrm{thr}}$  ($10^{3}\,e^{-}$)",
+            "ti_induction_vs_threshold.png", outdir, base_x=base_thr / 1e3,
+            xfn=lambda v: v / 1e3,
+            title="Does a lower threshold buy induction hits?")
+        plot_sample_knob_response(
+            rst_entries, "periodic-reset rate  (kHz)",
+            "ti_induction_vs_reset.png", outdir,
+            xfn=lambda v: reset_rate_khz(int(v), ts),
+            title="Induction yield vs periodic-reset rate, by topology")
+        for tag, ents, scale, unit in (("threshold", thr_entries, 1e3, "ke-"),
+                                       ("reset", rst_entries, 1.0, "cycles")):
+            if not ents:
+                continue
+            print(f"  {tag} scan -- PURE-INDUCTION single hits per event "
+                  f"(spatial backtrack: no charge landed):")
+            # Group by the knob grid actually scanned: --muon-thresholds lets the muon
+            # samples use a different (typically lower) list than the showers, and printing
+            # those rows under the shower's header would silently mislabel every column.
+            groups = {}
+            for e in ents:
+                key = tuple(np.round(np.sort(np.asarray(e[1], float)), 6))
+                groups.setdefault(key, []).append(e)
+            for key, grp in groups.items():
+                print("    %-22s" % unit + "".join("%9.1f" % (v / scale) for v in key))
+                for (lab, v, _non, _noff, nind, n_ev) in grp:
+                    r = np.asarray(nind, float)[np.argsort(np.asarray(v, float))]
+                    print("    %-22s" % lab[:22] + "".join("%9.4f" % y
+                                                           for y in r / max(n_ev, 1)))
 
     print("\n=== Threshold scan ===")
     thr_disp = thresholds / 1e3
