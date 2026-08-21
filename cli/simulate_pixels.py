@@ -31,7 +31,7 @@ import h5py
 import numba as nb
 from numba.cuda import device_array, to_device
 from numba.cuda.random import create_xoroshiro128p_states
-from numba.core.errors import NumbaPerformanceWarning
+from numba.cuda.core.errors import NumbaPerformanceWarning
 
 from tqdm import tqdm
 
@@ -957,7 +957,7 @@ def run_simulation(input_filename,
             RangePop()
 
             RangePush("load_pixel_pedestals")
-            pixel_pedestals_file = None
+            pixel_pedestals_lut = None
             if pixel_pedestals_file is not None:
                 pixel_pedestals_lut = CudaDict.load(pixel_pedestals_file[i_mod-1], 512)
             RangePop()
