@@ -277,7 +277,13 @@ def sum_pixel_signals(pixels_signals, signals, track_t0, pixel_index_map, track_
             break
 
     # The overflow_flag is for both overflow (too many segments for backtracking) and underflow (no backtracking the pixel is considered too far from the segments)
-    overflow_flag[pixel_index] = flag
+    # Only ever RAISE the flag. Every (itrk, ipix, itick) thread that maps to this pixel
+    # writes here, and on a genuinely overflowing pixel the mapped segments vastly
+    # outnumber the dropped ones -- so an unconditional store lets a later successful
+    # thread clear a real overflow, and the warning never fires. Racing writes of the
+    # same constant 1 are benign, so no atomic is needed.
+    if flag:
+        overflow_flag[pixel_index] = 1
 
 @cuda.jit
 def get_track_pixel_map(track_pixel_map, unique_pix, pixels):
