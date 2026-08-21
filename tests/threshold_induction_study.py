@@ -471,16 +471,34 @@ def _aux_sel(aux, sel, n):
     return out
 
 
-def event_fee_singlehits(ctx, ev, threshold_e, seed):
-    """Run only the FEE on a cached pre-signal; return single-hit (Q, truth, aux).
+_HIT_POPS = (1, 2)
 
-    A pixel is a SINGLE-HIT pixel iff it produced exactly one ADC sample. Its recorded
-    charge Q is recovered from the ADC the way a data analysis would (vd.adc_to_charge,
-    carrying the ~1-LSB quantization). `truth` is the spatial backtrack flag (did charge
-    land here); `aux` carries the per-hit truth needed for the CAUSAL test -- the hit time
-    t_hit, the charge that landed (q_coll) and when it arrived (t_coll, sig_t_coll) -- so a
-    hit that fired BEFORE its own charge arrived can be recognised as induction-triggered
-    even though real charge sits above the pad."""
+
+def _empty_pop():
+    """An empty (Q, truth, aux) population, shaped like a real one."""
+    return np.empty(0), np.empty(0, bool), {k: np.empty(0) for k in _AUX_KEYS}
+
+
+def event_fee_hits(ctx, ev, threshold_e, seed, pops=_HIT_POPS):
+    """Run only the FEE on a cached pre-signal; split pixels by ADC MULTIPLICITY.
+
+    Returns {n: (Q, truth, aux)} for each n in `pops`. n=1 is the single-hit sample every
+    fit in this study uses. n=2 is the population those pixels MIGRATE INTO when a knob
+    promotes them -- a higher threshold delays the crossing until a second sample fits, and
+    a periodic reset landing mid-integration chops one hit into two. Because the single-hit
+    cut *removes* the promoted pixels, reset is nearly invisible in the n=1 spectrum on its
+    own; the migration between n=1 and n=2 is where its signature actually lives.
+
+    Both populations come out of ONE FEE pass, so the second costs no extra GPU time.
+
+    For n>1, Q is the SUM of the per-hit charges: get_adc_values resets the integrator after
+    every ADC sample, so a pixel's total recorded charge is the sum of what its samples
+    recorded. That puts n=2 on the SAME charge axis as n=1, which is what makes the
+    migration readable -- a pixel that crosses over keeps roughly its charge, so the pair of
+    spectra shows counts moving rather than two unrelated distributions. `aux` always refers
+    to the FIRST hit (the discriminator's decision point), so the causal-timing keys mean
+    the same thing in both populations.
+    """
     import cupy as cp
     ctx.detector.DISCRIMINATION_THRESHOLD = float(threshold_e)
     adc, ticks = vd.run_fee(
@@ -492,22 +510,35 @@ def event_fee_singlehits(ctx, ev, threshold_e, seed):
         ev["max_time"], seed=seed)
     adc = np.asarray(adc)                            # (npix, MAX_ADC_VALUES)
     ticks = np.asarray(ticks)                        # hit time (us), same grid as t_coll
-    n_hits = (adc > 0).sum(axis=1)
-    sel = n_hits == 1
-    if not sel.any():
-        return np.empty(0), np.empty(0, bool), {k: np.empty(0) for k in _AUX_KEYS}
-    row = np.argmax(adc[sel], axis=1)                # index of the one nonzero sample
-    single_adc = adc[sel][np.arange(row.size), row]
-    t_hit = ticks[sel][np.arange(row.size), row]     # when that sample was taken (us)
-    q = vd.adc_to_charge(ctx, single_adc)            # electrons
-    t_coll = np.asarray(ev["t_coll"][sel], float)
-    t_near = np.asarray(ev["t_near"][sel], float)
-    t_hit = np.asarray(t_hit, float)
-    aux = dict(t_hit=t_hit, t_coll=t_coll, dt=t_hit - t_coll,
-               q_coll=np.asarray(ev["q_coll"][sel], float),
-               sig_t_coll=np.asarray(ev["sig_t_coll"][sel], float),
-               t_near=t_near, dt_near=t_hit - t_near)
-    return np.asarray(q, float), ev["is_collection"][sel], aux
+    hit = adc > 0
+    n_hits = hit.sum(axis=1)
+    q_all = vd.adc_to_charge(ctx, adc)               # electrons; exactly 0 where adc <= 0
+    out = {}
+    for n in pops:
+        sel = n_hits == n
+        if not sel.any():
+            out[n] = _empty_pop()
+            continue
+        first = np.argmax(hit[sel], axis=1)          # column of the FIRST recorded sample
+        q = q_all[sel].sum(axis=1)                   # total over this pixel's n hits
+        t_hit = np.asarray(ticks[sel][np.arange(first.size), first], float)
+        t_coll = np.asarray(ev["t_coll"][sel], float)
+        t_near = np.asarray(ev["t_near"][sel], float)
+        aux = dict(t_hit=t_hit, t_coll=t_coll, dt=t_hit - t_coll,
+                   q_coll=np.asarray(ev["q_coll"][sel], float),
+                   sig_t_coll=np.asarray(ev["sig_t_coll"][sel], float),
+                   t_near=t_near, dt_near=t_hit - t_near)
+        out[n] = (np.asarray(q, float), ev["is_collection"][sel], aux)
+    return out
+
+
+def event_fee_singlehits(ctx, ev, threshold_e, seed):
+    """Single-hit (Q, truth, aux) only -- thin wrapper on `event_fee_hits`.
+
+    Kept because the fits, the muon control samples and the template grid all want just the
+    n=1 sample; only the scans need the paired populations.
+    """
+    return event_fee_hits(ctx, ev, threshold_e, seed, pops=(1,))[1]
 
 
 # ===========================================================================
@@ -787,25 +818,41 @@ class _silence_device_stdout:
         return False
 
 
-def aggregate_singlehits(ctx, evs, threshold_e, reset_cycles, induction_scale,
-                         seed0, n_events=None):
-    """Run the FEE on cached pre-signals and concatenate single-hit (Q, truth).
+def aggregate_hits(ctx, evs, threshold_e, reset_cycles, induction_scale,
+                   seed0, pops=_HIT_POPS):
+    """Run the FEE on cached pre-signals and concatenate each multiplicity population.
 
-    `evs` is the list of cached nominal-induction pre-signals (used for the
-    threshold and reset scans). For the induction scan, callers pass freshly
+    Returns {n: (Q, truth, aux)}. `evs` is the list of cached nominal-induction pre-signals
+    (used for the threshold and reset scans). For the induction scan, callers pass freshly
     re-induced pre-signals in `evs` (the pre-FEE current depends on induction).
+
+    See `event_fee_hits` for why n=2 is kept alongside n=1: it is where single-hit pixels go
+    when threshold or reset promotes them, so the pair carries a migration that the
+    single-hit sample cannot show on its own.
     """
     set_periodic_reset(ctx, reset_cycles)
-    qs, tr, auxs = [], [], []
+    acc = {n: ([], [], []) for n in pops}
     with _silence_device_stdout():
         for i, ev in enumerate(evs):
-            q, t, a = event_fee_singlehits(ctx, ev, threshold_e, seed=seed0 + i)
-            if q.size:
-                qs.append(q); tr.append(t); auxs.append(a)
-    if not qs:
-        return np.empty(0), np.empty(0, bool), {k: np.empty(0) for k in _AUX_KEYS}
-    aux = {k: np.concatenate([a[k] for a in auxs]) for k in _AUX_KEYS}
-    return np.concatenate(qs), np.concatenate(tr), aux
+            res = event_fee_hits(ctx, ev, threshold_e, seed=seed0 + i, pops=pops)
+            for n in pops:
+                q, t, a = res[n]
+                if q.size:
+                    acc[n][0].append(q); acc[n][1].append(t); acc[n][2].append(a)
+    out = {}
+    for n in pops:
+        qs, trs, auxs = acc[n]
+        out[n] = (_empty_pop() if not qs else
+                  (np.concatenate(qs), np.concatenate(trs),
+                   {k: np.concatenate([a[k] for a in auxs]) for k in _AUX_KEYS}))
+    return out
+
+
+def aggregate_singlehits(ctx, evs, threshold_e, reset_cycles, induction_scale,
+                         seed0, n_events=None):
+    """Single-hit (Q, truth, aux) only -- thin wrapper on `aggregate_hits`."""
+    return aggregate_hits(ctx, evs, threshold_e, reset_cycles, induction_scale,
+                          seed0, pops=(1,))[1]
 
 
 def _pixel_category(n_hits, is_coll, q_coll):
@@ -1378,6 +1425,156 @@ def plot_scan_distributions(panels, title, fmt_val, col0_header, fname, outdir,
         _savefig(fig, f"{outdir}/{base}{suf}.png")
 
 
+def _paired_hist(q1, q2, threshold_e, qmax=None, nbins=45):
+    """Bin the single-hit and two-hit populations on COMMON edges.
+
+    Shared edges are the whole point: only then can the pair be read as a migration
+    (counts leaving one histogram reappearing in the other at a similar charge) rather
+    than as two unrelated distributions."""
+    a1 = np.asarray(q1, float)
+    a2 = np.asarray(q2, float)
+    h = _hist(np.concatenate([a1, a2]), threshold_e, nbins=nbins, qmax=qmax)
+    if h is None:
+        return None
+    edges = h[3]
+    c1, _ = np.histogram(a1[np.isfinite(a1) & (a1 > 0)], bins=edges)
+    c2, _ = np.histogram(a2[np.isfinite(a2) & (a2 > 0)], bins=edges)
+    return 0.5 * (edges[:-1] + edges[1:]), c1.astype(float), c2.astype(float), edges
+
+
+def plot_multiplicity_dist(panels, title, fmt_val, fname, outdir, n_shower=1,
+                           xlim=None, qmax=None):
+    """Paired single-hit / two-hit spectra, one panel per scan value.
+
+    Every fit in this study runs on pixels with EXACTLY one ADC sample. That cut is not
+    neutral: raising the threshold delays the crossing until a second sample fits, and
+    speeding up the periodic reset chops one integration into two -- both PROMOTE pixels out
+    of the single-hit sample and into the two-hit one. So part of each knob's apparent
+    response is a change in WHICH pixels are selected, not in the spectrum of a fixed set.
+    Drawing both populations on common bins separates those two effects by eye.
+
+    `panels` is [(knob_disp, q1, q2, threshold_e), ...]; `fmt_val` formats each panel tag."""
+    import matplotlib.pyplot as plt
+    if not any(np.size(q2) for (_d, _q1, q2, _t) in panels):
+        return                       # spectra file predates the two-hit populations
+    items = []
+    for (d, q1, q2, thr) in panels:
+        h = _paired_hist(q1, q2, thr, qmax=qmax)
+        if h is not None:
+            items.append((d, h, thr, np.size(q1), np.size(q2)))
+    if not items:
+        return
+    n = len(items)
+    ncol = min(max(n, 1), 3)
+    nrow = int(np.ceil(n / ncol))
+    ns = max(float(n_shower), 1.0)
+    base = fname[:-4] if fname.endswith(".png") else fname
+    for logy, suf in ((True, ""), (False, "_lin")):
+        fig, axes = plt.subplots(nrow, ncol, figsize=(3.8 * ncol, 2.9 * nrow),
+                                 sharex=True, sharey=logy, squeeze=False)
+        for ax, (d, (cen, c1, c2, edges), thr, n1, n2) in zip(axes.flat, items):
+            x = cen / 1e3
+            ax.fill_between(x, c1 / ns, step="mid", color=_C_PUR, alpha=0.35, lw=0,
+                            label="1 hit (fitted sample)")
+            ax.step(x, c1 / ns, where="mid", color=_C_PUR, lw=1.3)
+            ax.step(x, c2 / ns, where="mid", color=_C_GRN, lw=1.6,
+                    label="2 hits (total recorded $Q$)")
+            ax.axvline(thr / 1e3, color="0.45", ls=":", lw=1.0)
+            if logy:
+                ax.set_yscale("log")
+            if xlim:
+                ax.set_xlim(*xlim)
+            frac = n2 / max(n1 + n2, 1)
+            stat = "\n".join((fmt_val(d),
+                               r"$N_{1,2}=%d,\,%d$" % (n1, n2),
+                               r"2-hit frac $=%.3f$" % frac))
+            ax.text(0.95, 0.93, stat, transform=ax.transAxes, ha="right", va="top",
+                    fontsize=8.0, linespacing=1.35,
+                    bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="0.7", lw=0.6))
+        for ax in axes.flat[n:]:
+            ax.set_visible(False)
+        for c in range(ncol):
+            used = [r * ncol + c for r in range(nrow) if r * ncol + c < n]
+            if used:
+                axb = axes.flat[used[-1]]
+                axb.set_xlabel(r"$Q$ ($10^{3}\,e^{-}$)")
+                axb.tick_params(labelbottom=True)
+        for r in range(nrow):
+            if r * ncol < n:
+                axes[r, 0].set_ylabel("Pixels / shower")
+        h, l = axes.flat[0].get_legend_handles_labels()
+        fig.legend(h, l, loc="upper center", ncol=2, fontsize=9.5, bbox_to_anchor=(0.5, 1.02))
+        fig.suptitle(title, y=1.06, fontsize=12)
+        fig.tight_layout()
+        _savefig(fig, f"{outdir}/{base}{suf}.png")
+
+
+def plot_multiplicity_rates(cols, outdir, fname="ti_multiplicity_rates.png"):
+    """Migration summary: where the single-hit sample gains and loses pixels.
+
+    Row (a) is the yield of each population per shower; row (b) is the two-hit FRACTION,
+    n2/(n1+n2). The fraction is the scale-free one -- it divides out how many pixels the
+    event lit up at all, so it responds to a knob promoting pixels rather than to overall
+    occupancy. It is the observable the single-hit cut was hiding, and the one place the
+    periodic reset is expected to show a clean, monotonic response.
+
+    `cols` is [(title, xlabel, x, n1_rate, n2_rate), ...], one entry per knob."""
+    import matplotlib.pyplot as plt
+    cols = [c for c in cols if np.isfinite(np.asarray(c[4], float)).any()]
+    if not cols:
+        return
+    ncol = len(cols)
+    fig, axes = plt.subplots(2, ncol, figsize=(4.0 * ncol, 5.6), squeeze=False)
+    ekw = dict(ms=6.0, mfc="white", mew=1.5, capsize=3, elinewidth=1.1, ls="none")
+    for j, (title, xlabel, x, r1, r2) in enumerate(cols):
+        x = np.asarray(x, float)
+        r1 = np.asarray(r1, float)
+        r2 = np.asarray(r2, float)
+        o = np.argsort(x)
+        x, r1, r2 = x[o], r1[o], r2[o]
+        a, b = axes[0, j], axes[1, j]
+        a.errorbar(x, r1, fmt="o", color=_C_PUR, label="1 hit", **ekw)
+        a.errorbar(x, r2, fmt="s", color=_C_GRN, label="2 hits", **ekw)
+        a.set_title(title, fontsize=10.5)
+        with np.errstate(invalid="ignore", divide="ignore"):
+            frac = r2 / (r1 + r2)
+        b.errorbar(x, frac, fmt="^", color=_C_SUM, **ekw)
+        # Anchor the fraction axis at 0. Autoscaling a flat series (the induction scan,
+        # which should NOT promote pixels) blows a 1e-4 wobble up to full panel height and
+        # reads as a trend; anchored, flat looks flat.
+        top = np.nanmax(frac) if np.isfinite(frac).any() else 0.0
+        b.set_ylim(0.0, max(1.25 * float(top), 0.02))
+        b.set_xlabel(xlabel)
+        for ax in (a, b):
+            ax.grid(alpha=0.25, lw=0.6)
+        if j == 0:
+            a.set_ylabel("Pixels / shower")
+            b.set_ylabel(r"2-hit fraction  $n_2/(n_1{+}n_2)$")
+    axes[0, 0].legend(fontsize=9, loc="best")
+    for k, ax in enumerate(axes.flat[:2 * ncol]):
+        if k % ncol == 0:
+            ax.text(0.02, 0.94, "(%s)" % chr(97 + k // ncol), transform=ax.transAxes,
+                    fontsize=11, va="top", ha="left")
+    fig.suptitle("Hit-multiplicity migration: what the single-hit cut selects", fontsize=12)
+    fig.tight_layout()
+    _savefig(fig, f"{outdir}/{fname}")
+
+
+def _add_multiplicity(scan, items2, n_shower):
+    """Attach the two-hit yield to a scan dict, keyed on the scan's own knob values.
+
+    Adds `n2_rate` (two-hit pixels per shower) and `frac_2hit`. Missing entries become NaN
+    so a scan without a paired population -- or an older spectra file -- still runs and
+    simply shows blanks in the sensitivity matrix."""
+    by_val = {float(v): np.size(q) for (v, q, _tr, _a) in (items2 or [])}
+    ns = max(float(n_shower), 1.0)
+    r2 = np.array([by_val.get(float(k), np.nan) / ns for k in scan["knob"]], float)
+    scan["n2_rate"] = r2
+    with np.errstate(invalid="ignore", divide="ignore"):
+        scan["frac_2hit"] = r2 / (np.asarray(scan["rate"], float) + r2)
+    return scan
+
+
 def plot_scan(ctx, scan, knob_label, fname, outdir, knob_vals_disp=None, mpv_ylim=None):
     """The three DATA-BLIND handles vs one knob, in three stacked panels:
     (a) low-Q peak MPV [tracks THRESHOLD], (b) peak height [INDUCTION & reset],
@@ -1473,7 +1670,9 @@ def plot_sensitivity(matrix, knobs, observables, outdir):
     separable from the single-hit Q spectrum.
     """
     import matplotlib.pyplot as plt
-    fig, ax = plt.subplots(figsize=(7.0, 3.4))
+    # Width tracks the column count -- a fixed 7.0 in collides the tick labels once the
+    # migration observable makes it five columns.
+    fig, ax = plt.subplots(figsize=(max(7.0, 1.75 * len(observables) + 1.2), 3.4))
     M = np.abs(np.asarray(matrix, float))
     vmax = float(np.nanmax(M)) if np.isfinite(M).any() else 1.0
     im = ax.imshow(M, cmap="cividis", aspect="auto", vmin=0.0, vmax=vmax)
@@ -1801,22 +2000,30 @@ def _record_fit(out, fit, n_events):
 
 def aggregate_fixed_scan(ctx, evs, knob_vals, set_fn, seed0):
     """GPU: threshold or reset scan spectra on cached nominal-induction pre-signals.
-    `set_fn(value)` -> (threshold_e, reset_cycles). Returns [(val, q, tr), ...]."""
-    out = []
+    `set_fn(value)` -> (threshold_e, reset_cycles).
+
+    Returns (items1, items2), each [(val, q, tr, aux), ...] -- the single-hit scan and the
+    parallel TWO-hit scan. Both come from the same FEE pass, so items2 is free; it is what
+    makes the threshold/reset migration visible (see `event_fee_hits`).
+    """
+    out, out2 = [], []
     for j, val in enumerate(knob_vals):
         thr, rst = set_fn(val)
-        q, tr, aux = aggregate_singlehits(ctx, evs, thr, rst, 1.0, seed0=seed0 + j * 1000)
-        out.append((val, q, tr, aux))
-    return out
+        pops = aggregate_hits(ctx, evs, thr, rst, 1.0, seed0=seed0 + j * 1000)
+        out.append((val,) + pops[1])
+        out2.append((val,) + pops[2])
+    return out, out2
 
 
 def aggregate_induction_scan(ctx, drift_cache, scales, base_threshold, base_reset,
                              seed0, evs_off=None, collect_frac=0.15):
     """GPU: induction-scan spectra -- re-INDUCE (only) the pre-FEE current at each response
     scale on the cached drift/pixel geometry (scale-independent). `evs_off` is reused
-    verbatim for the scale=0 point. Returns [(scale, q, tr), ...]."""
+    verbatim for the scale=0 point.
+
+    Returns (items1, items2) -- single-hit and two-hit, as in `aggregate_fixed_scan`."""
     set_periodic_reset(ctx, base_reset)
-    out = []
+    out, out2 = [], []
     for j, s in enumerate(scales):
         if s == 0.0 and evs_off is not None:
             evs = evs_off                              # induction-off cache == scale-0
@@ -1825,11 +2032,12 @@ def aggregate_induction_scan(ctx, drift_cache, scales, base_threshold, base_rese
             evs = [event_induce(ctx, dc[0], dc[1], dc[2], seed=seed0 + j * 777 + i,
                                 collect_frac=collect_frac) for i, dc in enumerate(drift_cache)]
             evs = [e for e in evs if e is not None]
-        q, tr, aux = aggregate_singlehits(ctx, evs, base_threshold, base_reset, s,
-                                          seed0=seed0 + j * 1000 + 50000)
-        out.append((float(s), q, tr, aux))
+        pops = aggregate_hits(ctx, evs, base_threshold, base_reset, s,
+                              seed0=seed0 + j * 1000 + 50000)
+        out.append((float(s),) + pops[1])
+        out2.append((float(s),) + pops[2])
     set_induction(ctx, 1.0)
-    return out
+    return out, out2
 
 
 def fit_scan(items, n_events, n_shower, qmax, noise_e):
@@ -2175,6 +2383,23 @@ def save_spectra(spectra, path):
         kw[name + "_tr"] = _obj_array([it[2] for it in items])
         for k in _AUX_KEYS:
             kw[f"{name}_aux_{k}"] = _obj_array([it[3][k] for it in items])
+    # Parallel TWO-hit populations. Written under a distinct `_n2` prefix rather than
+    # widening the existing tuples, so every older reader/unpacker keeps working.
+    n2 = spectra.get("nominal_n2")
+    if n2 is not None:
+        kw["nominal_n2_q"] = np.asarray(n2[0], float)
+        kw["nominal_n2_tr"] = np.asarray(n2[1], bool)
+        for k in _AUX_KEYS:
+            kw["nominal_n2_aux_" + k] = np.asarray(n2[2][k], float)
+    for name in ("threshold", "reset", "induction"):
+        items = spectra.get(name + "_n2")
+        if not items:
+            continue
+        kw[f"{name}_n2_vals"] = np.asarray([it[0] for it in items], float)
+        kw[f"{name}_n2_q"] = _obj_array([it[1] for it in items])
+        kw[f"{name}_n2_tr"] = _obj_array([it[2] for it in items])
+        for k in _AUX_KEYS:
+            kw[f"{name}_n2_aux_{k}"] = _obj_array([it[3][k] for it in items])
     g = spectra["grid"]
     kw["grid_thr"] = np.asarray([it[0] for it in g], float)
     kw["grid_rst"] = np.asarray([it[1] for it in g], int)
@@ -2242,6 +2467,20 @@ def load_spectra(path):
         vals, qs, trs = d[name + "_vals"], d[name + "_q"], d[name + "_tr"]
         spectra[name] = [(float(vals[i]), np.asarray(qs[i], float), np.asarray(trs[i], bool),
                           _aux(name, i)) for i in range(len(vals))]
+    # Two-hit populations; absent in files written before the migration study, in which
+    # case the analysis simply skips the migration plots.
+    spectra["nominal_n2"] = ((np.asarray(d["nominal_n2_q"], float),
+                              np.asarray(d["nominal_n2_tr"], bool), _aux("nominal_n2"))
+                             if "nominal_n2_q" in d.files else None)
+    for name in ("threshold", "reset", "induction"):
+        key = name + "_n2_vals"
+        if key not in d.files:
+            spectra[name + "_n2"] = []
+            continue
+        vals, qs, trs = d[key], d[name + "_n2_q"], d[name + "_n2_tr"]
+        spectra[name + "_n2"] = [(float(vals[i]), np.asarray(qs[i], float),
+                                  np.asarray(trs[i], bool), _aux(name + "_n2", i))
+                                 for i in range(len(vals))]
     gthr, grst, gq, gtr = d["grid_thr"], d["grid_rst"], d["grid_q"], d["grid_tr"]
     spectra["grid"] = [(float(gthr[i]), int(grst[i]), np.asarray(gq[i], float),
                         np.asarray(gtr[i], bool), _aux("grid", i))
@@ -2318,7 +2557,9 @@ def produce_spectra(ctx, args):
                        for i, d in enumerate(drift_cache)) if e is not None]
 
     print("Aggregating nominal single-hit spectrum...")
-    q0, tr0, aux0 = aggregate_singlehits(ctx, evs, base_thr, base_reset, 1.0, seed0=args.seed + 1)
+    nom_pops = aggregate_hits(ctx, evs, base_thr, base_reset, 1.0, seed0=args.seed + 1)
+    q0, tr0, aux0 = nom_pops[1]
+    nom2 = nom_pops[2]
     qmax = float(min(np.max(q0[q0 > 0]), 50000.0)) if np.any(q0 > 0) else 30000.0
 
     print("Inducing induction-OFF pre-FEE signals (pure shower, for templates)...")
@@ -2337,18 +2578,19 @@ def produce_spectra(ctx, args):
                                            seed0=args.seed + 6000, base_thr=base_thr,
                                            base_reset=base_reset, mode=args.template_grid)
 
-    print("Aggregating threshold + reset scans...")
-    thr_items = aggregate_fixed_scan(ctx, evs, args.thresholds,
+    print("Aggregating threshold + reset scans (single-hit + two-hit populations)...")
+    thr_items, thr_items2 = aggregate_fixed_scan(ctx, evs, args.thresholds,
                                      lambda v: (float(v), base_reset), seed0=args.seed + 2000)
-    rst_items = aggregate_fixed_scan(ctx, evs, args.resets,
+    rst_items, rst_items2 = aggregate_fixed_scan(ctx, evs, args.resets,
                                      lambda v: (base_thr, int(v)), seed0=args.seed + 3000)
     set_periodic_reset(ctx, base_reset)
 
     ind_n = min(args.induction_events, n_eff) if args.induction_events else n_eff
     print(f"Aggregating induction scan ({ind_n} of {n_eff} events; re-induces per scale)...")
-    ind_items = aggregate_induction_scan(ctx, drift_cache[:ind_n], args.inductions, base_thr,
-                                         base_reset, seed0=args.seed + 4000,
-                                         evs_off=evs_off[:ind_n], collect_frac=args.collect_frac)
+    ind_items, ind_items2 = aggregate_induction_scan(
+        ctx, drift_cache[:ind_n], args.inductions, base_thr,
+        base_reset, seed0=args.seed + 4000,
+        evs_off=evs_off[:ind_n], collect_frac=args.collect_frac)
 
     # --- control-sample DIAGNOSTICS: the shower plus straight-muon topologies, each with a
     #     nominal (induction-on) and an induction-off single-hit sample for the anatomy /
@@ -2393,7 +2635,11 @@ def produce_spectra(ctx, args):
                 n_shower_main=n_eff, n_shower_ind=ind_n,
                 detector_name=str(det_name), detector_path=str(det_path))
     return dict(meta=meta, nominal=(q0, tr0, aux0), threshold=thr_items, reset=rst_items,
-                induction=ind_items, grid=grid_spectra, samples=samples, waveforms=waveforms)
+                induction=ind_items, grid=grid_spectra, samples=samples, waveforms=waveforms,
+                # parallel TWO-hit populations (same FEE passes): the migration target that
+                # makes the threshold/reset response visible -- see event_fee_hits.
+                nominal_n2=nom2, threshold_n2=thr_items2, reset_n2=rst_items2,
+                induction_n2=ind_items2)
 
 
 def analyze_spectra(spectra, outdir):
@@ -2429,6 +2675,12 @@ def analyze_spectra(spectra, outdir):
 
     def dist_panels(fits, disp):
         return [(d, f, q, tr) for d, (val, f, q, tr) in zip(disp, fits)]
+
+    def mult_panels(items1, items2, disp, thr_of):
+        """Pair each scan point's single-hit and two-hit spectra for the migration plot."""
+        d2 = {float(v): q for (v, q, _t, _a) in (items2 or [])}
+        return [(d, q, d2.get(float(v), np.empty(0)), float(thr_of(v)))
+                for d, (v, q, _t, _a) in zip(disp, items1)]
 
     print("\n=== Nominal composite template fit ===")
     q0, tr0 = np.asarray(spectra["nominal"][0], float), np.asarray(spectra["nominal"][1], bool)
@@ -2502,36 +2754,77 @@ def analyze_spectra(spectra, outdir):
     thr_items = [(v, q, tr, float(v), template_fn(float(v), base_reset))
                  for (v, q, tr, _a) in spectra["threshold"]]
     thr_scan, thr_fits = fit_scan(thr_items, n_main, n_main, qmax, noise_e)
+    _add_multiplicity(thr_scan, spectra.get("threshold_n2"), n_main)
     plot_scan(None, thr_scan, r"Pixel charge threshold $Q_{\mathrm{thr}}$  ($10^{3}\,e^{-}$)",
               "ti_scan_threshold.png", outdir, knob_vals_disp=thr_disp, mpv_ylim=mpv_ylim)
     plot_scan_distributions(dist_panels(thr_fits, thr_disp),
                             r"Readout-$Q$ spectra vs pixel charge threshold",
                             lambda d: r"$Q_{\mathrm{thr}}=%.1f$" % d, r"$Q_{\mathrm{thr}}$",
                             "ti_dist_threshold.png", outdir, xlim=xlim, thr_sigma=thr_sigma)
+    plot_multiplicity_dist(mult_panels(spectra["threshold"], spectra.get("threshold_n2"),
+                                       thr_disp, lambda v: v),
+                           r"Single-hit vs two-hit pixels vs pixel charge threshold",
+                           lambda d: r"$Q_{\mathrm{thr}}=%.1f$" % d,
+                           "ti_multiplicity_threshold.png", outdir, n_shower=n_main,
+                           xlim=xlim, qmax=qmax)
 
     print("\n=== Periodic-reset scan ===")
     reset_rate = reset_rate_khz(resets, ts)
     rst_items = [(v, q, tr, base_thr, template_fn(base_thr, int(v)))
                  for (v, q, tr, _a) in spectra["reset"]]
     rst_scan, rst_fits = fit_scan(rst_items, n_main, n_main, qmax, noise_e)
+    _add_multiplicity(rst_scan, spectra.get("reset_n2"), n_main)
     plot_scan(None, rst_scan, r"Periodic-reset rate  (kHz)",
               "ti_scan_periodic_reset.png", outdir, knob_vals_disp=reset_rate)
     plot_scan_distributions(dist_panels(rst_fits, reset_rate),
                             r"Readout-$Q$ spectra vs periodic-reset rate",
                             lambda d: ("reset off" if d == 0 else r"%.0f kHz" % d), r"kHz",
                             "ti_dist_periodic_reset.png", outdir, xlim=xlim, thr_sigma=thr_sigma)
+    plot_multiplicity_dist(mult_panels(spectra["reset"], spectra.get("reset_n2"),
+                                       reset_rate, lambda v: base_thr),
+                           r"Single-hit vs two-hit pixels vs periodic-reset rate",
+                           lambda d: ("reset off" if d == 0 else r"%.0f kHz" % d),
+                           "ti_multiplicity_reset.png", outdir, n_shower=n_main,
+                           xlim=xlim, qmax=qmax)
 
     print("\n=== Induction-response scan ===")
     ind_disp = inductions
     ind_items = [(v, q, tr, base_thr, template_fn(base_thr, base_reset))
                  for (v, q, tr, _a) in spectra["induction"]]
     ind_scan, ind_fits = fit_scan(ind_items, n_ind, n_ind, qmax, noise_e)
+    _add_multiplicity(ind_scan, spectra.get("induction_n2"), n_ind)
     plot_scan(None, ind_scan, r"Neighbour-pad induction-response scale",
               "ti_scan_induction.png", outdir, knob_vals_disp=ind_disp)
     plot_scan_distributions(dist_panels(ind_fits, ind_disp),
                             r"Readout-$Q$ spectra vs induction-response scale",
                             lambda d: r"induction $\times%.1f$" % d, r"scale",
                             "ti_dist_induction.png", outdir, xlim=xlim, thr_sigma=thr_sigma)
+
+    print("\n=== Hit-multiplicity migration ===")
+    if not any(spectra.get(k) for k in ("threshold_n2", "reset_n2", "induction_n2")):
+        print("  (no two-hit populations in this spectra file -- re-run produce_spectra "
+              "to record them)")
+    plot_multiplicity_rates([
+        ("Threshold", r"$Q_{\mathrm{thr}}$  ($10^{3}\,e^{-}$)", thr_disp,
+         thr_scan["rate"], thr_scan["n2_rate"]),
+        ("Periodic reset", "reset rate  (kHz)", reset_rate,
+         rst_scan["rate"], rst_scan["n2_rate"]),
+        ("Induction", "induction scale", ind_disp,
+         ind_scan["rate"], ind_scan["n2_rate"]),
+    ], outdir)
+    for lbl, sc, xs in (("threshold", thr_scan, thr_disp),
+                        ("reset", rst_scan, reset_rate),
+                        ("induction", ind_scan, ind_disp)):
+        f2 = np.asarray(sc["frac_2hit"], float)
+        if not np.isfinite(f2).any():
+            continue
+        o = np.argsort(np.asarray(xs, float))
+        f2o = f2[o]
+        good = np.nonzero(np.isfinite(f2o))[0]
+        print("  %-10s 2-hit fraction %.3f -> %.3f over the scan  (1-hit/shower %.2f -> %.2f)"
+              % (lbl, f2o[good[0]], f2o[good[-1]],
+                 np.asarray(sc["rate"], float)[o][good[0]],
+                 np.asarray(sc["rate"], float)[o][good[-1]]))
 
     print("\n=== Sensitivity matrix ===")
     plot_shape_collapse([
@@ -2546,8 +2839,11 @@ def analyze_spectra(spectra, outdir):
 
     # POSITIONS track the threshold; the SCALE-FREE shape ratios (charge measured in units of
     # the peak position) have the threshold divided out, so they isolate reset/induction.
-    obs_keys = ["peak_mpv", "tail_peak", "tail_over_core", "shoulder_frac"]
-    obs_lbl = ["Peak position", "Tail peak", "Tail/core (x)", "Shoulder frac (x)"]
+    # `frac_2hit` is the migration handle: it measures pixels being PROMOTED out of the
+    # single-hit sample, which is the part of the reset response the single-hit cut removes
+    # from every spectral observable above.
+    obs_keys = ["peak_mpv", "tail_peak", "tail_over_core", "shoulder_frac", "frac_2hit"]
+    obs_lbl = ["Peak position", "Tail peak", "Tail/core (x)", "Shoulder frac (x)", "2-hit frac"]
     rows = [sensitivity_row(thr_scan, obs_keys, return_raw=True),
             sensitivity_row(rst_scan, obs_keys, knob_axis=reset_rate, return_raw=True),
             sensitivity_row(ind_scan, obs_keys, return_raw=True)]
