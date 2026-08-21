@@ -1735,7 +1735,7 @@ def _sample_scan_counts(scan):
     landed on the pad), which is the direct truth-level answer -- not an ON-minus-OFF
     subtraction, which mixes in pixels that merely changed multiplicity."""
     vals, n_on, n_off, n_ind = [], [], [], []
-    for (v, q_on, tr_on, q_off, _tr_off, _n2on, _n2off) in scan:
+    for (v, q_on, tr_on, _q2, _tr2, q_off, _tr_off) in scan:
         tr_on = np.asarray(tr_on, bool)
         vals.append(float(v))
         n_on.append(int(np.size(q_on)))
@@ -1745,7 +1745,7 @@ def _sample_scan_counts(scan):
             np.asarray(n_off, float), np.asarray(n_ind, float))
 
 
-def plot_sensitivity(matrix, knobs, observables, outdir):
+def plot_sensitivity(matrix, knobs, observables, outdir, suffix="", title=None):
     """The money plot: |fractional response| of each observable to each knob.
 
     For each knob scan and each observable we compute the end-to-end fractional
@@ -1778,10 +1778,10 @@ def plot_sensitivity(matrix, knobs, observables, outdir):
     cb.set_label(r"$|\,\Delta\mathrm{obs}/\mathrm{obs}\,|\;/\;|\,\Delta\mathrm{knob}/\mathrm{knob}\,|$",
                  fontsize=10)
     cb.ax.tick_params(labelsize=9)
-    ax.set_title("Sensitivity of each fit observable to each readout knob",
+    ax.set_title(title or "Sensitivity of each fit observable to each readout knob",
                  fontsize=11, pad=8)
     fig.tight_layout()
-    _savefig(fig, f"{outdir}/ti_sensitivity_matrix.png")
+    _savefig(fig, f"{outdir}/ti_sensitivity_matrix{suffix}.png")
 
 
 def plot_shower_templates(node_fits, thresholds, base_reset, outdir):
@@ -2101,30 +2101,65 @@ def aggregate_fixed_scan(ctx, evs, knob_vals, set_fn, seed0):
 
 
 def aggregate_sample_scan(ctx, evs_on, evs_off, knob_vals, set_fn, seed0):
-    """FEE-only knob scan on ONE control sample, with induction ON and OFF at every point.
+    """FEE-only knob scan on ONE control sample, mirroring the shower scans.
 
-    The on/off pair at each knob value is a cheap two-point induction axis: the EXCESS of ON
-    over OFF is the hit count that exists only because of induced current on neighbouring
-    pads, and the spatial-truth flag splits the ON sample into collection vs pure-induction
-    pixels. Together they answer the operational question directly -- how far the threshold
-    has to drop before induction produces single-hit pixels at all, which in fsd_cube it
-    does not do at the nominal 5 ke- (DISCRIMINATOR_NOISE is 13x quieter than module0, so
-    the marginal crossings module0 gets for free never happen).
+    At every knob value this records the same three things the shower scans carry: the
+    induction-ON single-hit sample (what gets fitted), its TWO-hit counterpart (the
+    migration target), and the induction-OFF single-hit sample. The on/off pair is a cheap
+    two-point induction axis -- the excess of ON over OFF is the hit count that exists only
+    because of induced current on neighbouring pads -- while the spatial-truth flag splits
+    ON into collection vs pure-induction pixels.
 
     Both pre-signal caches already exist, so this costs FEE passes only -- no re-induction,
     which is what makes scanning a muon sample affordable at all.
 
-    Returns [(val, q_on, tr_on, q_off, tr_off, n2_on, n2_off), ...]; the two-hit populations
-    are kept as COUNTS only (the migration fraction needs no more than that, and full muon
-    spectra at every knob value would dominate the spectra file).
+    `aux` is deliberately NOT recorded: the fits and the shape observables need only (q, tr),
+    and the causal-timing diagnostics that do use aux run at the base point. Carrying seven
+    aux arrays per knob value per angle would dominate the spectra file for no gain.
+
+    Returns [(val, q_on, tr_on, q2_on, tr2_on, q_off, tr_off), ...].
     """
     out = []
     for j, val in enumerate(knob_vals):
         thr, rst = set_fn(val)
         pon = aggregate_hits(ctx, evs_on, thr, rst, 1.0, seed0=seed0 + j * 1000)
         pof = aggregate_hits(ctx, evs_off, thr, rst, 0.0, seed0=seed0 + j * 1000 + 500)
-        out.append((float(val), pon[1][0], pon[1][1], pof[1][0], pof[1][1],
-                    int(np.size(pon[2][0])), int(np.size(pof[2][0]))))
+        out.append((float(val), pon[1][0], pon[1][1], pon[2][0], pon[2][1],
+                    pof[1][0], pof[1][1]))
+    return out
+
+
+def aggregate_sample_induction_scan(ctx, drift_cache, scales, base_threshold, base_reset,
+                                    seed0, evs_off=None, collect_frac=0.15):
+    """Induction-response scan on ONE control sample -- the muon analogue of
+    `aggregate_induction_scan`.
+
+    This is the ONLY per-sample scan that must RE-INDUCE (the pre-FEE current depends on the
+    induction scale), so unlike the threshold/reset scans it is not free: cost is
+    |scales| x n_events induce passes per angle, on events that light far more pixels than a
+    shower does. That is why it is gated behind its own --muon-induction-events, default 0.
+
+    Returns [(scale, q_on, tr_on, q2_on, tr2_on, q_off, tr_off), ...], the same shape as
+    `aggregate_sample_scan`, with the induction-OFF cache reused as the scale-0 reference at
+    every point so the on/off column stays meaningful.
+    """
+    set_periodic_reset(ctx, base_reset)
+    ref = (aggregate_hits(ctx, evs_off, base_threshold, base_reset, 0.0, seed0=seed0 + 77)[1]
+           if evs_off else (np.empty(0), np.empty(0, bool), None))
+    out = []
+    for j, s in enumerate(scales):
+        if s == 0.0 and evs_off is not None:
+            evs = evs_off
+        else:
+            set_induction(ctx, s)
+            evs = [e for e in (event_induce(ctx, dc[0], dc[1], dc[2],
+                                            seed=seed0 + j * 777 + i,
+                                            collect_frac=collect_frac)
+                               for i, dc in enumerate(drift_cache)) if e is not None]
+        pon = aggregate_hits(ctx, evs, base_threshold, base_reset, s,
+                             seed0=seed0 + j * 1000 + 50000)
+        out.append((float(s), pon[1][0], pon[1][1], pon[2][0], pon[2][1], ref[0], ref[1]))
+    set_induction(ctx, 1.0)
     return out
 
 
@@ -2255,6 +2290,12 @@ def parse_args():
                          "cost 2x|knob values| extra FEE passes per angle: they reuse the "
                          "cached pre-signals, so no re-induction, but a muon lights far more "
                          "pixels per event than a shower does.")
+    ap.add_argument("--muon-induction-events", type=int, default=0,
+                    help="events per muon sample for a full INDUCTION scan (0 = off, the "
+                         "default). Unlike the threshold/reset scans this must RE-INDUCE per "
+                         "scale, so it is the expensive one -- turn it on only when you want "
+                         "an induction ROW in each topology's sensitivity matrix. The cheap "
+                         "two-point induction on/off contrast is recorded either way.")
     ap.add_argument("--muon-thresholds", type=float, nargs="*", default=None,
                     help="thresholds (e-) for the muon scan; defaults to --thresholds. Set "
                          "this LOWER than the shower scan to find where induction starts "
@@ -2549,17 +2590,26 @@ def save_spectra(spectra, path):
         # per-sample knob scans (induction on/off at every point); aux is deliberately not
         # stored -- the causal diagnostics only run at the base point.
         kw[f"samp_{name}_n_scan"] = np.asarray(int(s.get("n_scan", 0)))
-        for knob in ("threshold", "reset"):
+        kw[f"samp_{name}_n_ind_scan"] = np.asarray(int(s.get("n_ind_scan", 0)))
+        for fld in ("thr_grid", "scan_thresholds"):
+            if s.get(fld) is not None:
+                kw[f"samp_{name}_{fld}"] = np.asarray(s[fld], float)
+        for knob in ("threshold", "reset", "induction"):
             sc = s.get("scan_" + knob)
             if not sc:
                 continue
             pre = f"samp_{name}_scan_{knob}"
             kw[pre + "_vals"] = np.asarray([r[0] for r in sc], float)
-            kw[pre + "_q_on"] = _obj_array([r[1] for r in sc])
-            kw[pre + "_tr_on"] = _obj_array([r[2] for r in sc])
-            kw[pre + "_q_off"] = _obj_array([r[3] for r in sc])
-            kw[pre + "_tr_off"] = _obj_array([r[4] for r in sc])
-            kw[pre + "_n2"] = np.asarray([[r[5], r[6]] for r in sc], float)
+            for fld, i in (("q_on", 1), ("tr_on", 2), ("q2_on", 3),
+                           ("tr2_on", 4), ("q_off", 5), ("tr_off", 6)):
+                kw[f"{pre}_{fld}"] = _obj_array([r[i] for r in sc])
+        gr = s.get("grid")
+        if gr:
+            pre = f"samp_{name}_grid"
+            kw[pre + "_thr"] = np.asarray([it[0] for it in gr], float)
+            kw[pre + "_rst"] = np.asarray([it[1] for it in gr], int)
+            kw[pre + "_q"] = _obj_array([it[2] for it in gr])
+            kw[pre + "_tr"] = _obj_array([it[3] for it in gr])
     np.savez(path, **kw)
 
 
@@ -2637,19 +2687,35 @@ def load_spectra(path):
                     s[which] = (np.asarray(d[qk], float), np.asarray(d[f"samp_{name}_{which}_tr"], bool), aux)
                 else:
                     s[which] = None
-            s["n_scan"] = int(d[f"samp_{name}_n_scan"]) if f"samp_{name}_n_scan" in d.files else 0
-            for knob in ("threshold", "reset"):
+            for fld in ("n_scan", "n_ind_scan"):
+                k = f"samp_{name}_{fld}"
+                s[fld] = int(d[k]) if k in d.files else 0
+            for fld in ("thr_grid", "scan_thresholds"):
+                k = f"samp_{name}_{fld}"
+                s[fld] = np.asarray(d[k], float) if k in d.files else None
+            for knob in ("threshold", "reset", "induction"):
                 pre = f"samp_{name}_scan_{knob}"
                 if pre + "_vals" not in d.files:
                     s["scan_" + knob] = []
                     continue
-                v, n2 = d[pre + "_vals"], d[pre + "_n2"]
+                v = d[pre + "_vals"]
                 s["scan_" + knob] = [
                     (float(v[i]), np.asarray(d[pre + "_q_on"][i], float),
                      np.asarray(d[pre + "_tr_on"][i], bool),
+                     np.asarray(d[pre + "_q2_on"][i], float),
+                     np.asarray(d[pre + "_tr2_on"][i], bool),
                      np.asarray(d[pre + "_q_off"][i], float),
-                     np.asarray(d[pre + "_tr_off"][i], bool),
-                     int(n2[i][0]), int(n2[i][1])) for i in range(len(v))]
+                     np.asarray(d[pre + "_tr_off"][i], bool)) for i in range(len(v))]
+            gpre = f"samp_{name}_grid"
+            if gpre + "_thr" in d.files:
+                gt, grr = d[gpre + "_thr"], d[gpre + "_rst"]
+                s["grid"] = [(float(gt[i]), int(grr[i]),
+                              np.asarray(d[gpre + "_q"][i], float),
+                              np.asarray(d[gpre + "_tr"][i], bool),
+                              {k: np.empty(0) for k in _AUX_KEYS})
+                             for i in range(len(gt))]
+            else:
+                s["grid"] = []
             samples[name] = s
     spectra["samples"] = samples
     return spectra
@@ -2791,6 +2857,29 @@ def produce_spectra(ctx, args):
                 ctx, mu_evs[:ns], mu_off[:ns], args.resets,
                 lambda v: (base_thr, int(v)), seed0=sd + 4000)
             set_periodic_reset(ctx, base_reset)
+            # This topology's OWN induction-off template grid. The shower grid cannot be
+            # reused: it is a template for the EM-shower charge spectrum, and a MIP's is a
+            # different distribution entirely, so fitting muon scan points against it would
+            # freeze the wrong shape. FEE-only on the cached induction-off pre-signals.
+            mu_thr_grid = sorted(set(float(t) for t in mu_thr) | {base_thr})
+            print(f"  building this topology's induction-off template grid "
+                  f"({len(mu_thr_grid)}x{len(rst_grid)}, {args.template_grid})...")
+            samples[name]["grid"] = aggregate_template_grid(
+                ctx, mu_off[:ns], mu_thr_grid, rst_grid, seed0=sd + 6000,
+                base_thr=base_thr, base_reset=base_reset, mode=args.template_grid)
+            samples[name]["thr_grid"] = np.asarray(mu_thr_grid, float)
+            samples[name]["scan_thresholds"] = np.asarray(mu_thr, float)
+            set_periodic_reset(ctx, base_reset)
+            mi_n = min(int(args.muon_induction_events), len(mu_drift))
+            if mi_n > 0:
+                print(f"  induction scan ({len(args.inductions)} scales; re-induces per "
+                      f"scale) on {mi_n} events...")
+                samples[name]["n_ind_scan"] = mi_n
+                samples[name]["scan_induction"] = aggregate_sample_induction_scan(
+                    ctx, mu_drift[:mi_n], args.inductions, base_thr, base_reset,
+                    seed0=sd + 8000, evs_off=mu_off[:mi_n],
+                    collect_frac=args.collect_frac)
+                set_induction(ctx, 1.0); set_periodic_reset(ctx, base_reset)
         waveforms += capture_waveforms(ctx, mu_evs, base_thr, base_reset, sd + 900, name,
                                        args.wf_events, args.wf_max_pix)
     set_induction(ctx, 1.0); set_periodic_reset(ctx, base_reset)
@@ -2930,10 +3019,12 @@ def analyze_spectra(spectra, outdir):
             offmap = {float(r): (q, tr) for (t, r, q, tr, _a) in grid
                       if abs(float(t) - base_thr) < 1e-6}
             items = spectra.get("reset") or []
+        n2map = {float(r[0]): (r[1], r[2]) for r in (spectra.get(knob + "_n2") or [])}
         out = []
         for (v, q, tr, _a) in items:
             qo, tro = offmap.get(float(v), (np.empty(0), np.empty(0, bool)))
-            out.append((float(v), q, tr, qo, tro, 0, 0))
+            q2, tr2 = n2map.get(float(v), (np.empty(0), np.empty(0, bool)))
+            out.append((float(v), q, tr, q2, tr2, qo, tro))
         return out
 
     def _entry(label, scan, n_ev):
@@ -2985,6 +3076,114 @@ def analyze_spectra(spectra, outdir):
                     r = np.asarray(nind, float)[np.argsort(np.asarray(v, float))]
                     print("    %-22s" % lab[:22] + "".join("%9.4f" % y
                                                            for y in r / max(n_ev, 1)))
+
+    # --- FULL SHOWER-PARITY SCAN ANALYSIS PER MUON TOPOLOGY -------------------------------
+    # POSITIONS track the threshold; the SCALE-FREE shape ratios (charge in units of the peak
+    # position) divide it out, so they isolate reset/induction; frac_2hit catches pixels being
+    # promoted OUT of the single-hit sample. Shared so every topology, shower included, is
+    # scored on exactly the same observables.
+    obs_keys_g = ["peak_mpv", "tail_peak", "tail_over_core", "shoulder_frac", "frac_2hit"]
+    obs_lbl_g = ["Peak position", "Tail peak", "Tail/core (x)", "Shoulder frac (x)", "2-hit frac"]
+
+    def analyze_sample(name, sm):
+        """Run the shower scan machinery on one control sample: its own template grid, the
+        composite fits, the scan/distribution/migration plots and its own sensitivity matrix.
+
+        The template grid must be the SAMPLE'S OWN: the shower grid is a template for the EM
+        charge spectrum, and a MIP's is a different distribution, so reusing it would freeze
+        the wrong shape into every muon fit."""
+        suf = "_" + name
+        ns = int(sm.get("n_scan", 0)) or int(sm.get("n", 1))
+        grid_sp = sm.get("grid") or []
+        sc_thr, sc_rst = sm.get("scan_threshold") or [], sm.get("scan_reset") or []
+        sc_ind = sm.get("scan_induction") or []
+        if not grid_sp or not sc_thr:
+            return None
+        nom = sm.get("nominal")
+        qn = np.asarray(nom[0], float) if nom else np.empty(0)
+        s_qmax = float(min(np.max(qn[qn > 0]), 50000.0)) if np.any(qn > 0) else qmax
+        s_thr_grid = np.asarray(sm.get("thr_grid") if sm.get("thr_grid") is not None
+                                else thr_grid, float)
+        s_scan_thr = np.asarray(sm.get("scan_thresholds") if sm.get("scan_thresholds") is not None
+                                else thresholds, float)
+        try:
+            sgrid, snodes = fit_template_grid(grid_sp, s_thr_grid, rst_grid, ts,
+                                              s_qmax, ns, noise_e)
+            stp = TemplateParam(sgrid, ts)
+        except Exception as exc:                     # a starved topology (e.g. theta=90)
+            print(f"  {name}: template grid fit failed ({exc}); scans not fitted")
+            return None
+
+        def s_template(thr, cycles):
+            t = snodes.get((float(thr), int(cycles)))
+            return t if (t is not None and t.get("ok")) else stp.template_at(thr, cycles)
+
+        out = {}
+        blocks = [("threshold", sc_thr, s_scan_thr / 1e3,
+                   lambda v: (float(v), base_reset))]
+        if sc_rst:
+            blocks.append(("reset", sc_rst,
+                           reset_rate_khz(np.asarray([r[0] for r in sc_rst], int), ts),
+                           lambda v: (base_thr, int(v))))
+        if sc_ind:
+            blocks.append(("induction", sc_ind,
+                           np.asarray([r[0] for r in sc_ind], float),
+                           lambda v: (base_thr, base_reset)))
+        for knob, scan, disp, pt in blocks:
+            items = [(r[0], r[1], r[2], pt(r[0])[0], s_template(*pt(r[0]))) for r in scan]
+            n_ev = int(sm.get("n_ind_scan", ns)) if knob == "induction" else ns
+            sc, fits = fit_scan(items, n_ev, n_ev, s_qmax, noise_e)
+            _add_multiplicity(sc, [(r[0], r[3], r[4], {}) for r in scan], n_ev)
+            out[knob] = sc
+            plot_scan(None, sc, {"threshold": r"$Q_{\mathrm{thr}}$  ($10^{3}\,e^{-}$)",
+                                 "reset": r"Periodic-reset rate  (kHz)",
+                                 "induction": r"Induction-response scale"}[knob],
+                      f"ti_scan_{knob}{suf}.png", outdir, knob_vals_disp=disp)
+            plot_scan_distributions(
+                [(d, f, q, tr) for d, (v, f, q, tr) in zip(disp, fits)],
+                f"{name}: readout-$Q$ spectra vs {knob}",
+                (lambda d: r"$Q_{\mathrm{thr}}=%.1f$" % d) if knob == "threshold" else
+                (lambda d: ("reset off" if d == 0 else r"%.0f kHz" % d)) if knob == "reset" else
+                (lambda d: r"induction $\times%.1f$" % d),
+                knob, f"ti_dist_{knob}{suf}.png", outdir, xlim=xlim, thr_sigma=thr_sigma)
+            plot_multiplicity_dist(
+                [(d, r[1], r[3], pt(r[0])[0]) for d, r in zip(disp, scan)],
+                f"{name}: single-hit vs two-hit pixels vs {knob}",
+                (lambda d: r"$Q_{\mathrm{thr}}=%.1f$" % d) if knob == "threshold" else
+                (lambda d: ("reset off" if d == 0 else r"%.0f kHz" % d)) if knob == "reset" else
+                (lambda d: r"induction $\times%.1f$" % d),
+                f"ti_multiplicity_{knob}{suf}.png", outdir, n_shower=n_ev,
+                xlim=xlim, qmax=s_qmax)
+        rows, knobs_l = [], []
+        rows.append(sensitivity_row(out["threshold"], obs_keys_g, return_raw=True))
+        knobs_l.append("Threshold")
+        if "reset" in out:
+            rr = np.asarray([r[0] for r in sc_rst], int)
+            rows.append(sensitivity_row(out["reset"], obs_keys_g,
+                                        knob_axis=reset_rate_khz(rr, ts), return_raw=True))
+            knobs_l.append("Periodic reset")
+        if "induction" in out:
+            rows.append(sensitivity_row(out["induction"], obs_keys_g, return_raw=True))
+            knobs_l.append("Induction")
+        plot_sensitivity([r[0] for r in rows], knobs_l, obs_lbl_g, outdir, suffix=suf,
+                         title=f"Sensitivity matrix -- {name}")
+        return dict(scans=out, matrix=[r[0] for r in rows], knobs=knobs_l)
+
+    sample_results = {}
+    _todo = [(n, s) for n, s in samples.items() if n != "shower" and s.get("scan_threshold")]
+    if _todo:
+        print("\n=== Per-topology scan analysis (same machinery as the shower scans) ===")
+        for _nm, _sm in _todo:
+            _r = analyze_sample(_nm, _sm)
+            if _r is None:
+                continue
+            sample_results[_nm] = _r
+            print(f"  {_nm}: fitted {len(_r['knobs'])} scan(s); "
+                  f"sensitivity -> ti_sensitivity_matrix_{_nm}.png")
+            print("                 " + "  ".join(f"{l:>19}" for l in obs_lbl_g))
+            for kn, row in zip(_r["knobs"], _r["matrix"]):
+                cells = [f"{v:7.2f}" if np.isfinite(v) else f"{'--':>7}" for v in row]
+                print(f"  {kn:>13}  " + "  ".join(f"{c:>19}" for c in cells))
 
     print("\n=== Threshold scan ===")
     thr_disp = thresholds / 1e3
@@ -3076,11 +3275,7 @@ def analyze_spectra(spectra, outdir):
 
     # POSITIONS track the threshold; the SCALE-FREE shape ratios (charge measured in units of
     # the peak position) have the threshold divided out, so they isolate reset/induction.
-    # `frac_2hit` is the migration handle: it measures pixels being PROMOTED out of the
-    # single-hit sample, which is the part of the reset response the single-hit cut removes
-    # from every spectral observable above.
-    obs_keys = ["peak_mpv", "tail_peak", "tail_over_core", "shoulder_frac", "frac_2hit"]
-    obs_lbl = ["Peak position", "Tail peak", "Tail/core (x)", "Shoulder frac (x)", "2-hit frac"]
+    obs_keys, obs_lbl = obs_keys_g, obs_lbl_g
     rows = [sensitivity_row(thr_scan, obs_keys, return_raw=True),
             sensitivity_row(rst_scan, obs_keys, knob_axis=reset_rate, return_raw=True),
             sensitivity_row(ind_scan, obs_keys, return_raw=True)]
