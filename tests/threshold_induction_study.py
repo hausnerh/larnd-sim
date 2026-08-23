@@ -447,6 +447,27 @@ def event_induce(ctx, drifted, neigh, radius, seed, collect_frac=0.15):
     )
 
 
+def _cache_mb(evs):
+    """Host megabytes held by a list of cached pre-signal dicts.
+
+    `pixels_signals` dominates: it is a dense (n_unique_pix x n_ticks) float32 array, and
+    n_unique_pix grows with MAX_RADIUS**2. Worth printing, because MAX_RADIUS comes from the
+    RESPONSE FILE rather than from anything set here, so swapping in a wider response table
+    silently multiplies the cache -- which is how a configuration that ran yesterday OOMs
+    today with no change to the command line.
+    """
+    tot = 0
+    for e in evs:
+        if not e:
+            continue
+        for k in ("pixels_signals", "unique_pix", "q_coll", "t_coll", "sig_t_coll",
+                  "t_near", "truth_e", "is_collection"):
+            v = e.get(k)
+            if v is not None:
+                tot += int(np.asarray(v).nbytes)
+    return tot / 1024.0 / 1024.0
+
+
 def event_presignals(ctx, tracks, seed, collect_frac=0.15):
     """Thin wrapper: event_drift then event_induce (for callers that don't reuse drift)."""
     d = event_drift(ctx, tracks)
@@ -2766,24 +2787,29 @@ def produce_spectra(ctx, args):
     if n_eff == 0:
         sys.exit("No events produced any pixels -- check shower placement / config.")
 
-    print("Inducing nominal-induction pre-FEE signals (cached)...")
-    set_induction(ctx, 1.0)
-    set_periodic_reset(ctx, base_reset)
-    evs = [e for e in (event_induce(ctx, d[0], d[1], d[2], seed=args.seed + 100 + i,
-                                    collect_frac=args.collect_frac)
-                       for i, d in enumerate(drift_cache)) if e is not None]
-
-    print("Aggregating nominal single-hit spectrum...")
-    nom_pops = aggregate_hits(ctx, evs, base_thr, base_reset, 1.0, seed0=args.seed + 1)
-    q0, tr0, aux0 = nom_pops[1]
-    nom2 = nom_pops[2]
-    qmax = float(min(np.max(q0[q0 > 0]), 50000.0)) if np.any(q0 > 0) else 30000.0
+    # MEMORY ORDER MATTERS HERE. Each cached pre-signal holds a dense (n_pixels x n_ticks)
+    # float32 array, and n_pixels scales with MAX_RADIUS**2 -- which is read from the
+    # RESPONSE FILE (int(response.shape[0] * RESPONSE_BIN_SIZE // PIXEL_PITCH)), not from
+    # anything this script sets. fsd_cube's dedicated 25x25 response gives MAX_RADIUS=12
+    # where the old shared 9x9 table gave 4, i.e. ~3-4x the pixels per event and a
+    # correspondingly bigger cache. Holding the induction-ON and induction-OFF caches at
+    # full length simultaneously is what OOMs the node.
+    #
+    # So: build the OFF cache first, let the template grid consume it in full, then keep
+    # only the `ind_n` events the induction scan still needs before building the ON cache.
+    # Peak residency drops from 2*n_eff to n_eff + ind_n with no change to any result --
+    # the seeds are per-event and unchanged, so both caches are bit-identical to before.
+    ind_n = min(args.induction_events, n_eff) if args.induction_events else n_eff
 
     print("Inducing induction-OFF pre-FEE signals (pure shower, for templates)...")
     set_induction(ctx, 0.0)
+    set_periodic_reset(ctx, base_reset)
     evs_off = [e for e in (event_induce(ctx, d[0], d[1], d[2], seed=args.seed + 200 + i,
                                         collect_frac=args.collect_frac)
                            for i, d in enumerate(drift_cache)) if e is not None]
+    print(f"  pre-signal cache: {_cache_mb(evs_off):.1f} MB "
+          f"({_cache_mb(evs_off) / max(len(evs_off), 1):.2f} MB/event, "
+          f"MAX_RADIUS={ctx.detector.MAX_RADIUS} pix)")
 
     thr_grid = sorted(set(float(t) for t in args.thresholds) | {base_thr})
     rst_grid = sorted(set(int(r) for r in args.resets) | {int(base_reset)})
@@ -2794,6 +2820,27 @@ def produce_spectra(ctx, args):
     grid_spectra = aggregate_template_grid(ctx, evs_off, thr_grid, rst_grid,
                                            seed0=args.seed + 6000, base_thr=base_thr,
                                            base_reset=base_reset, mode=args.template_grid)
+    if ind_n < len(evs_off):                 # release the tail; only the scan needs it now
+        evs_off = evs_off[:ind_n]
+        print(f"  released induction-off cache beyond {ind_n} events "
+              f"(now {_cache_mb(evs_off):.1f} MB)")
+
+    print("Inducing nominal-induction pre-FEE signals (cached)...")
+    set_induction(ctx, 1.0)
+    set_periodic_reset(ctx, base_reset)
+    evs = [e for e in (event_induce(ctx, d[0], d[1], d[2], seed=args.seed + 100 + i,
+                                    collect_frac=args.collect_frac)
+                       for i, d in enumerate(drift_cache)) if e is not None]
+    print(f"  pre-signal cache: {_cache_mb(evs):.1f} MB "
+          f"(total resident {_cache_mb(evs) + _cache_mb(evs_off):.1f} MB)")
+    if ind_n < len(drift_cache):             # drift geometry is only re-induced for the scan
+        drift_cache = drift_cache[:ind_n]
+
+    print("Aggregating nominal single-hit spectrum...")
+    nom_pops = aggregate_hits(ctx, evs, base_thr, base_reset, 1.0, seed0=args.seed + 1)
+    q0, tr0, aux0 = nom_pops[1]
+    nom2 = nom_pops[2]
+    qmax = float(min(np.max(q0[q0 > 0]), 50000.0)) if np.any(q0 > 0) else 30000.0
 
     print("Aggregating threshold + reset scans (single-hit + two-hit populations)...")
     thr_items, thr_items2 = aggregate_fixed_scan(ctx, evs, args.thresholds,
@@ -2802,7 +2849,6 @@ def produce_spectra(ctx, args):
                                      lambda v: (base_thr, int(v)), seed0=args.seed + 3000)
     set_periodic_reset(ctx, base_reset)
 
-    ind_n = min(args.induction_events, n_eff) if args.induction_events else n_eff
     print(f"Aggregating induction scan ({ind_n} of {n_eff} events; re-induces per scale)...")
     ind_items, ind_items2 = aggregate_induction_scan(
         ctx, drift_cache[:ind_n], args.inductions, base_thr,
@@ -2820,6 +2866,14 @@ def produce_spectra(ctx, args):
                               off=(off_node[2], off_node[3], off_node[4]) if off_node else None)}
     waveforms = capture_waveforms(ctx, evs, base_thr, base_reset, args.seed + 9000, "shower",
                                   args.wf_events, args.wf_max_pix)
+    # Every shower cache is finished with at this point. Release them before the muon
+    # topologies start allocating their own: a through-going muon crosses the whole anode
+    # and so lights far more pixels per event than a compact shower does, and at
+    # MAX_RADIUS=12 holding both sets at once is what tips the node over.
+    if evs or evs_off or drift_cache:
+        print(f"  releasing shower caches "
+              f"({_cache_mb(evs) + _cache_mb(evs_off):.1f} MB) before the muon samples")
+    evs = evs_off = drift_cache = None
     for it, theta in enumerate(args.muon_thetas or []):
         name = "muon_th%02d" % int(round(theta))
         mu_n = min(int(args.muon_events), int(args.n_events))
@@ -2838,6 +2892,8 @@ def produce_spectra(ctx, args):
                                            collect_frac=args.collect_frac)
                               for i, d in enumerate(mu_drift)) if e is not None]
         off = aggregate_singlehits(ctx, mu_off, base_thr, base_reset, 0.0, seed0=sd + 600)
+        print(f"  pre-signal cache: {_cache_mb(mu_evs) + _cache_mb(mu_off):.1f} MB "
+              f"({len(mu_evs)} on + {len(mu_off)} off events)")
         samples[name] = dict(kind="muon", theta=float(theta), n=len(mu_drift),
                              nominal=nom, off=off)
         # Knob scans on THIS topology. The shower scans above cannot answer "does a lower
@@ -2882,6 +2938,7 @@ def produce_spectra(ctx, args):
                 set_induction(ctx, 1.0); set_periodic_reset(ctx, base_reset)
         waveforms += capture_waveforms(ctx, mu_evs, base_thr, base_reset, sd + 900, name,
                                        args.wf_events, args.wf_max_pix)
+        mu_evs = mu_off = mu_drift = mu_raw = None   # free before the next angle allocates
     set_induction(ctx, 1.0); set_periodic_reset(ctx, base_reset)
 
     det_name, _geom, det_path = vd.detector_identity(ctx)
