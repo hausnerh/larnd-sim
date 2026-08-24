@@ -535,6 +535,15 @@ def event_fee_hits(ctx, ev, threshold_e, seed, pops=_HIT_POPS):
     n_hits = hit.sum(axis=1)
     q_all = vd.adc_to_charge(ctx, adc)               # electrons; exactly 0 where adc <= 0
     out = {}
+    # Every pixel that fired at all, whatever its multiplicity, as (summed Q, truth, n_hits).
+    # The n=1/n=2 populations below are just slices of this, but they cannot represent 3+ hits
+    # -- and a saturating pillar pixel reaches 20-30. At 6 bytes/pixel this is far cheaper
+    # than the aux arrays (which are ~74% of the spectra file), so there is no reason to
+    # throw the rest away.
+    hit_any = n_hits >= 1
+    out["all"] = (np.asarray(q_all[hit_any].sum(axis=1), float),
+                  ev["is_collection"][hit_any],
+                  np.asarray(n_hits[hit_any], np.int16))
     for n in pops:
         sel = n_hits == n
         if not sel.any():
@@ -551,6 +560,11 @@ def event_fee_hits(ctx, ev, threshold_e, seed, pops=_HIT_POPS):
                    t_near=t_near, dt_near=t_hit - t_near)
         out[n] = (np.asarray(q, float), ev["is_collection"][sel], aux)
     return out
+
+
+def _empty_all():
+    """Empty all-multiplicity record, shaped like a real one."""
+    return np.empty(0), np.empty(0, bool), np.empty(0, np.int16)
 
 
 def event_fee_singlehits(ctx, ev, threshold_e, seed):
@@ -853,6 +867,7 @@ def aggregate_hits(ctx, evs, threshold_e, reset_cycles, induction_scale,
     """
     set_periodic_reset(ctx, reset_cycles)
     acc = {n: ([], [], []) for n in pops}
+    alla = ([], [], [])
     with _silence_device_stdout():
         for i, ev in enumerate(evs):
             res = event_fee_hits(ctx, ev, threshold_e, seed=seed0 + i, pops=pops)
@@ -860,12 +875,18 @@ def aggregate_hits(ctx, evs, threshold_e, reset_cycles, induction_scale,
                 q, t, a = res[n]
                 if q.size:
                     acc[n][0].append(q); acc[n][1].append(t); acc[n][2].append(a)
+            qa, ta, na = res["all"]
+            if qa.size:
+                alla[0].append(qa); alla[1].append(ta); alla[2].append(na)
     out = {}
     for n in pops:
         qs, trs, auxs = acc[n]
         out[n] = (_empty_pop() if not qs else
                   (np.concatenate(qs), np.concatenate(trs),
                    {k: np.concatenate([a[k] for a in auxs]) for k in _AUX_KEYS}))
+    out["all"] = (_empty_all() if not alla[0] else
+                  (np.concatenate(alla[0]), np.concatenate(alla[1]),
+                   np.concatenate(alla[2])))
     return out
 
 
@@ -1574,7 +1595,7 @@ def plot_multiplicity_dist(panels, title, fmt_val, fname, outdir, n_shower=1,
 
 
 def plot_charge_overlay(series, title, fname, outdir, n_shower=1, qmax=None,
-                        xlabel=None, note=None):
+                        xlabel=None, note=None, legend_title=None):
     """Overlay one charge distribution per threshold, with NO truth split.
 
     `series` is [(label, q, threshold_e), ...]. Every curve is binned on COMMON edges (built
@@ -1596,6 +1617,7 @@ def plot_charge_overlay(series, title, fname, outdir, n_shower=1, qmax=None,
     ns = max(float(n_shower), 1.0)
     cmap = plt.get_cmap("viridis")
     nser = len(series)
+    _one_thr = len({round(t, 6) for _l, _q, t in series}) == 1
     base = fname[:-4] if fname.endswith(".png") else fname
     for logy, suf in ((True, ""), (False, "_lin")):
         fig, ax = plt.subplots(figsize=(7.6, 4.9))
@@ -1606,7 +1628,10 @@ def plot_charge_overlay(series, title, fname, outdir, n_shower=1, qmax=None,
             y = cnt / ns
             top = max(top, float(y.max()) if y.size else 0.0)
             ax.step(cen / 1e3, y, where="mid", color=col, lw=1.7, label=lab)
-            ax.axvline(t / 1e3, color=col, ls=":", lw=1.0, alpha=0.75)
+            if not _one_thr:
+                ax.axvline(t / 1e3, color=col, ls=":", lw=1.0, alpha=0.75)
+        if _one_thr:                       # reset/induction scans: threshold is fixed
+            ax.axvline(series[0][2] / 1e3, color="0.45", ls=":", lw=1.2)
         if logy:
             ax.set_yscale("log")
             ax.set_ylim(0.5 / ns, max(top * 3.0, 1.0 / ns))
@@ -1617,8 +1642,8 @@ def plot_charge_overlay(series, title, fname, outdir, n_shower=1, qmax=None,
         ax.set_ylabel("pixels / shower")
         ax.set_title(title, fontsize=11.5)
         ax.grid(alpha=0.22, lw=0.6)
-        ax.legend(title=r"$Q_{\mathrm{thr}}$", fontsize=9, title_fontsize=9,
-                  loc="upper right", ncol=2)
+        ax.legend(title=legend_title or r"$Q_{\mathrm{thr}}$", fontsize=9,
+                  title_fontsize=9, loc="upper right", ncol=2)
         if note:
             ax.text(0.015, 0.02, note, transform=ax.transAxes, fontsize=8.0, va="bottom",
                     ha="left", color="0.35")
@@ -2208,17 +2233,19 @@ def aggregate_fixed_scan(ctx, evs, knob_vals, set_fn, seed0):
     """GPU: threshold or reset scan spectra on cached nominal-induction pre-signals.
     `set_fn(value)` -> (threshold_e, reset_cycles).
 
-    Returns (items1, items2), each [(val, q, tr, aux), ...] -- the single-hit scan and the
-    parallel TWO-hit scan. Both come from the same FEE pass, so items2 is free; it is what
-    makes the threshold/reset migration visible (see `event_fee_hits`).
+    Returns (items1, items2, items_all): the single-hit scan, the parallel TWO-hit scan, and
+    the ALL-multiplicity record [(val, q_sum, tr, n_hits), ...]. All come from the same FEE
+    pass, so the extra two are free; items2 makes the migration visible and items_all is the
+    only one that can represent 3+ hits (see `event_fee_hits`).
     """
-    out, out2 = [], []
+    out, out2, outa = [], [], []
     for j, val in enumerate(knob_vals):
         thr, rst = set_fn(val)
         pops = aggregate_hits(ctx, evs, thr, rst, 1.0, seed0=seed0 + j * 1000)
         out.append((val,) + pops[1])
         out2.append((val,) + pops[2])
-    return out, out2
+        outa.append((float(val),) + pops["all"])
+    return out, out2, outa
 
 
 def aggregate_sample_scan(ctx, evs_on, evs_off, knob_vals, set_fn, seed0):
@@ -2290,9 +2317,9 @@ def aggregate_induction_scan(ctx, drift_cache, scales, base_threshold, base_rese
     scale on the cached drift/pixel geometry (scale-independent). `evs_off` is reused
     verbatim for the scale=0 point.
 
-    Returns (items1, items2) -- single-hit and two-hit, as in `aggregate_fixed_scan`."""
+    Returns (items1, items2, items_all), as in `aggregate_fixed_scan`."""
     set_periodic_reset(ctx, base_reset)
-    out, out2 = [], []
+    out, out2, outa = [], [], []
     for j, s in enumerate(scales):
         if s == 0.0 and evs_off is not None:
             evs = evs_off                              # induction-off cache == scale-0
@@ -2305,8 +2332,9 @@ def aggregate_induction_scan(ctx, drift_cache, scales, base_threshold, base_rese
                               seed0=seed0 + j * 1000 + 50000)
         out.append((float(s),) + pops[1])
         out2.append((float(s),) + pops[2])
+        outa.append((float(s),) + pops["all"])
     set_induction(ctx, 1.0)
-    return out, out2
+    return out, out2, outa
 
 
 def fit_scan(items, n_events, n_shower, qmax, noise_e):
@@ -2686,6 +2714,20 @@ def save_spectra(spectra, path):
         kw[f"{name}_n2_tr"] = _obj_array([it[2] for it in items])
         for k in _AUX_KEYS:
             kw[f"{name}_n2_aux_{k}"] = _obj_array([it[3][k] for it in items])
+    # all-multiplicity records: (q_sum, truth, n_hits) per scan point
+    na = spectra.get("nominal_all")
+    if na is not None:
+        kw["nominal_all_q"] = np.asarray(na[0], np.float32)
+        kw["nominal_all_tr"] = np.asarray(na[1], bool)
+        kw["nominal_all_n"] = np.asarray(na[2], np.int16)
+    for name in ("threshold", "reset", "induction"):
+        items = spectra.get(name + "_all")
+        if not items:
+            continue
+        kw[f"{name}_all_vals"] = np.asarray([r[0] for r in items], float)
+        kw[f"{name}_all_q"] = _obj_array([np.asarray(r[1], np.float32) for r in items])
+        kw[f"{name}_all_tr"] = _obj_array([r[2] for r in items])
+        kw[f"{name}_all_n"] = _obj_array([np.asarray(r[3], np.int16) for r in items])
     g = spectra["grid"]
     kw["grid_thr"] = np.asarray([it[0] for it in g], float)
     kw["grid_rst"] = np.asarray([it[1] for it in g], int)
@@ -2790,6 +2832,20 @@ def load_spectra(path):
         spectra[name + "_n2"] = [(float(vals[i]), np.asarray(qs[i], float),
                                   np.asarray(trs[i], bool), _aux(name + "_n2", i))
                                  for i in range(len(vals))]
+    spectra["nominal_all"] = ((np.asarray(d["nominal_all_q"], float),
+                               np.asarray(d["nominal_all_tr"], bool),
+                               np.asarray(d["nominal_all_n"], int))
+                              if "nominal_all_q" in d.files else None)
+    for name in ("threshold", "reset", "induction"):
+        key = name + "_all_vals"
+        if key not in d.files:
+            spectra[name + "_all"] = []
+            continue
+        v = d[key]
+        spectra[name + "_all"] = [(float(v[i]), np.asarray(d[name + "_all_q"][i], float),
+                                   np.asarray(d[name + "_all_tr"][i], bool),
+                                   np.asarray(d[name + "_all_n"][i], int))
+                                  for i in range(len(v))]
     gthr, grst, gq, gtr = d["grid_thr"], d["grid_rst"], d["grid_q"], d["grid_tr"]
     spectra["grid"] = [(float(gthr[i]), int(grst[i]), np.asarray(gq[i], float),
                         np.asarray(gtr[i], bool), _aux("grid", i))
@@ -2943,14 +2999,14 @@ def produce_spectra(ctx, args):
     qmax = float(min(np.max(q0[q0 > 0]), 50000.0)) if np.any(q0 > 0) else 30000.0
 
     print("Aggregating threshold + reset scans (single-hit + two-hit populations)...")
-    thr_items, thr_items2 = aggregate_fixed_scan(ctx, evs, args.thresholds,
+    thr_items, thr_items2, thr_all = aggregate_fixed_scan(ctx, evs, args.thresholds,
                                      lambda v: (float(v), base_reset), seed0=args.seed + 2000)
-    rst_items, rst_items2 = aggregate_fixed_scan(ctx, evs, args.resets,
+    rst_items, rst_items2, rst_all = aggregate_fixed_scan(ctx, evs, args.resets,
                                      lambda v: (base_thr, int(v)), seed0=args.seed + 3000)
     set_periodic_reset(ctx, base_reset)
 
     print(f"Aggregating induction scan ({ind_n} of {n_eff} events; re-induces per scale)...")
-    ind_items, ind_items2 = aggregate_induction_scan(
+    ind_items, ind_items2, ind_all = aggregate_induction_scan(
         ctx, drift_cache[:ind_n], args.inductions, base_thr,
         base_reset, seed0=args.seed + 4000,
         evs_off=evs_off[:ind_n], collect_frac=args.collect_frac)
@@ -3053,7 +3109,11 @@ def produce_spectra(ctx, args):
                 # parallel TWO-hit populations (same FEE passes): the migration target that
                 # makes the threshold/reset response visible -- see event_fee_hits.
                 nominal_n2=nom2, threshold_n2=thr_items2, reset_n2=rst_items2,
-                induction_n2=ind_items2)
+                induction_n2=ind_items2,
+                # every pixel that fired, with its multiplicity -- the only record that can
+                # represent 3+ hits (~6 bytes/pixel; the aux arrays are ~74% of this file)
+                nominal_all=nom_pops["all"], threshold_all=thr_all,
+                reset_all=rst_all, induction_all=ind_all)
 
 
 def analyze_spectra(spectra, outdir):
@@ -3371,6 +3431,21 @@ def analyze_spectra(spectra, outdir):
     # threshold, first per HIT (single-hit pixels, one ADC sample each) and then per PIXEL
     # (that pixel's samples summed, so two-hit pixels re-enter at their total charge). The
     # pair shows what the single-hit cut removes and where it puts it back.
+    def per_pixel_series(knob, items, labeller, thr_of):
+        """Per-pixel summed charge for the overlay, preferring the true all-multiplicity
+        record and falling back to 1-hit + 2-hit when a file predates it (in which case the
+        3+ pixels are simply missing and the tail is a lower limit)."""
+        allrec = {float(r[0]): np.asarray(r[1], float) for r in (spectra.get(knob + "_all") or [])}
+        n2 = {float(r[0]): np.asarray(r[1], float) for r in (spectra.get(knob + "_n2") or [])}
+        exact = bool(allrec)
+        out = []
+        for lab, (v, q, _tr, _a) in zip(labeller, items):
+            v = float(v)
+            qq = allrec[v] if exact else np.concatenate(
+                [np.asarray(q, float), n2.get(v, np.empty(0))])
+            out.append((lab, qq, float(thr_of(v))))
+        return out, exact
+
     _lab = lambda v: r"%.1f ke$^-$" % (v / 1e3)
     _n2 = {float(r[0]): np.asarray(r[1], float) for r in (spectra.get("threshold_n2") or [])}
     plot_charge_overlay(
@@ -3379,15 +3454,18 @@ def analyze_spectra(spectra, outdir):
         "ti_charge_per_hit_vs_threshold.png", outdir, n_shower=n_main, qmax=qmax,
         xlabel=r"hit charge $Q$  ($10^{3}\,e^{-}$)",
         note="dotted lines mark each threshold")
-    if _n2:
+    _ser, _exact = per_pixel_series("threshold", spectra["threshold"],
+                                    [_lab(v) for (v, _q, _t, _a) in spectra["threshold"]],
+                                    lambda v: v)
+    if _ser and (_exact or _n2):
         plot_charge_overlay(
-            [(_lab(v), np.concatenate([np.asarray(q, float),
-                                       _n2.get(float(v), np.empty(0))]), float(v))
-             for (v, q, _tr, _a) in spectra["threshold"]],
-            "Total recorded charge per pixel, 1- and 2-hit pixels summed (no truth split)",
+            _ser,
+            ("Total recorded charge per pixel, every multiplicity (no truth split)" if _exact
+             else "Total recorded charge per pixel, 1- and 2-hit pixels summed (no truth split)"),
             "ti_charge_per_pixel_vs_threshold.png", outdir, n_shower=n_main, qmax=qmax,
             xlabel=r"summed pixel charge $\Sigma Q$  ($10^{3}\,e^{-}$)",
-            note="pixels with 3+ hits are not recorded, so the high-$Q$ tail is a lower limit")
+            note=(None if _exact else
+                  "pixels with 3+ hits are not recorded, so the high-$Q$ tail is a lower limit"))
 
     print("\n=== Periodic-reset scan ===")
     reset_rate = reset_rate_khz(resets, ts)
@@ -3407,6 +3485,33 @@ def analyze_spectra(spectra, outdir):
                            lambda d: ("reset off" if d == 0 else r"%.0f kHz" % d),
                            "ti_multiplicity_reset.png", outdir, n_shower=n_main,
                            xlim=xlim, qmax=qmax)
+
+    # Same no-truth-split overlays as the threshold scan, but against reset rate. Here the
+    # threshold is fixed, so any spread between the curves is the reset genuinely reshaping
+    # the spectrum rather than the selection moving.
+    _rlab = lambda v, d: ("reset off" if d == 0 else r"%.0f kHz" % d)
+    _rn2 = {float(r[0]): np.asarray(r[1], float) for r in (spectra.get("reset_n2") or [])}
+    plot_charge_overlay(
+        [(_rlab(v, d), q, base_thr)
+         for d, (v, q, _tr, _a) in zip(reset_rate, spectra["reset"])],
+        "Recorded charge per hit, all single-hit pixels (no truth split)",
+        "ti_charge_per_hit_vs_reset.png", outdir, n_shower=n_main, qmax=qmax,
+        xlabel=r"hit charge $Q$  ($10^{3}\,e^{-}$)", legend_title="reset rate",
+        note="dotted line marks the fixed threshold")
+    _rser, _rexact = per_pixel_series("reset", spectra["reset"],
+                                      [_rlab(v, d) for d, (v, _q, _t, _a)
+                                       in zip(reset_rate, spectra["reset"])],
+                                      lambda v: base_thr)
+    if _rser and (_rexact or _rn2):
+        plot_charge_overlay(
+            _rser,
+            ("Total recorded charge per pixel, every multiplicity (no truth split)" if _rexact
+             else "Total recorded charge per pixel, 1- and 2-hit pixels summed (no truth split)"),
+            "ti_charge_per_pixel_vs_reset.png", outdir, n_shower=n_main, qmax=qmax,
+            xlabel=r"summed pixel charge $\Sigma Q$  ($10^{3}\,e^{-}$)",
+            legend_title="reset rate",
+            note=(None if _rexact else
+                  "pixels with 3+ hits are not recorded, so the high-$Q$ tail is a lower limit"))
 
     print("\n=== Induction-response scan ===")
     ind_disp = inductions
