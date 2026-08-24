@@ -1573,6 +1573,59 @@ def plot_multiplicity_dist(panels, title, fmt_val, fname, outdir, n_shower=1,
         _savefig(fig, f"{outdir}/{base}{suf}.png")
 
 
+def plot_charge_overlay(series, title, fname, outdir, n_shower=1, qmax=None,
+                        xlabel=None, note=None):
+    """Overlay one charge distribution per threshold, with NO truth split.
+
+    `series` is [(label, q, threshold_e), ...]. Every curve is binned on COMMON edges (built
+    from the pooled sample at the lowest threshold) so they can be read against each other
+    bin for bin, rather than each being binned to its own range. Colour runs with the
+    threshold and each threshold is marked by a dotted line in its own colour, so the
+    turn-on of every curve sits next to where its discriminator actually was.
+    """
+    import matplotlib.pyplot as plt
+    series = [(l, np.asarray(q, float), float(t)) for l, q, t in series if np.size(q)]
+    if not series:
+        return
+    pooled = np.concatenate([q for _l, q, _t in series])
+    h = _hist(pooled, min(t for _l, _q, t in series), qmax=qmax)
+    if h is None:
+        return
+    edges = h[3]
+    cen = 0.5 * (edges[:-1] + edges[1:])
+    ns = max(float(n_shower), 1.0)
+    cmap = plt.get_cmap("viridis")
+    nser = len(series)
+    base = fname[:-4] if fname.endswith(".png") else fname
+    for logy, suf in ((True, ""), (False, "_lin")):
+        fig, ax = plt.subplots(figsize=(7.6, 4.9))
+        top = 0.0
+        for i, (lab, q, t) in enumerate(series):
+            col = cmap(0.06 + 0.86 * i / max(nser - 1, 1))
+            cnt, _ = np.histogram(q, bins=edges)
+            y = cnt / ns
+            top = max(top, float(y.max()) if y.size else 0.0)
+            ax.step(cen / 1e3, y, where="mid", color=col, lw=1.7, label=lab)
+            ax.axvline(t / 1e3, color=col, ls=":", lw=1.0, alpha=0.75)
+        if logy:
+            ax.set_yscale("log")
+            ax.set_ylim(0.5 / ns, max(top * 3.0, 1.0 / ns))
+        else:
+            ax.set_ylim(0.0, max(top * 1.15, 1e-6))
+        ax.set_xlim(0.0, edges[-1] / 1e3)
+        ax.set_xlabel(xlabel or r"$Q$  ($10^{3}\,e^{-}$)")
+        ax.set_ylabel("pixels / shower")
+        ax.set_title(title, fontsize=11.5)
+        ax.grid(alpha=0.22, lw=0.6)
+        ax.legend(title=r"$Q_{\mathrm{thr}}$", fontsize=9, title_fontsize=9,
+                  loc="upper right", ncol=2)
+        if note:
+            ax.text(0.015, 0.02, note, transform=ax.transAxes, fontsize=8.0, va="bottom",
+                    ha="left", color="0.35")
+        fig.tight_layout()
+        _savefig(fig, f"{outdir}/{base}{suf}.png")
+
+
 def plot_multiplicity_rates(cols, outdir, fname="ti_multiplicity_rates.png"):
     """Migration summary: where the single-hit sample gains and loses pixels.
 
@@ -3313,6 +3366,28 @@ def analyze_spectra(spectra, outdir):
                            lambda d: r"$Q_{\mathrm{thr}}=%.1f$" % d,
                            "ti_multiplicity_threshold.png", outdir, n_shower=n_main,
                            xlim=xlim, qmax=qmax)
+
+    # Threshold overlays with NO truth split: the whole recorded population at each
+    # threshold, first per HIT (single-hit pixels, one ADC sample each) and then per PIXEL
+    # (that pixel's samples summed, so two-hit pixels re-enter at their total charge). The
+    # pair shows what the single-hit cut removes and where it puts it back.
+    _lab = lambda v: r"%.1f ke$^-$" % (v / 1e3)
+    _n2 = {float(r[0]): np.asarray(r[1], float) for r in (spectra.get("threshold_n2") or [])}
+    plot_charge_overlay(
+        [(_lab(v), q, float(v)) for (v, q, _tr, _a) in spectra["threshold"]],
+        "Recorded charge per hit, all single-hit pixels (no truth split)",
+        "ti_charge_per_hit_vs_threshold.png", outdir, n_shower=n_main, qmax=qmax,
+        xlabel=r"hit charge $Q$  ($10^{3}\,e^{-}$)",
+        note="dotted lines mark each threshold")
+    if _n2:
+        plot_charge_overlay(
+            [(_lab(v), np.concatenate([np.asarray(q, float),
+                                       _n2.get(float(v), np.empty(0))]), float(v))
+             for (v, q, _tr, _a) in spectra["threshold"]],
+            "Total recorded charge per pixel, 1- and 2-hit pixels summed (no truth split)",
+            "ti_charge_per_pixel_vs_threshold.png", outdir, n_shower=n_main, qmax=qmax,
+            xlabel=r"summed pixel charge $\Sigma Q$  ($10^{3}\,e^{-}$)",
+            note="pixels with 3+ hits are not recorded, so the high-$Q$ tail is a lower limit")
 
     print("\n=== Periodic-reset scan ===")
     reset_rate = reset_rate_khz(resets, ts)
