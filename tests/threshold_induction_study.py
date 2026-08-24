@@ -1318,8 +1318,35 @@ def _savefig(fig, path):
     print("  wrote", path)
 
 
+# theta is measured to the PIXEL PLANE, so the two extremes are physically distinct
+# topologies and deserve names rather than angles: 0 deg lies IN the plane (isochronous --
+# the whole track's charge arrives together), 90 deg runs along the drift (the "pillar" --
+# all charge onto one pixel column, arriving spread over the full drift time).
+_MUON_GEOM = {0: ("in-plane", "inplane"), 90: ("along drift", "alongdrift")}
+
+
+def sample_labels(name, sm):
+    """(title, population, slug) for one control sample.
+
+    The dict key (`muon_th45`) is fine for lookups but tells a reader nothing on a plot, and
+    the generic plot furniture says "shower" everywhere -- wrong on a muon panel, where the
+    collected population is the muon's own ionisation. `population` replaces that word and
+    `slug` names the output files.
+    """
+    if str(sm.get("kind", "")) != "muon":
+        return "EM shower", "shower", "shower"
+    th = float(sm.get("theta", float("nan")))
+    if not np.isfinite(th):
+        return "Muon", "muon", str(name)
+    key = int(round(th))
+    if key in _MUON_GEOM:
+        word, slug = _MUON_GEOM[key]
+        return f"Muon, {word} ({key}\u00b0 to pixel plane)", "muon", f"muon_{slug}"
+    return f"Muon, inclined {key}\u00b0 to pixel plane", "muon", f"muon_incl{key:02d}"
+
+
 def _draw_charge_dist(ax, q, truth, fit, threshold_e, xlim=None,
-                      compact=False, thr_sigma=0.0, logy=True):
+                      compact=False, thr_sigma=0.0, logy=True, population="shower"):
     """Draw one FEE-readout single-hit Q spectrum (the noisy Q you trigger on in
     data), bins coloured by the per-pixel backtrack truth into induction vs shower
     (collection) hits (see categorize()), the composite template fit overlaid (frozen
@@ -1334,7 +1361,7 @@ def _draw_charge_dist(ax, q, truth, fit, threshold_e, xlim=None,
             stacked=True, color=[_C_IND, _C_SHW], alpha=0.6, edgecolor="white",
             linewidth=(0.2 if compact else 0.35),
             weights=[np.full(int(is_ind.sum()), 1.0 / nsh), np.full(int(is_shw.sum()), 1.0 / nsh)],
-            label=["Induction", "Shower"])
+            label=["Induction", population.capitalize()])
     if fit.get("ok") and fit.get("kind") == "template":
         xs = np.linspace(fit["edges"][0], fit["edges"][-1], 700)
         lg = fit["lg"]
@@ -1355,19 +1382,30 @@ def _draw_charge_dist(ax, q, truth, fit, threshold_e, xlim=None,
         ax.axvline(threshold_e / 1e3, color="0.30", ls="--", lw=1.2)
     else:
         ax.axvline(threshold_e / 1e3, color="0.30", ls="--", lw=1.2, label=r"$Q_{\mathrm{thr}}$")
+    # Scale the y-axis from the DATA, not from the fit overlay. The template curve is a
+    # Landau evaluated across the whole panel and diverges towards x -> 0, so letting
+    # matplotlib autoscale on it pushes the top to ~1e6 and squashes every histogram into the
+    # bottom decade (visible in every scan-distribution plot before this fix).
+    _tot, _ = np.histogram(q, bins=fit["edges"])
+    _dtop = float(_tot.max()) / nsh if _tot.size and _tot.max() > 0 else 1.0
     if logy:
         ax.set_yscale("log")
-        ax.set_ylim(bottom=0.6)
+        top = max(_dtop * 6.0, 2.0)
+        cur = ax.get_ylim()[1]                 # panels share y: keep a bigger DATA-driven
+        if np.isfinite(cur) and top < cur <= 100.0 * top:   # top from a previous panel, but
+            top = cur                                       # never the fit-curve runaway
+        ax.set_ylim(0.6, top)
     else:
         ax.set_yscale("linear")
-        ax.set_ylim(bottom=0.0)
+        ax.set_ylim(0.0, max(_dtop * 1.35, 1.0))
     if xlim is not None:
         ax.set_xlim(*xlim)
     elif fit.get("edges") is not None:
         ax.set_xlim(fit["edges"][0] / 1e3, fit["edges"][-1] / 1e3)
 
 
-def plot_headline(ctx, q, truth, fit, outdir, xlim=None, thr_sigma=0.0):
+def plot_headline(ctx, q, truth, fit, outdir, xlim=None, thr_sigma=0.0,
+                  suffix="", population="shower", title=None):
     """Nominal single-hit Q spectrum (the noisy Q triggered on, induction/shower
     coloured) + composite template fit (frozen shower langaus + floating Gaussian +
     induction langau) + threshold-with-noise band. Saved both log-y (ti_hist_nominal.png,
@@ -1376,6 +1414,7 @@ def plot_headline(ctx, q, truth, fit, outdir, xlim=None, thr_sigma=0.0):
     for logy, suf in ((True, ""), (False, "_lin")):
         fig, ax = plt.subplots(figsize=(7.2, 5.0))
         _draw_charge_dist(ax, q, truth, fit, fit["threshold_e"], xlim=xlim,
+                          population=population,
                           thr_sigma=thr_sigma, logy=logy)
         if fit.get("ok"):
             stats = "\n".join((
@@ -1388,14 +1427,16 @@ def plot_headline(ctx, q, truth, fit, outdir, xlim=None, thr_sigma=0.0):
                     fontsize=10.5, linespacing=1.5,
                     bbox=dict(boxstyle="round,pad=0.5", fc="white", ec="0.6", lw=0.8))
         ax.set_xlabel(r"Single-hit pixel charge $Q$ ($10^{3}\,e^{-}$)")
-        ax.set_ylabel("Single-hit pixels / shower")
+        ax.set_ylabel(f"Single-hit pixels / {population}")
         ax.legend(loc="upper center", fontsize=9.5, handlelength=1.9)
         fig.tight_layout()
-        _savefig(fig, f"{outdir}/ti_hist_nominal{suf}.png")
+        if title:
+            ax.set_title(title, fontsize=12)
+        _savefig(fig, f"{outdir}/ti_hist_nominal{suffix}{suf}.png")
 
 
 def plot_scan_distributions(panels, title, fmt_val, col0_header, fname, outdir,
-                            xlim=None, thr_sigma=0.0):
+                            xlim=None, thr_sigma=0.0, population="shower"):
     """Grid of readout-Q spectra + fits, one panel per test case (scan value). Each
     panel carries its own fit summary (the two langauss MPVs and the backtrack
     induction/shower pixel yields) in its annotation box -- no separate table -- and
@@ -1419,12 +1460,14 @@ def plot_scan_distributions(panels, title, fmt_val, col0_header, fname, outdir,
                                  sharex=True, sharey=logy, squeeze=False)
         for ax, (d, f, q, tr) in zip(axes.flat, items):
             _draw_charge_dist(ax, q, tr, f, f["threshold_e"], xlim=xlim,
-                              compact=True, thr_sigma=thr_sigma, logy=logy)
+                              compact=True, thr_sigma=thr_sigma, logy=logy,
+                              population=population)
             is_ind, is_shw = categorize(q, tr)
+            pc = population[0]                      # subscript: i(nduction) vs s(hower)/m(uon)
             stat = "\n".join((
                 fmt_val(d),
-                r"$\mathrm{MPV}_{i,s}=%.1f,\,%.1f$" % (f["mpv_ind"] / 1e3, f["mpv_shw"] / 1e3),
-                r"$N_{i,s}=%d,\,%d$" % (int(is_ind.sum()), int(is_shw.sum()))))
+                r"$\mathrm{MPV}_{i,%s}=%%.1f,\,%%.1f$" % pc % (f["mpv_ind"] / 1e3, f["mpv_shw"] / 1e3),
+                r"$N_{i,%s}=%%d,\,%%d$" % pc % (int(is_ind.sum()), int(is_shw.sum()))))
             ax.text(0.95, 0.93, stat, transform=ax.transAxes, ha="right", va="top",
                     fontsize=8.0, linespacing=1.35,
                     bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="0.7", lw=0.6))
@@ -1438,7 +1481,7 @@ def plot_scan_distributions(panels, title, fmt_val, col0_header, fname, outdir,
                 axb.tick_params(labelbottom=True)
         for r in range(nrow):
             if r * ncol < n:
-                axes[r, 0].set_ylabel("Single-hit pixels / shower")
+                axes[r, 0].set_ylabel(f"Single-hit pixels / {population}")
         h, l = axes.flat[0].get_legend_handles_labels()
         fig.legend(h, l, loc="upper center", ncol=4, fontsize=9.5, bbox_to_anchor=(0.5, 1.02))
         fig.suptitle(title, y=1.06, fontsize=12)
@@ -1464,7 +1507,7 @@ def _paired_hist(q1, q2, threshold_e, qmax=None, nbins=45):
 
 
 def plot_multiplicity_dist(panels, title, fmt_val, fname, outdir, n_shower=1,
-                           xlim=None, qmax=None):
+                           xlim=None, qmax=None, population="shower"):
     """Paired single-hit / two-hit spectra, one panel per scan value.
 
     Every fit in this study runs on pixels with EXACTLY one ADC sample. That cut is not
@@ -1522,7 +1565,7 @@ def plot_multiplicity_dist(panels, title, fmt_val, fname, outdir, n_shower=1,
                 axb.tick_params(labelbottom=True)
         for r in range(nrow):
             if r * ncol < n:
-                axes[r, 0].set_ylabel("Pixels / shower")
+                axes[r, 0].set_ylabel(f"Pixels / {population}")
         h, l = axes.flat[0].get_legend_handles_labels()
         fig.legend(h, l, loc="upper center", ncol=2, fontsize=9.5, bbox_to_anchor=(0.5, 1.02))
         fig.suptitle(title, y=1.06, fontsize=12)
@@ -1596,7 +1639,8 @@ def _add_multiplicity(scan, items2, n_shower):
     return scan
 
 
-def plot_scan(ctx, scan, knob_label, fname, outdir, knob_vals_disp=None, mpv_ylim=None):
+def plot_scan(ctx, scan, knob_label, fname, outdir, knob_vals_disp=None, mpv_ylim=None,
+              population="shower", title=None):
     """The three DATA-BLIND handles vs one knob, in three stacked panels:
     (a) low-Q peak MPV [tracks THRESHOLD], (b) peak height [INDUCTION & reset],
     (c) tail height [periodic RESET & induction]. Points with uncertainties, no
@@ -1614,13 +1658,15 @@ def plot_scan(ctx, scan, knob_label, fname, outdir, knob_vals_disp=None, mpv_yli
     if mpv_ylim is not None:
         axes[0].set_ylim(*mpv_ylim)
     axes[1].errorbar(x, col("peak_height"), fmt="s", color=_C_SHW, **ekw)
-    axes[1].set_ylabel("Peak height  (hits/shower)")
+    axes[1].set_ylabel(f"Peak height  (hits/{population})")
     axes[2].errorbar(x, col("tail_height"), fmt="^", color=_C_PUR, **ekw)
-    axes[2].set_ylabel("Tail height  (hits/shower)")
+    axes[2].set_ylabel(f"Tail height  (hits/{population})")
     axes[2].set_xlabel(knob_label)
     for k, axp in enumerate(axes):
         axp.text(0.018, 0.93, "(%s)" % chr(97 + k), transform=axp.transAxes,
                  fontsize=11, va="top", ha="left")
+    if title:
+        axes[0].set_title(title, fontsize=11.5)
     fig.align_ylabels(axes)
     fig.tight_layout()
     _savefig(fig, f"{outdir}/{fname}")
@@ -1906,7 +1952,7 @@ def plot_template_params(grid, tparam, ts, outdir):
 
 
 def plot_offpeak_anatomy(q, tr, aux, threshold_e, outdir, qmax=None, n_shower=1,
-                         suffix="", title=None):
+                         suffix="", title=None, population="shower"):
     """(1) WHAT ARE THE TWO PEAKS of the induction-off shower template?
 
     Splits the induction-OFF single-hit spectrum by the truth quantities that the
@@ -1939,7 +1985,7 @@ def plot_offpeak_anatomy(q, tr, aux, threshold_e, outdir, qmax=None, n_shower=1,
                weights=[np.full(x.size, 1.0 / nsh) for x in stacks])
     ax[0].axvline(T / 1e3, color="0.3", ls="--", lw=1.1)
     ax[0].set_xlabel(r"recorded $Q$ ($10^{3}e^{-}$)")
-    ax[0].set_ylabel("single-hit pixels / shower")
+    ax[0].set_ylabel(f"single-hit pixels / {population}")
     ax[0].set_title("Induction-off spectrum, split by charge that landed", fontsize=11)
     ax[0].set_xlim(0, 40); ax[0].legend(fontsize=9, title="real charge on pad")
     # (b) recorded Q vs collected charge
@@ -1971,7 +2017,7 @@ def plot_offpeak_anatomy(q, tr, aux, threshold_e, outdir, qmax=None, n_shower=1,
 
 
 def plot_hit_timing(q, tr, aux, threshold_e, outdir, n_shower=1, n_mad=3.0,
-                    suffix="", title=None):
+                    suffix="", title=None, population="shower"):
     """(2) CAUSAL shower/induction separation using timing.
 
     Two reference times are used, because a pure-induction pad collects nothing and so has
@@ -2027,7 +2073,7 @@ def plot_hit_timing(q, tr, aux, threshold_e, outdir, n_shower=1, n_mad=3.0,
         b = np.linspace(np.nanpercentile(dtn[fn], 0.5), np.nanpercentile(dtn[fn], 99.5), 70)
         if spatial.any():
             ax[0].hist(dtn[spatial & fn], bins=b, color=_C_SHW, alpha=.65,
-                       label="charge landed (spatial 'shower')")
+                       label=f"charge landed (spatial '{population}')")
         if (~spatial).any():
             ax[0].hist(dtn[~spatial & fn], bins=b, color=_C_IND, alpha=.65,
                        label="no charge (spatial 'induction')")
@@ -2060,12 +2106,13 @@ def plot_hit_timing(q, tr, aux, threshold_e, outdir, n_shower=1, n_mad=3.0,
         w = lambda mask: np.full(int(mask.sum()), 1.0 / nsh)
         ax[2].hist([q[~spatial] / 1e3, q[spatial] / 1e3], bins=edges / 1e3, stacked=True,
                    color=[_C_IND, _C_SHW], alpha=.35, edgecolor="white", linewidth=.2,
-                   weights=[w(~spatial), w(spatial)], label=["induction (spatial)", "shower (spatial)"])
+                   weights=[w(~spatial), w(spatial)],
+                   label=["induction (spatial)", f"{population} (spatial)"])
         ax[2].step(edges[:-1] / 1e3, np.histogram(q[~causal], bins=edges)[0] / nsh,
                    where="post", color=_C_IND, lw=2.0, label="induction (causal, timed)")
         ax[2].axvline(float(threshold_e) / 1e3, color="0.3", ls="--", lw=1.1)
         ax[2].set_xlabel(r"recorded $Q$ ($10^{3}e^{-}$)")
-        ax[2].set_ylabel("single-hit pixels / shower")
+        ax[2].set_ylabel(f"single-hit pixels / {population}")
         ax[2].set_xlim(0, 30); ax[2].legend(fontsize=8.5)
         ax[2].set_title("Induction grows when timing is required", fontsize=11)
     head = ("%s -- " % title) if title else ""
@@ -3023,8 +3070,9 @@ def analyze_spectra(spectra, outdir):
         print("\n=== Truth diagnostics (control samples) ===")
         for name, sm in samples.items():
             nsh = int(sm.get("n", n_main)) or n_main
-            suf = "" if name == "shower" else "_" + name
-            lab = "shower" if name == "shower" else "%s (%.0f deg to plane)" % (name, sm.get("theta", np.nan))
+            s_title, s_pop, s_slug = sample_labels(name, sm)
+            suf = "" if name == "shower" else "_" + s_slug
+            lab = s_title
             off, nom = sm.get("off"), sm.get("nominal")
             if off is not None:
                 qo, tro, auxo = off
@@ -3038,11 +3086,11 @@ def analyze_spectra(spectra, outdir):
                 plot_offpeak_anatomy(np.asarray(qo, float)[selo], coll[selo],
                                      _aux_sel(auxo, selo, qo.size),
                                      base_thr, outdir, qmax=qmax, n_shower=nsh,
-                                     suffix=suf, title=lab)
+                                     suffix=suf, title=lab, population=s_pop)
             if nom is not None and np.size(nom[2].get("dt", [])) == np.size(nom[0]):
                 qn, trn, auxn = nom
                 tinfo = plot_hit_timing(qn, trn, auxn, base_thr, outdir, n_shower=nsh,
-                                        suffix=suf, title=lab)
+                                        suffix=suf, title=lab, population=s_pop)
                 if tinfo:
                     n_sp = int(np.asarray(trn, bool).sum())
                     sp_b = np.asarray(trn, bool)
@@ -3096,7 +3144,7 @@ def analyze_spectra(spectra, outdir):
         if _nm == "shower":
             continue
         _ns = int(_sm.get("n_scan", 0)) or int(_sm.get("n", 1))
-        _lab = "%s (%.0f deg)" % (_nm, _sm.get("theta", np.nan))
+        _lab = sample_labels(_nm, _sm)[0]
         if _sm.get("scan_threshold"):
             thr_entries.append(_entry(_lab, _sm["scan_threshold"], _ns))
         if _sm.get("scan_reset"):
@@ -3127,12 +3175,13 @@ def analyze_spectra(spectra, outdir):
             for e in ents:
                 key = tuple(np.round(np.sort(np.asarray(e[1], float)), 6))
                 groups.setdefault(key, []).append(e)
+            w = max(24, max(len(e[0]) for e in ents) + 2)   # fit the descriptive names
             for key, grp in groups.items():
-                print("    %-22s" % unit + "".join("%9.1f" % (v / scale) for v in key))
+                print("    %-*s" % (w, unit) + "".join("%9.1f" % (v / scale) for v in key))
                 for (lab, v, _non, _noff, nind, n_ev) in grp:
                     r = np.asarray(nind, float)[np.argsort(np.asarray(v, float))]
-                    print("    %-22s" % lab[:22] + "".join("%9.4f" % y
-                                                           for y in r / max(n_ev, 1)))
+                    print("    %-*s" % (w, lab) + "".join("%9.4f" % y
+                                                          for y in r / max(n_ev, 1)))
 
     # --- FULL SHOWER-PARITY SCAN ANALYSIS PER MUON TOPOLOGY -------------------------------
     # POSITIONS track the threshold; the SCALE-FREE shape ratios (charge in units of the peak
@@ -3149,7 +3198,8 @@ def analyze_spectra(spectra, outdir):
         The template grid must be the SAMPLE'S OWN: the shower grid is a template for the EM
         charge spectrum, and a MIP's is a different distribution, so reusing it would freeze
         the wrong shape into every muon fit."""
-        suf = "_" + name
+        s_title, s_pop, s_slug = sample_labels(name, sm)
+        suf = "_" + s_slug
         ns = int(sm.get("n_scan", 0)) or int(sm.get("n", 1))
         grid_sp = sm.get("grid") or []
         sc_thr, sc_rst = sm.get("scan_threshold") or [], sm.get("scan_reset") or []
@@ -3168,7 +3218,7 @@ def analyze_spectra(spectra, outdir):
                                               s_qmax, ns, noise_e)
             stp = TemplateParam(sgrid, ts)
         except Exception as exc:                     # a starved topology (e.g. theta=90)
-            print(f"  {name}: template grid fit failed ({exc}); scans not fitted")
+            print(f"  {s_title}: template grid fit failed ({exc}); scans not fitted")
             return None
 
         def s_template(thr, cycles):
@@ -3195,22 +3245,24 @@ def analyze_spectra(spectra, outdir):
             plot_scan(None, sc, {"threshold": r"$Q_{\mathrm{thr}}$  ($10^{3}\,e^{-}$)",
                                  "reset": r"Periodic-reset rate  (kHz)",
                                  "induction": r"Induction-response scale"}[knob],
-                      f"ti_scan_{knob}{suf}.png", outdir, knob_vals_disp=disp)
+                      f"ti_scan_{knob}{suf}.png", outdir, knob_vals_disp=disp,
+                      population=s_pop, title=s_title)
             plot_scan_distributions(
                 [(d, f, q, tr) for d, (v, f, q, tr) in zip(disp, fits)],
-                f"{name}: readout-$Q$ spectra vs {knob}",
+                f"{s_title}: readout-$Q$ spectra vs {knob}",
                 (lambda d: r"$Q_{\mathrm{thr}}=%.1f$" % d) if knob == "threshold" else
                 (lambda d: ("reset off" if d == 0 else r"%.0f kHz" % d)) if knob == "reset" else
                 (lambda d: r"induction $\times%.1f$" % d),
-                knob, f"ti_dist_{knob}{suf}.png", outdir, xlim=xlim, thr_sigma=thr_sigma)
+                knob, f"ti_dist_{knob}{suf}.png", outdir, xlim=xlim,
+                thr_sigma=thr_sigma, population=s_pop)
             plot_multiplicity_dist(
                 [(d, r[1], r[3], pt(r[0])[0]) for d, r in zip(disp, scan)],
-                f"{name}: single-hit vs two-hit pixels vs {knob}",
+                f"{s_title}: single-hit vs two-hit pixels vs {knob}",
                 (lambda d: r"$Q_{\mathrm{thr}}=%.1f$" % d) if knob == "threshold" else
                 (lambda d: ("reset off" if d == 0 else r"%.0f kHz" % d)) if knob == "reset" else
                 (lambda d: r"induction $\times%.1f$" % d),
                 f"ti_multiplicity_{knob}{suf}.png", outdir, n_shower=n_ev,
-                xlim=xlim, qmax=s_qmax)
+                xlim=xlim, qmax=s_qmax, population=s_pop)
         rows, knobs_l = [], []
         rows.append(sensitivity_row(out["threshold"], obs_keys_g, return_raw=True))
         knobs_l.append("Threshold")
@@ -3223,8 +3275,9 @@ def analyze_spectra(spectra, outdir):
             rows.append(sensitivity_row(out["induction"], obs_keys_g, return_raw=True))
             knobs_l.append("Induction")
         plot_sensitivity([r[0] for r in rows], knobs_l, obs_lbl_g, outdir, suffix=suf,
-                         title=f"Sensitivity matrix -- {name}")
-        return dict(scans=out, matrix=[r[0] for r in rows], knobs=knobs_l)
+                         title=f"Sensitivity matrix -- {s_title}")
+        return dict(scans=out, matrix=[r[0] for r in rows], knobs=knobs_l,
+                    title=s_title, slug=s_slug)
 
     sample_results = {}
     _todo = [(n, s) for n, s in samples.items() if n != "shower" and s.get("scan_threshold")]
@@ -3235,8 +3288,8 @@ def analyze_spectra(spectra, outdir):
             if _r is None:
                 continue
             sample_results[_nm] = _r
-            print(f"  {_nm}: fitted {len(_r['knobs'])} scan(s); "
-                  f"sensitivity -> ti_sensitivity_matrix_{_nm}.png")
+            print(f"  {_r['title']}: fitted {len(_r['knobs'])} scan(s); "
+                  f"sensitivity -> ti_sensitivity_matrix_{_r['slug']}.png")
             print("                 " + "  ".join(f"{l:>19}" for l in obs_lbl_g))
             for kn, row in zip(_r["knobs"], _r["matrix"]):
                 cells = [f"{v:7.2f}" if np.isfinite(v) else f"{'--':>7}" for v in row]
