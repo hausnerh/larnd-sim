@@ -974,6 +974,477 @@ def capture_waveforms(ctx, evs, threshold_e, reset_cycles, seed0, label,
     return recs
 
 
+# ===========================================================================
+# BURST-MODE (forced continuous readout) study
+#   A through-going muon PARALLEL to the pixel plane (theta=0) lays a LINE of
+#   collecting pixels at fixed drift depth; the pixels one-or-more pitches
+#   TRANSVERSE to that line see a pure, sub-threshold, bipolar induction
+#   transient and never self-trigger. "Burst mode" = a DAQ that force-samples
+#   those pixels on a fixed cadence with NO discriminator gate, so the induction
+#   WAVEFORM SHAPE is recorded. That shape is threshold-independent, so it is a
+#   test of the induction model that escapes the threshold-calibration systematic
+#   which limits the self-trigger induction RATE. See docs/threshold_induction_study.md.
+# ===========================================================================
+def muon_neighbor_pixels(ctx, ev, reach_pitches=3):
+    """Classify a through-going muon event's pixels into COLLECTORS (charge landed on the
+    pad) and the pure-INDUCTION transverse neighbours at +-1..+-reach pitches perpendicular
+    to the track.
+
+    A theta=0 muon lies in the pixel plane at fixed drift depth, so its collectors form a
+    LINE; pixels one-or-more pitches off that line see only induced current and never collect.
+    The track direction is found by PCA on the collector pad centres (works at any azimuth and
+    needs no knowledge of how the track was generated); we step perpendicular to it in pitch
+    units, snap to the pixel grid, and keep offset pixels that (a) actually received induced
+    current -- i.e. have a row in `unique_pix` -- and (b) are NOT themselves collectors.
+
+    Returns [{row, pix_id, x, y, dist (signed pitches), is_collection, q_coll}, ...];
+    `row` indexes ev['pixels_signals'] so the caller reads the analog waveform directly.
+    """
+    from larndsim.pixels_from_track import pixel2id, id2pixel
+    det = ctx.detector
+    ids = np.asarray(ev["unique_pix"], np.int64)
+    coll = np.asarray(ev["is_collection"], bool)
+    qc = np.asarray(ev["q_coll"], float)
+    xs, ys = vd.pixel_xy_from_id(det, ids)
+    row_of = {int(p): r for r, p in enumerate(ids)}          # pixel id -> row in pixels_signals
+    ci = np.nonzero(coll)[0]
+    if ci.size < 2:                                          # need a line to define a transverse
+        return []
+    cx, cy = xs[ci], ys[ci]
+    # principal (track) axis from the collector centroid scatter; perpendicular = transverse
+    _u, _s, Vt = np.linalg.svd(np.vstack([cx - cx.mean(), cy - cy.mean()]).T,
+                               full_matrices=False)
+    track_hat = Vt[0]
+    perp = np.array([-track_hat[1], track_hat[0]])
+    pitch = float(det.PIXEL_PITCH)
+    nx, ny = int(det.N_PIXELS[0]), int(det.N_PIXELS[1])
+    out, seen = [], set()
+    for k in ci:
+        _ix, _iy, plane = (int(v) for v in id2pixel(int(ids[k])))
+        x0 = float(det.TPC_BORDERS[plane, 0, 0]); y0 = float(det.TPC_BORDERS[plane, 1, 0])
+        for step in range(-reach_pitches, reach_pitches + 1):
+            if step == 0:
+                continue
+            ixn = int(round((xs[k] + step * pitch * perp[0] - x0) / pitch))
+            iyn = int(round((ys[k] + step * pitch * perp[1] - y0) / pitch))
+            if not (0 <= ixn < nx and 0 <= iyn < ny):
+                continue
+            pid = int(pixel2id(ixn, iyn, plane))
+            r = row_of.get(pid)
+            if r is None or pid in seen or bool(coll[r]):     # off-grid, seen, or a collector
+                continue
+            seen.add(pid)
+            out.append(dict(row=int(r), pix_id=pid, x=float(xs[r]), y=float(ys[r]),
+                            dist=int(step), is_collection=bool(coll[r]), q_coll=float(qc[r])))
+    return out
+
+
+def burst_readout(ctx, cur, cadence_ticks, noise_e, rng):
+    """Forced 'burst-mode' readout of ONE pixel's pre-FEE current waveform.
+
+    Models a DAQ that samples-and-resets the charge integrator every `cadence_ticks` ticks
+    with NO discriminator gate, so a sub-threshold neighbour that never self-triggers still
+    yields a full waveform. Each window's recorded charge is the integrated current over that
+    window (ts * sum(current)); the FEE's running q_sum telescopes to exactly this in the
+    BUFFER_RISETIME << window limit (the 0.1 us shaper dies within ~1 tick -- verified against
+    fee.get_adc_values), so this reuses the SAME fee.digitize / vd.adc_to_charge calibration
+    the self-trigger path uses. That carries the ADC LSB and the pedestal, and the pedestal is
+    what lets the negative Ramo lobe round-trip (it maps to a code below pedestal, not clamped).
+
+    Returns (t_us, q_e): one burst charge sample per window.
+    """
+    det = ctx.detector
+    ts = float(det.TIME_SAMPLING)
+    w = np.asarray(cur, float)
+    W = max(int(cadence_ticks), 1)
+    nwin = w.size // W
+    if nwin == 0:
+        return np.zeros(0, np.float32), np.zeros(0, np.float32)
+    q_int = w[:nwin * W].reshape(nwin, W).sum(axis=1) * ts               # electrons per window
+    q_int = q_int + rng.normal(0.0, noise_e, size=nwin)                  # uncorrelated readout noise
+    adc = np.asarray(ctx.fee.digitize(q_int, det.GAIN, det.V_PEDESTAL))  # host-callable (numpy in/out)
+    q_rec = np.asarray(vd.adc_to_charge(ctx, adc), float)               # back to e-, carrying the LSB
+    t = (np.arange(nwin) + 0.5) * W * ts
+    return t.astype(np.float32), q_rec.astype(np.float32)
+
+
+def capture_burst(ctx, drift_cache, sample, theta, scales, cadence_ticks, reach,
+                  noise_e, seed0, collect_frac=0.15):
+    """Burst-mode capture on a control sample: for each induction SCALE, re-induce the events,
+    find each track's transverse-neighbour (pure-induction) pixels, and record their forced
+    burst-mode waveforms. The scale axis is the induction-MODEL knob -- comparing the neighbour
+    waveforms at scale 1.0 vs a mis-model (0.5, 1.5) is the threshold-independent model test.
+
+    Memory-flat: induces ONE event at a time and keeps only the (small) neighbour waveforms,
+    never a list of pre-signal caches. Event seeds depend on the event index ONLY (not the
+    scale), so the sole difference between scales is the induction physics; a dedicated rng
+    supplies the per-sample readout noise. Returns a list of per-neighbour records.
+    """
+    recs = []
+    bn_rng = np.random.default_rng((int(seed0) & 0xFFFFFFFF) ^ 0x9E3779B9)
+    for scale in scales:
+        set_induction(ctx, float(scale))
+        with _silence_device_stdout():
+            for i, dc in enumerate(drift_cache):
+                ev = event_induce(ctx, dc[0], dc[1], dc[2], seed=seed0 + i,
+                                  collect_frac=collect_frac)
+                if ev is None:
+                    continue
+                for nb in muon_neighbor_pixels(ctx, ev, reach_pitches=reach):
+                    t, q = burst_readout(ctx, ev["pixels_signals"][nb["row"]],
+                                         cadence_ticks, noise_e, bn_rng)
+                    if q.size == 0:
+                        continue
+                    ipk = int(np.argmax(q))                  # the positive lobe (what a discriminator sees)
+                    recs.append(dict(sample=str(sample), theta=float(theta), scale=float(scale),
+                                     dist=int(abs(nb["dist"])), ev=int(i), pix_id=int(nb["pix_id"]),
+                                     q_coll=float(nb["q_coll"]), peak=float(q[ipk]),
+                                     peak_abs=float(np.max(np.abs(q))), t=t, q=q))
+    set_induction(ctx, 1.0)
+    return recs
+
+
+def save_burst(recs, path):
+    """Save burst-mode neighbour waveforms (from capture_burst) to an .npz for --refit."""
+    if not recs:
+        return
+    scal = ("sample", "theta", "scale", "dist", "ev", "pix_id", "q_coll", "peak", "peak_abs")
+    kw = {k: np.asarray([r[k] for r in recs]) for k in scal}
+    for k in ("t", "q"):
+        kw[k] = _obj_array([r[k] for r in recs])
+    np.savez(path, **kw)
+    print(f"  wrote {len(recs)} burst-mode neighbour waveforms to {path}")
+
+
+def load_burst(path):
+    """Inverse of save_burst -> list of records (empty list if the file is absent)."""
+    if not path or not os.path.exists(path):
+        return []
+    d = np.load(path, allow_pickle=True)
+    if "sample" not in d.files:
+        return []
+    n = len(d["sample"])
+    return [dict(sample=str(d["sample"][i]), theta=float(d["theta"][i]),
+                 scale=float(d["scale"][i]), dist=int(d["dist"][i]), ev=int(d["ev"][i]),
+                 pix_id=int(d["pix_id"][i]), q_coll=float(d["q_coll"][i]),
+                 peak=float(d["peak"][i]), peak_abs=float(d["peak_abs"][i]),
+                 t=np.asarray(d["t"][i], float), q=np.asarray(d["q"][i], float))
+            for i in range(n)]
+
+
+def _stack_on_peak(grp, half=8):
+    """Align each neighbour waveform to its own positive-peak sample and stack a +-half window,
+    so the mean transient SHAPE survives (the transient sits at each event's random drift depth,
+    so raw averaging would smear it away). Returns (rel_index, stacked 2-D array)."""
+    seg = []
+    for r in grp:
+        q = np.asarray(r["q"], float)
+        if q.size == 0:
+            continue
+        p = int(np.argmax(q))
+        w = np.zeros(2 * half + 1)
+        a, b = p - half, p + half + 1
+        lo, hi = max(a, 0), min(b, q.size)
+        w[lo - a:hi - a] = q[lo:hi]
+        seg.append(w)
+    return np.arange(-half, half + 1), (np.vstack(seg) if seg else np.zeros((0, 2 * half + 1)))
+
+
+def analyze_burst(recs, outdir, noise_e):
+    """The burst-mode deliverable: (1) the mean sub-threshold induction transient by neighbour
+    distance vs the noise band; (2) the induction-amplitude falloff with transverse distance,
+    nominal vs mis-model; (3) the discriminating power (how many sigma a +-50% induction error
+    separates from nominal) and its growth with muon count. Runs from the saved ti_burst.npz,
+    so it iterates locally with --refit."""
+    if not recs:
+        return
+    import matplotlib.pyplot as plt
+    print("\n=== Burst-mode sub-threshold induction waveforms (forced readout) ===")
+    samples = sorted(set(r["sample"] for r in recs))
+    scales = sorted(set(r["scale"] for r in recs))
+    dists = sorted(set(r["dist"] for r in recs))
+    nom = 1.0 if 1.0 in scales else scales[len(scales) // 2]
+
+    def sel(sample, scale, dist):
+        return [r for r in recs if r["sample"] == sample and r["scale"] == scale
+                and r["dist"] == dist]
+
+    # (1) mean transient waveform by neighbour distance, at nominal induction
+    for sample in samples:
+        any_dt = next((r for r in recs if r["sample"] == sample and len(r["t"]) > 1), None)
+        dt = float(any_dt["t"][1] - any_dt["t"][0]) if any_dt is not None else 1.0
+        fig, ax = plt.subplots(figsize=(6.6, 4.4))
+        cmap = plt.get_cmap("viridis")
+        drew = False
+        for di, dist in enumerate(dists):
+            grp = sel(sample, nom, dist)
+            if len(grp) < 2:
+                continue
+            rel, Q = _stack_on_peak(grp)
+            if Q.shape[0] == 0:
+                continue
+            mean = Q.mean(axis=0)
+            sem = Q.std(axis=0) / max(sqrt(Q.shape[0]), 1.0)
+            c = cmap(0.12 + 0.72 * di / max(len(dists) - 1, 1))
+            ax.plot(rel * dt, mean, color=c, lw=1.8,
+                    label=f"{dist} pitch  (N={Q.shape[0]})")
+            ax.fill_between(rel * dt, mean - sem, mean + sem, color=c, alpha=0.20, lw=0)
+            drew = True
+        if not drew:
+            plt.close(fig)
+            continue
+        ax.axhline(0.0, color="0.6", lw=0.8)
+        ax.axhspan(-noise_e, noise_e, color="0.85", alpha=0.6, zorder=0,
+                   label=r"$\pm$noise (%.0f $e^-$)" % noise_e)
+        ax.set_xlabel(r"time relative to transient peak  ($\mu$s)")
+        ax.set_ylabel(r"burst-sample charge  ($e^-$)")
+        ax.set_title(f"Burst-mode induction transient — {sample}  (induction $\\times{nom:g}$)")
+        ax.legend(fontsize=8, loc="best")
+        ax.grid(alpha=0.25, lw=0.6)
+        fig.tight_layout()
+        _savefig(fig, f"{outdir}/ti_burst_waveforms_{sample}.png")
+
+    # (2) induction-amplitude falloff with transverse distance, one curve per scale
+    fig, axes = plt.subplots(1, len(samples), figsize=(4.8 * len(samples), 4.2),
+                             squeeze=False)
+    for si, sample in enumerate(samples):
+        ax = axes[0, si]
+        for scale in scales:
+            dd, mean, sem = [], [], []
+            for dist in dists:
+                g = sel(sample, scale, dist)
+                if len(g) < 2:
+                    continue
+                pk = np.array([r["peak"] for r in g])
+                dd.append(dist); mean.append(pk.mean()); sem.append(pk.std() / sqrt(len(pk)))
+            if dd:
+                ax.errorbar(dd, mean, yerr=sem, marker="o", capsize=3, lw=1.5,
+                            label=(r"$\times%g$ (nominal)" % scale) if scale == nom
+                            else r"$\times%g$" % scale)
+        ax.axhspan(-noise_e, noise_e, color="0.85", alpha=0.6, zorder=0)
+        ax.set_xlabel("transverse distance (pitches)")
+        ax.set_title(sample, fontsize=10.5)
+        if si == 0:
+            ax.set_ylabel(r"mean burst peak charge  ($e^-$)")
+        ax.grid(alpha=0.25, lw=0.6); ax.legend(fontsize=8)
+    fig.suptitle("Induction amplitude falloff — nominal vs mis-modelled induction", fontsize=12)
+    fig.tight_layout()
+    _savefig(fig, f"{outdir}/ti_burst_falloff.png")
+
+    # (3) discriminating power: significance of a mis-model vs nominal, and its sqrt(N) growth
+    fig, ax = plt.subplots(figsize=(6.8, 4.6))
+    print("  model-discrimination at the nearest neighbour (dist=1 pitch):")
+    print("    %-14s %8s %6s %9s %9s %9s" %
+          ("sample", "mismodel", "N_nb", "N_mu", "sigma", "sigma@1e3mu"))
+    drew = False
+    for sample in samples:
+        g0 = [r for r in recs if r["sample"] == sample and r["scale"] == nom and r["dist"] == 1]
+        p0 = np.array([r["peak"] for r in g0], float)
+        for scale in scales:
+            if scale == nom:
+                continue
+            g1 = [r for r in recs if r["sample"] == sample and r["scale"] == scale
+                  and r["dist"] == 1]
+            p1 = np.array([r["peak"] for r in g1], float)
+            if p0.size < 3 or p1.size < 3:
+                continue
+            comb = sqrt(p0.var() / p0.size + p1.var() / p1.size)
+            sig = abs(p1.mean() - p0.mean()) / comb if comb > 0 else np.nan
+            nmu = len(set(r["ev"] for r in g1)) or 1
+            sig_1e3 = sig * sqrt(1000.0 / nmu)
+            print("    %-14s %8s %6d %6d %9.2f %9.1f" %
+                  (sample, "x%g" % scale, p1.size, nmu, sig, sig_1e3))
+            # significance vs muon count by subsampling the neighbour pool (sqrt-N growth)
+            ev1 = np.array([r["ev"] for r in g1]); ev0 = np.array([r["ev"] for r in g0])
+            uev = np.array(sorted(set(ev1) | set(ev0)))
+            if uev.size >= 4:
+                ns = np.unique(np.linspace(2, uev.size, 8).round().astype(int))
+                xs_, ys_ = [], []
+                for k in ns:
+                    keep = set(uev[:k])
+                    a = p0[np.isin(ev0, list(keep))]; b = p1[np.isin(ev1, list(keep))]
+                    if a.size < 3 or b.size < 3:
+                        continue
+                    c = sqrt(a.var() / a.size + b.var() / b.size)
+                    xs_.append(k); ys_.append(abs(b.mean() - a.mean()) / c if c > 0 else np.nan)
+                if xs_:
+                    ax.plot(xs_, ys_, marker="o", lw=1.5, label=f"{sample}  $\\times{scale:g}$")
+                    drew = True
+    ax.axhline(3.0, color=_C_SHW, ls="--", lw=1.0, label=r"$3\sigma$")
+    ax.set_xlabel("muons used"); ax.set_ylabel(r"separation from nominal ($\sigma$)")
+    ax.set_title("Burst-mode discriminating power vs muon count (dist = 1 pitch)")
+    ax.grid(alpha=0.25, lw=0.6)
+    if drew:
+        ax.legend(fontsize=8, loc="best")
+    fig.tight_layout()
+    _savefig(fig, f"{outdir}/ti_burst_discrimination.png")
+
+
+def analyze_energy_scan(escan, meta, outdir):
+    """Shower-energy dependence of induction (Part D). For each energy the run recorded the
+    induction ON and OFF single-hit and all-multiplicity populations; here we plot the
+    pure-induction single-hit rate, the multiplicity-inclusive fired rate ON vs OFF, and the
+    mean collected charge, all per shower, vs energy -- the test of whether denser (higher-E)
+    cores induce more strongly. Rows: (E, n_ev, q1on,tr1on, qAon,trAon,nAon, q1off,tr1off,
+    qAoff,trAoff,nAoff)."""
+    if not escan:
+        return
+    import matplotlib.pyplot as plt
+    print("\n=== Shower-energy scan (induction vs shower energy) ===")
+    E = np.array([r[0] for r in escan], float)
+    o = np.argsort(E); E = E[o]
+    esc = [escan[i] for i in o]
+    rate_ind, rate_on, rate_off, meanq = [], [], [], []
+    print("    %8s %7s %12s %12s %12s %12s" %
+          ("E[MeV]", "n_ev", "pureInd/ev", "fired_on/ev", "fired_off/ev", "meanQ_on"))
+    for r in esc:
+        (_E, nev, q1on, tr1on, qAon, _trAon, _nAon, _q1off, _tr1off, qAoff, _trAoff, _nAoff) = r
+        nev = max(int(nev), 1)
+        q1on = np.asarray(q1on, float); tr1on = np.asarray(tr1on, bool)
+        n_pure = int((~tr1on).sum())
+        ri = n_pure / nev
+        ron = np.asarray(qAon, float).size / nev
+        roff = np.asarray(qAoff, float).size / nev
+        mq = float(np.mean(np.asarray(qAon, float))) if np.asarray(qAon, float).size else np.nan
+        rate_ind.append(ri); rate_on.append(ron); rate_off.append(roff); meanq.append(mq)
+        print("    %8.0f %7d %12.4f %12.3f %12.3f %12.0f" % (_E, nev, ri, ron, roff, mq))
+    fig, axes = plt.subplots(1, 3, figsize=(13.5, 4.2))
+    axes[0].plot(E, rate_ind, "o-", color=_C_IND, lw=1.6)
+    axes[0].set_ylabel("pure-induction single hits / shower")
+    axes[0].set_title("Direct induction hits")
+    axes[1].plot(E, rate_on, "o-", color=_C_SHW, label="induction ON", lw=1.6)
+    axes[1].plot(E, rate_off, "s--", color=_C_SUM, label="induction OFF", lw=1.4)
+    axes[1].set_ylabel("fired pixels / shower (all multiplicities)")
+    axes[1].set_title("Inclusive fired rate")
+    axes[1].legend(fontsize=8)
+    axes[2].plot(E, meanq, "o-", color=_C_GRN, lw=1.6)
+    axes[2].set_ylabel(r"mean collected charge / pixel  ($e^-$)")
+    axes[2].set_title("Charge scale")
+    for ax in axes:
+        ax.set_xlabel("shower energy (MeV)"); ax.set_xscale("log")
+        ax.grid(alpha=0.25, lw=0.6)
+    fig.suptitle("Shower-energy dependence of induction", fontsize=12)
+    fig.tight_layout()
+    _savefig(fig, f"{outdir}/ti_induction_vs_energy.png")
+
+
+def plot_inclusive_rate(name, sm, n_ev, ts, outdir, suffix):
+    """Part B: the MULTIPLICITY-INCLUSIVE fired-pixel rate, induction ON vs OFF, vs threshold and
+    reset. The single-hit rate cancels by construction (induction creates pure-induction single
+    hits but promotes collection pixels OUT of the single-hit sample); the inclusive rate should
+    not, so ON-minus-OFF here is the non-cancelling induction signature the single-hit cut hides."""
+    import matplotlib.pyplot as plt
+    blocks = []
+    for knob, xlabel in (("threshold", r"$Q_{\mathrm{thr}}$  ($10^3\,e^-$)"),
+                         ("reset", "reset rate (kHz)")):
+        sca = sm.get(f"scan_{knob}_allmult")
+        if not sca:
+            continue
+        vals = np.array([r[0] for r in sca], float)
+        x = (reset_rate_khz(vals.astype(int), ts) if knob == "reset" else vals / 1e3)
+        ron = np.array([np.asarray(r[1], float).size for r in sca], float) / max(n_ev, 1)
+        roff = np.array([np.asarray(r[4], float).size for r in sca], float) / max(n_ev, 1)
+        blocks.append((knob, xlabel, x, ron, roff))
+    if not blocks:
+        return
+    fig, axes = plt.subplots(1, len(blocks), figsize=(4.8 * len(blocks), 4.0), squeeze=False)
+    for j, (knob, xlabel, x, ron, roff) in enumerate(blocks):
+        ax = axes[0, j]; o = np.argsort(x)
+        ax.plot(x[o], ron[o], "o-", color=_C_SHW, lw=1.5, label="induction ON")
+        ax.plot(x[o], roff[o], "s--", color=_C_SUM, lw=1.3, label="induction OFF")
+        ax.set_xlabel(xlabel); ax.set_title(knob, fontsize=10.5)
+        ax.grid(alpha=0.25, lw=0.6)
+        if j == 0:
+            ax.set_ylabel("fired pixels / event (all multiplicities)")
+        ax.legend(fontsize=8)
+    fig.suptitle(f"Multiplicity-inclusive fired rate (ON vs OFF) — {name}", fontsize=11)
+    fig.tight_layout()
+    _savefig(fig, f"{outdir}/ti_inclusive_rate{suffix}.png")
+
+
+def recommend_operating_point(spectra, sample_results, outdir, noise_e):
+    """Part C: synthesise the self-trigger scans and the burst-mode model test into an
+    operating-point recommendation -- which (threshold, reset, readout-mode) lets FSD Cube
+    measure induction, and with what dominant systematic."""
+    import matplotlib.pyplot as plt
+    m = spectra["meta"]
+    n_main = int(m["n_shower_main"]); base_thr = float(m["base_threshold"])
+    print("\n=== Operating-point recommendation (FSD Cube induction measurement) ===")
+
+    # self-trigger: pure-induction single-hit rate vs threshold, shower + each muon topology
+    curves = []
+    thr_rows = spectra.get("threshold") or []
+    if thr_rows:
+        v = np.array([r[0] for r in thr_rows], float)
+        ri = np.array([int((~np.asarray(r[2], bool)).sum()) for r in thr_rows], float) / max(n_main, 1)
+        curves.append(("shower", v, ri))
+    for nm, sm in spectra.get("samples", {}).items():
+        sc = sm.get("scan_threshold")
+        if not sc:
+            continue
+        ns = int(sm.get("n_scan", sm.get("n", 1))) or 1
+        v = np.array([r[0] for r in sc], float)
+        ri = np.array([int((~np.asarray(r[2], bool)).sum()) for r in sc], float) / ns
+        curves.append((nm, v, ri))
+
+    # burst-mode: best mis-model significance at the nearest neighbour, extrapolated to 1000 muons
+    burst = spectra.get("burst") or []
+    best = None
+    if burst:
+        scales = sorted(set(r["scale"] for r in burst))
+        noms = 1.0 if 1.0 in scales else scales[len(scales) // 2]
+        for sample in sorted(set(r["sample"] for r in burst)):
+            p0 = np.array([r["peak"] for r in burst
+                           if r["sample"] == sample and r["scale"] == noms and r["dist"] == 1], float)
+            for scale in scales:
+                if scale == noms:
+                    continue
+                g1 = [r for r in burst if r["sample"] == sample and r["scale"] == scale
+                      and r["dist"] == 1]
+                p1 = np.array([r["peak"] for r in g1], float)
+                if p0.size < 3 or p1.size < 3:
+                    continue
+                comb = sqrt(p0.var() / p0.size + p1.var() / p1.size)
+                if comb <= 0:
+                    continue
+                sig = abs(p1.mean() - p0.mean()) / comb
+                nmu = len(set(r["ev"] for r in g1)) or 1
+                s1e3 = sig * sqrt(1000.0 / nmu)
+                if best is None or s1e3 > best[3]:
+                    best = (sample, scale, sig, s1e3, nmu)
+
+    if curves:
+        print("  self-trigger pure-induction single hits / event vs threshold:")
+        for nm, v, ri in curves:
+            o = np.argsort(v)
+            print(f"    {nm:>13}: " + "  ".join(f"{vv/1e3:.1f}k={rr:.3f}" for vv, rr in zip(v[o], ri[o])))
+    if best is not None:
+        print(f"  burst-mode model test: best = {best[0]} x{best[1]:g} -> {best[2]:.1f} sigma at "
+              f"{best[4]} muons ({best[3]:.0f} sigma at 1000 muons), threshold-INDEPENDENT.")
+    print("  RECOMMENDATION:")
+    print("    * self-trigger induction is a RATE: needs a LOW threshold (<=2-3 ke-) and per-pixel")
+    print("      threshold calibration to ~1%; periodic reset is a weak lever on the spectrum.")
+    print("    * BURST-MODE (forced readout) of theta=0 muon transverse neighbours measures the")
+    print("      induction WAVEFORM SHAPE -- threshold-independent, the robust configuration.")
+
+    if curves:
+        fig, ax = plt.subplots(figsize=(6.8, 4.6))
+        for nm, v, ri in curves:
+            o = np.argsort(v)
+            ax.plot(v[o] / 1e3, ri[o], "o-", lw=1.5, label=nm)
+        ax.axvline(base_thr / 1e3, color="0.6", ls=":", lw=1.0, label="nominal thr")
+        ax.set_yscale("symlog", linthresh=1e-3)
+        ax.set_xlabel(r"threshold  ($10^3\,e^-$)")
+        ax.set_ylabel("pure-induction single hits / event")
+        ttl = "Self-trigger induction yield vs threshold"
+        if best is not None:
+            ttl += f"\nburst-mode: {best[3]:.0f}$\\sigma$ model test at 1000 muons (threshold-independent)"
+        ax.set_title(ttl, fontsize=10.5)
+        ax.grid(alpha=0.25, lw=0.6); ax.legend(fontsize=8)
+        fig.tight_layout()
+        _savefig(fig, f"{outdir}/ti_operating_point.png")
+
+
 def categorize(q, is_collection):
     """2-way truth split of single-hit pixels from the backtrack collection flag:
 
@@ -2265,16 +2736,23 @@ def aggregate_sample_scan(ctx, evs_on, evs_off, knob_vals, set_fn, seed0):
     and the causal-timing diagnostics that do use aux run at the base point. Carrying seven
     aux arrays per knob value per angle would dominate the spectra file for no gain.
 
-    Returns [(val, q_on, tr_on, q2_on, tr2_on, q_off, tr_off), ...].
+    Returns (out, out_all):
+      out     = [(val, q_on, tr_on, q2_on, tr2_on, q_off, tr_off), ...]  -- as before;
+      out_all = [(val, q_allon, tr_allon, n_allon, q_alloff, tr_alloff, n_alloff), ...]  -- the
+                MULTIPLICITY-INCLUSIVE (every fired pixel) population, ON and OFF. The single-hit
+                rate cancels by construction -- induction creates pure-induction single hits but
+                also promotes collection pixels OUT of the single-hit sample -- so the inclusive
+                rate is the observable that does NOT cancel. It is free here (same FEE passes).
     """
-    out = []
+    out, out_all = [], []
     for j, val in enumerate(knob_vals):
         thr, rst = set_fn(val)
         pon = aggregate_hits(ctx, evs_on, thr, rst, 1.0, seed0=seed0 + j * 1000)
         pof = aggregate_hits(ctx, evs_off, thr, rst, 0.0, seed0=seed0 + j * 1000 + 500)
         out.append((float(val), pon[1][0], pon[1][1], pon[2][0], pon[2][1],
                     pof[1][0], pof[1][1]))
-    return out
+        out_all.append((float(val),) + pon["all"] + pof["all"])
+    return out, out_all
 
 
 def aggregate_sample_induction_scan(ctx, drift_cache, scales, base_threshold, base_reset,
@@ -2492,6 +2970,33 @@ def parse_args():
                          "time) are saved to ti_waveforms.npz for the standalone viewer. 0 = off.")
     ap.add_argument("--wf-max-pix", type=int, default=40,
                     help="max pixels saved per waveform event (sampled across hit categories)")
+    # --- shower-energy scan (Part D): induction vs shower energy, parametric generator ---
+    ap.add_argument("--shower-energies", type=float, nargs="*", default=None,
+                    help="run a SHOWER-ENERGY scan at these energies (MeV), e.g. 100 300 1000 "
+                         "3000. Each is its own small parametric sub-sample induced ON and OFF; "
+                         "n_dep is scaled with energy so denser cores come from geometry, not a "
+                         "fake dE/dx. Tests whether higher-energy showers induce more strongly. "
+                         "Ignored with --edep-h5 (real showers carry their own energies).")
+    ap.add_argument("--energy-scan-events", type=int, default=100,
+                    help="showers per energy point for --shower-energies (capped at --n-events)")
+    # --- burst-mode sub-threshold induction waveforms (Part A) ---
+    ap.add_argument("--burst-thetas", type=float, nargs="*", default=[0.0],
+                    help="muon angles (deg to pixel plane) to run the BURST-MODE study on. 0 = "
+                         "through-going parallel to the plane, the clean case: collectors form a "
+                         "line, their transverse neighbours see pure sub-threshold induction. "
+                         "These angles must also be in --muon-thetas.")
+    ap.add_argument("--burst-events", type=int, default=60,
+                    help="muon events per burst-mode angle (re-induced per --burst-inductions "
+                         "scale, so this is the one added cost; 0 = disable burst mode).")
+    ap.add_argument("--burst-neighbors", type=int, default=3,
+                    help="transverse-neighbour reach in pitches (+-N) whose forced waveforms are "
+                         "captured -- the induction falloff profile.")
+    ap.add_argument("--burst-cadence", type=float, default=0.0,
+                    help="forced-sample period (us). 0 = the ADC integration window "
+                         "((3+ADC_HOLD_DELAY)*CLOCK_CYCLE), the natural DAQ sample.")
+    ap.add_argument("--burst-inductions", type=float, nargs="+", default=[0.5, 1.0, 1.5],
+                    help="induction scales for the burst-mode MODEL test: 1.0 is nominal, the "
+                         "others are mis-models whose separation from nominal is the deliverable.")
     ap.add_argument("--outdir", default="tistudy")
     return ap.parse_args()
 
@@ -2766,6 +3271,12 @@ def save_spectra(spectra, path):
             for fld, i in (("q_on", 1), ("tr_on", 2), ("q2_on", 3),
                            ("tr2_on", 4), ("q_off", 5), ("tr_off", 6)):
                 kw[f"{pre}_{fld}"] = _obj_array([r[i] for r in sc])
+            # multiplicity-inclusive (all-hit) ON/OFF companion -- the non-cancelling rate
+            sca = s.get(f"scan_{knob}_allmult")
+            if sca:
+                for fld, i in (("aq_on", 1), ("atr_on", 2), ("an_on", 3),
+                               ("aq_off", 4), ("atr_off", 5), ("an_off", 6)):
+                    kw[f"{pre}_{fld}"] = _obj_array([r[i] for r in sca])
         gr = s.get("grid")
         if gr:
             pre = f"samp_{name}_grid"
@@ -2773,6 +3284,15 @@ def save_spectra(spectra, path):
             kw[pre + "_rst"] = np.asarray([it[1] for it in gr], int)
             kw[pre + "_q"] = _obj_array([it[2] for it in gr])
             kw[pre + "_tr"] = _obj_array([it[3] for it in gr])
+    # shower-energy scan (Part D): (E, n_ev, q1on,tr1on, qAon,trAon,nAon, q1off,tr1off,
+    # qAoff,trAoff,nAoff) per energy point.
+    escan = spectra.get("energy_scan") or []
+    if escan:
+        kw["escan_E"] = np.asarray([r[0] for r in escan], float)
+        kw["escan_nev"] = np.asarray([r[1] for r in escan], int)
+        for fld, i in (("q1on", 2), ("tr1on", 3), ("qAon", 4), ("trAon", 5), ("nAon", 6),
+                       ("q1off", 7), ("tr1off", 8), ("qAoff", 9), ("trAoff", 10), ("nAoff", 11)):
+            kw[f"escan_{fld}"] = _obj_array([r[i] for r in escan])
     np.savez(path, **kw)
 
 
@@ -2883,6 +3403,17 @@ def load_spectra(path):
                      np.asarray(d[pre + "_tr2_on"][i], bool),
                      np.asarray(d[pre + "_q_off"][i], float),
                      np.asarray(d[pre + "_tr_off"][i], bool)) for i in range(len(v))]
+                # multiplicity-inclusive companion (tolerate older files without it)
+                if pre + "_aq_on" in d.files:
+                    s["scan_" + knob + "_allmult"] = [
+                        (float(v[i]), np.asarray(d[pre + "_aq_on"][i], float),
+                         np.asarray(d[pre + "_atr_on"][i], bool),
+                         np.asarray(d[pre + "_an_on"][i], np.int16),
+                         np.asarray(d[pre + "_aq_off"][i], float),
+                         np.asarray(d[pre + "_atr_off"][i], bool),
+                         np.asarray(d[pre + "_an_off"][i], np.int16)) for i in range(len(v))]
+                else:
+                    s["scan_" + knob + "_allmult"] = []
             gpre = f"samp_{name}_grid"
             if gpre + "_thr" in d.files:
                 gt, grr = d[gpre + "_thr"], d[gpre + "_rst"]
@@ -2895,6 +3426,24 @@ def load_spectra(path):
                 s["grid"] = []
             samples[name] = s
     spectra["samples"] = samples
+
+    # shower-energy scan (Part D)
+    escan = []
+    if "escan_E" in d.files:
+        Es = np.asarray(d["escan_E"], float)
+        for i in range(len(Es)):
+            escan.append((float(Es[i]), int(d["escan_nev"][i]),
+                          np.asarray(d["escan_q1on"][i], float),
+                          np.asarray(d["escan_tr1on"][i], bool),
+                          np.asarray(d["escan_qAon"][i], float),
+                          np.asarray(d["escan_trAon"][i], bool),
+                          np.asarray(d["escan_nAon"][i], np.int16),
+                          np.asarray(d["escan_q1off"][i], float),
+                          np.asarray(d["escan_tr1off"][i], bool),
+                          np.asarray(d["escan_qAoff"][i], float),
+                          np.asarray(d["escan_trAoff"][i], bool),
+                          np.asarray(d["escan_nAoff"][i], np.int16)))
+    spectra["energy_scan"] = escan
     return spectra
 
 
@@ -3030,6 +3579,46 @@ def produce_spectra(ctx, args):
         print(f"  releasing shower caches "
               f"({_cache_mb(evs) + _cache_mb(evs_off):.1f} MB) before the muon samples")
     evs = evs_off = drift_cache = None
+
+    # --- SHOWER-ENERGY SCAN (Part D): does a denser (higher-energy) core induce more? Each
+    #     energy is its own small shower sub-sample, induced ON and OFF; we keep the single-hit
+    #     and all-multiplicity populations so the analysis can read the pure-induction rate, the
+    #     multiplicity-inclusive fired rate (ON vs OFF), and the mean charge vs energy. n_dep is
+    #     scaled with energy so the per-tracklet dE/dx stays MIP-like and the core densifies
+    #     through GEOMETRY (overlapping tracklets), not through a fake dE/dx that would merely
+    #     rescale charge uniformly. -----------------------------------------------------------
+    energy_scan = []
+    if args.shower_energies and not args.edep_h5:
+        es_n = (min(int(args.energy_scan_events), int(args.n_events))
+                if args.energy_scan_events else int(args.n_events))
+        energies = sorted(float(e) for e in args.shower_energies)
+        print(f"\nShower-energy scan: {energies} MeV, {es_n} showers each "
+              f"(n_dep ~ energy; higher energy = denser core)...")
+        for E in energies:
+            ndep = max(int(round(args.n_dep * E / max(args.shower_energy, 1.0))), 50)
+            e_raw = [build_shower_event(ctx, rng, energy_mev=E, n_dep=ndep) for _ in range(es_n)]
+            e_drift = [d for d in (event_drift(ctx, r) for r in e_raw) if d is not None]
+            se = args.seed + 30000 + int(round(E))
+            set_induction(ctx, 1.0); set_periodic_reset(ctx, base_reset)
+            e_on = [e for e in (event_induce(ctx, d[0], d[1], d[2], seed=se + i,
+                                             collect_frac=args.collect_frac)
+                                for i, d in enumerate(e_drift)) if e is not None]
+            pon = aggregate_hits(ctx, e_on, base_thr, base_reset, 1.0, seed0=se + 100)
+            set_induction(ctx, 0.0)
+            e_off = [e for e in (event_induce(ctx, d[0], d[1], d[2], seed=se + 500 + i,
+                                              collect_frac=args.collect_frac)
+                                 for i, d in enumerate(e_drift)) if e is not None]
+            pof = aggregate_hits(ctx, e_off, base_thr, base_reset, 0.0, seed0=se + 600)
+            ne = len(e_drift)
+            energy_scan.append((float(E), int(ne)) + pon[1][:2] + pon["all"] + pof[1][:2]
+                               + pof["all"])
+            print(f"  E={E:.0f} MeV: {ne} showers, single-hit {pon[1][0].size} ON / "
+                  f"{pof[1][0].size} OFF, fired {pon['all'][0].size} ON / {pof['all'][0].size} OFF")
+            e_on = e_off = e_drift = e_raw = None
+        set_induction(ctx, 1.0)
+
+    burst_recs = []
+    burst_thetas = set(int(round(t)) for t in (args.burst_thetas or []))
     for it, theta in enumerate(args.muon_thetas or []):
         name = "muon_th%02d" % int(round(theta))
         mu_n = min(int(args.muon_events), int(args.n_events))
@@ -3062,10 +3651,12 @@ def produce_spectra(ctx, args):
             print(f"  scanning threshold ({len(mu_thr)} pts) + reset ({len(args.resets)} pts) "
                   f"on {ns} events, induction on/off...")
             samples[name]["n_scan"] = ns
-            samples[name]["scan_threshold"] = aggregate_sample_scan(
+            (samples[name]["scan_threshold"],
+             samples[name]["scan_threshold_allmult"]) = aggregate_sample_scan(
                 ctx, mu_evs[:ns], mu_off[:ns], mu_thr,
                 lambda v: (float(v), base_reset), seed0=sd + 2000)
-            samples[name]["scan_reset"] = aggregate_sample_scan(
+            (samples[name]["scan_reset"],
+             samples[name]["scan_reset_allmult"]) = aggregate_sample_scan(
                 ctx, mu_evs[:ns], mu_off[:ns], args.resets,
                 lambda v: (base_thr, int(v)), seed0=sd + 4000)
             set_periodic_reset(ctx, base_reset)
@@ -3092,6 +3683,24 @@ def produce_spectra(ctx, args):
                     seed0=sd + 8000, evs_off=mu_off[:mi_n],
                     collect_frac=args.collect_frac)
                 set_induction(ctx, 1.0); set_periodic_reset(ctx, base_reset)
+        # BURST MODE (Part A): for a through-going track PARALLEL to the pixel plane, capture the
+        # forced-readout waveforms of the transverse (pure-induction) neighbour pixels at each
+        # induction scale -- the threshold-independent induction-model test. Reuses mu_drift; the
+        # scan reset above is FEE-only, so pixels_signals is unchanged.
+        if int(round(theta)) in burst_thetas and int(args.burst_events) > 0 and mu_drift:
+            nbev = min(int(args.burst_events), len(mu_drift))
+            cad_us = (float(args.burst_cadence) if args.burst_cadence and args.burst_cadence > 0
+                      else (3.0 + float(ctx.detector.ADC_HOLD_DELAY))
+                      * float(ctx.detector.CLOCK_CYCLE))
+            cad_ticks = max(int(round(cad_us / ts)), 1)
+            print(f"  burst-mode capture: {nbev} events x {len(args.burst_inductions)} induction "
+                  f"scales, +-{args.burst_neighbors} pitch neighbours, "
+                  f"cadence {cad_us:.2f} us ({cad_ticks} ticks)...")
+            burst_recs += capture_burst(ctx, mu_drift[:nbev], name, float(theta),
+                                        args.burst_inductions, cad_ticks,
+                                        int(args.burst_neighbors), noise_e, seed0=sd + 5000,
+                                        collect_frac=args.collect_frac)
+            set_induction(ctx, 1.0); set_periodic_reset(ctx, base_reset)
         waveforms += capture_waveforms(ctx, mu_evs, base_thr, base_reset, sd + 900, name,
                                        args.wf_events, args.wf_max_pix)
         mu_evs = mu_off = mu_drift = mu_raw = None   # free before the next angle allocates
@@ -3106,6 +3715,8 @@ def produce_spectra(ctx, args):
                 detector_name=str(det_name), detector_path=str(det_path))
     return dict(meta=meta, nominal=(q0, tr0, aux0), threshold=thr_items, reset=rst_items,
                 induction=ind_items, grid=grid_spectra, samples=samples, waveforms=waveforms,
+                # burst-mode neighbour waveforms + the shower-energy scan (Parts A/D)
+                burst=burst_recs, energy_scan=energy_scan,
                 # parallel TWO-hit populations (same FEE passes): the migration target that
                 # makes the threshold/reset response visible -- see event_fee_hits.
                 nominal_n2=nom2, threshold_n2=thr_items2, reset_n2=rst_items2,
@@ -3389,6 +4000,8 @@ def analyze_spectra(spectra, outdir):
             knobs_l.append("Induction")
         plot_sensitivity([r[0] for r in rows], knobs_l, obs_lbl_g, outdir, suffix=suf,
                          title=f"Sensitivity matrix -- {s_title}")
+        # Part B: multiplicity-inclusive fired rate (ON vs OFF) -- the non-cancelling observable
+        plot_inclusive_rate(s_title, sm, ns, ts, outdir, suf)
         return dict(scans=out, matrix=[r[0] for r in rows], knobs=knobs_l,
                     title=s_title, slug=s_slug)
 
@@ -3603,6 +4216,13 @@ def analyze_spectra(spectra, outdir):
              sensitivity_knobs=np.array(knobs),
              sensitivity_observables=np.array(obs_lbl))
 
+    # --- Part D: shower-energy dependence of induction ---
+    analyze_energy_scan(spectra.get("energy_scan", []), m, outdir)
+    # --- Part A: burst-mode sub-threshold induction waveforms (the threshold-independent test) ---
+    analyze_burst(spectra.get("burst", []), outdir, noise_e)
+    # --- Part C: operating-point recommendation, from everything above ---
+    recommend_operating_point(spectra, sample_results, outdir, noise_e)
+
 
 def main():
     args = parse_args()
@@ -3620,6 +4240,9 @@ def main():
     if args.refit:
         print(f"REFIT mode: loading spectra from {args.refit} (no GPU) ...")
         spectra = load_spectra(args.refit)
+        # burst-mode waveforms live in a sibling ti_burst.npz (separate, like ti_waveforms.npz)
+        spectra["burst"] = load_burst(os.path.join(
+            os.path.dirname(os.path.abspath(args.refit)) or ".", "ti_burst.npz"))
         mm = spectra["meta"]
         print(f"  base thr={float(mm['base_threshold']):.0f} e-, reset={int(mm['base_reset'])}, "
               f"noise={float(mm['noise_e']):.0f} e-, showers main/ind="
@@ -3643,6 +4266,7 @@ def main():
         spec_path = args.spectra_out or f"{args.outdir}/ti_spectra.npz"
         save_spectra(spectra, spec_path)
         save_waveforms(spectra.get("waveforms", []), f"{args.outdir}/ti_waveforms.npz")
+        save_burst(spectra.get("burst", []), f"{args.outdir}/ti_burst.npz")
         print(f"Wrote raw spectra to {spec_path}\n  -> iterate fits locally with:  "
               f"python tests/threshold_induction_study.py --refit {spec_path} --outdir {args.outdir}")
 
