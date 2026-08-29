@@ -2997,6 +2997,12 @@ def parse_args():
     ap.add_argument("--burst-inductions", type=float, nargs="+", default=[0.5, 1.0, 1.5],
                     help="induction scales for the burst-mode MODEL test: 1.0 is nominal, the "
                          "others are mis-models whose separation from nominal is the deliverable.")
+    ap.add_argument("--burst-only", action="store_true",
+                    help="FAST PATH: skip ALL shower work and every template/composite fit; do "
+                         "only parallel-muon (--burst-thetas) burst-mode waveforms plus a cheap "
+                         "FEE-only self-trigger threshold scan (induction on/off). Minutes, not "
+                         "hours, and no big-RAM allocation. The burst waveforms are threshold-"
+                         "independent, so the threshold range only scans the self-trigger yield.")
     ap.add_argument("--outdir", default="tistudy")
     return ap.parse_args()
 
@@ -3445,6 +3451,103 @@ def load_spectra(path):
                           np.asarray(d["escan_nAoff"][i], np.int16)))
     spectra["energy_scan"] = escan
     return spectra
+
+
+def produce_burst_only(ctx, args):
+    """GPU, FAST PATH (`--burst-only`): parallel-muon burst-mode waveforms + a cheap FEE-only
+    self-trigger threshold scan, and NOTHING else -- no showers, no template grid, no composite
+    fits, no induction/reset scans. Built for quick turnaround on the muon burst study.
+
+    For each `--burst-thetas` angle it (1) captures the transverse-neighbour burst waveforms at
+    each `--burst-inductions` scale (threshold-independent, so captured once), and (2) runs the
+    two-point induction on/off single-/all-multiplicity scan over the thresholds (FEE-only on two
+    cached inductions -- the only place a threshold enters). Returns a `spectra` dict with the
+    shower-dependent slots left EMPTY, so save/load round-trip and the lean analyzer just skips
+    them. Peak memory is one angle's on+off cache at a time -- no shower halo, so no big-RAM node.
+    """
+    base_thr, base_reset = base_config(ctx, args)
+    ts = float(ctx.detector.TIME_SAMPLING)
+    noise_e = (float(args.noise_e) if args.noise_e is not None
+               else float(np.atleast_1d(getattr(ctx.detector, "UNCORRELATED_NOISE_CHARGE", 500.0)).ravel()[0]))
+    rng = np.random.default_rng(args.seed)
+    thetas = [float(t) for t in (args.burst_thetas or [0.0])]
+    thr_list = list(args.muon_thresholds) if args.muon_thresholds else list(args.thresholds)
+    cad_us = (float(args.burst_cadence) if args.burst_cadence and args.burst_cadence > 0
+              else (3.0 + float(ctx.detector.ADC_HOLD_DELAY)) * float(ctx.detector.CLOCK_CYCLE))
+    cad_ticks = max(int(round(cad_us / ts)), 1)
+    print(f"\nBURST-ONLY fast mode: thetas={thetas}, burst {int(args.burst_events)} ev x "
+          f"{len(args.burst_inductions)} scales (+-{args.burst_neighbors} pitch), threshold scan "
+          f"{thr_list} on {int(args.muon_scan_events)} ev, reset={base_reset}, "
+          f"cadence {cad_us:.2f} us ({cad_ticks} ticks); noise sigma={noise_e:.0f} e-")
+
+    samples, burst_recs = {}, []
+    for it, theta in enumerate(thetas):
+        name = "muon_th%02d" % int(round(theta))
+        mu_n = int(args.muon_events)
+        print(f"\nMuon '{name}' (theta={theta:.0f} deg to pixel plane): building {mu_n} events...")
+        mu_raw = [build_muon_event(ctx, rng, theta_deg=theta, length_cm=args.muon_length)
+                  for _ in range(mu_n)]
+        mu_drift = [d for d in (event_drift(ctx, r) for r in mu_raw) if d is not None]
+        sd = args.seed + 7000 + it * 1000
+        print(f"  {len(mu_drift)}/{mu_n} events produced collectable charge")
+
+        nbev = min(int(args.burst_events), len(mu_drift))
+        if nbev > 0:
+            print(f"  burst capture: {nbev} events x {len(args.burst_inductions)} induction scales...")
+            burst_recs += capture_burst(ctx, mu_drift[:nbev], name, theta, args.burst_inductions,
+                                        cad_ticks, int(args.burst_neighbors), noise_e,
+                                        seed0=sd + 5000, collect_frac=args.collect_frac)
+
+        ns = (min(int(args.muon_scan_events), len(mu_drift)) if args.muon_scan_events
+              else len(mu_drift))
+        sc, sca = [], []
+        if ns > 0:
+            set_induction(ctx, 1.0); set_periodic_reset(ctx, base_reset)
+            mu_evs = [e for e in (event_induce(ctx, d[0], d[1], d[2], seed=sd + i,
+                                               collect_frac=args.collect_frac)
+                                  for i, d in enumerate(mu_drift[:ns])) if e is not None]
+            set_induction(ctx, 0.0)
+            mu_off = [e for e in (event_induce(ctx, d[0], d[1], d[2], seed=sd + 500 + i,
+                                               collect_frac=args.collect_frac)
+                                  for i, d in enumerate(mu_drift[:ns])) if e is not None]
+            print(f"  self-trigger threshold scan ({len(thr_list)} pts) on {ns} events, "
+                  f"induction on/off...")
+            sc, sca = aggregate_sample_scan(ctx, mu_evs, mu_off, thr_list,
+                                            lambda v: (float(v), base_reset), seed0=sd + 2000)
+            mu_evs = mu_off = None
+        samples[name] = dict(kind="muon", theta=theta, n=len(mu_drift), n_scan=ns,
+                             scan_threshold=sc, scan_threshold_allmult=sca,
+                             scan_thresholds=np.asarray(thr_list, float))
+        mu_drift = mu_raw = None
+        set_induction(ctx, 1.0)
+
+    det_name, _geom, det_path = vd.detector_identity(ctx)
+    meta = dict(base_threshold=base_thr, base_reset=base_reset, ts=ts, noise_e=noise_e,
+                thr_sigma=float(np.atleast_1d(ctx.detector.DISCRIMINATOR_NOISE).ravel()[0]),
+                qmax=30000.0, thresholds=np.asarray(thr_list, float),
+                resets=np.asarray([base_reset], int),
+                inductions=np.asarray(args.burst_inductions, float),
+                thr_grid=np.asarray(thr_list, float), rst_grid=np.asarray([base_reset], int),
+                n_shower_main=0, n_shower_ind=0,
+                detector_name=str(det_name), detector_path=str(det_path))
+    empty = (np.empty(0), np.empty(0, bool), {k: np.empty(0) for k in _AUX_KEYS})
+    return dict(meta=meta, nominal=empty, threshold=[], reset=[], induction=[],
+                grid=[], samples=samples, waveforms=[], burst=burst_recs, energy_scan=[])
+
+
+def analyze_burst_only(spectra, outdir):
+    """CPU, FAST PATH: the lean analyzer for `--burst-only` spectra -- the burst-mode plots, the
+    per-topology multiplicity-inclusive rate, and the operating-point recommendation. Skips the
+    whole shower template/composite/sensitivity machinery (there is no shower data), so it is
+    robust on the minimal spectra dict and refits locally with no GPU."""
+    m = spectra["meta"]
+    noise_e, ts = float(m["noise_e"]), float(m["ts"])
+    print("\n=== BURST-ONLY analysis (fast path) ===")
+    analyze_burst(spectra.get("burst", []), outdir, noise_e)
+    for name, sm in spectra.get("samples", {}).items():
+        s_title, _pop, s_slug = sample_labels(name, sm)
+        plot_inclusive_rate(s_title, sm, int(sm.get("n_scan", 1)) or 1, ts, outdir, "_" + s_slug)
+    recommend_operating_point(spectra, {}, outdir, noise_e)
 
 
 def produce_spectra(ctx, args):
@@ -4262,15 +4365,19 @@ def main():
         ctx._response0 = ctx.response.copy()
         ctx._induction_mask = induction_mask(ctx)
         ctx.induction_scale = 1.0
-        spectra = produce_spectra(ctx, args)
+        spectra = produce_burst_only(ctx, args) if args.burst_only else produce_spectra(ctx, args)
         spec_path = args.spectra_out or f"{args.outdir}/ti_spectra.npz"
         save_spectra(spectra, spec_path)
         save_waveforms(spectra.get("waveforms", []), f"{args.outdir}/ti_waveforms.npz")
         save_burst(spectra.get("burst", []), f"{args.outdir}/ti_burst.npz")
-        print(f"Wrote raw spectra to {spec_path}\n  -> iterate fits locally with:  "
-              f"python tests/threshold_induction_study.py --refit {spec_path} --outdir {args.outdir}")
+        print(f"Wrote raw spectra to {spec_path}\n  -> iterate fits locally with:  python "
+              f"tests/threshold_induction_study.py --refit {spec_path} --outdir {args.outdir}"
+              f"{' --burst-only' if args.burst_only else ''}")
 
-    analyze_spectra(spectra, args.outdir)
+    if args.burst_only:
+        analyze_burst_only(spectra, args.outdir)
+    else:
+        analyze_spectra(spectra, args.outdir)
     print(f"\nWrote results + plots to {args.outdir}/")
     print("=" * 70)
 
