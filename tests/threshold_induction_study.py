@@ -1006,19 +1006,24 @@ def capture_waveforms(ctx, evs, threshold_e, reset_cycles, seed0, label,
 #   test of the induction model that escapes the threshold-calibration systematic
 #   which limits the self-trigger induction RATE. See docs/threshold_induction_study.md.
 # ===========================================================================
-def muon_neighbor_pixels(ctx, ev, reach_pitches=3):
-    """Classify a through-going muon event's pixels into COLLECTORS (charge landed on the
-    pad) and the pure-INDUCTION transverse neighbours at +-1..+-reach pitches perpendicular
-    to the track.
+def muon_neighbor_pixels(ctx, ev, reach_pitches=3, include_collectors=False):
+    """Select the BAND of pixels around a through-going muon track: the COLLECTORS the muon's
+    charge lands on and/or the transverse NEIGHBOURS at +-1..+-reach pitches perpendicular to it.
 
-    A theta=0 muon lies in the pixel plane at fixed drift depth, so its collectors form a
-    LINE; pixels one-or-more pitches off that line see only induced current and never collect.
-    The track direction is found by PCA on the collector pad centres (works at any azimuth and
-    needs no knowledge of how the track was generated); we step perpendicular to it in pitch
-    units, snap to the pixel grid, and keep offset pixels that (a) actually received induced
-    current -- i.e. have a row in `unique_pix` -- and (b) are NOT themselves collectors.
+    A theta=0 muon lies in the pixel plane at fixed drift depth, so its collectors form a LINE
+    (the "column" of the track); pixels one-or-more pitches off that line see only induced
+    current and never collect. The track direction is found by PCA on the collector pad centres
+    (works at any azimuth, no knowledge of how the track was generated); we step perpendicular to
+    it in pitch units, snap to the grid, and keep pixels that received current (have a row in
+    `unique_pix`).
 
-    Returns [{row, pix_id, x, y, dist (signed pitches), is_collection, q_coll}, ...];
+      include_collectors=False -> pure-induction neighbours only (dist != 0, is_collection False):
+                                  the induction-model / falloff analysis.
+      include_collectors=True  -> the FULL band: collectors (dist 0, is_collection True) AND the
+                                  neighbours -- so a burst readout captures both the collection
+                                  pulse on the track and the induced pulses beside it.
+
+    Returns [{row, pix_id, x, y, dist (signed pitches; 0 = on-track), is_collection, q_coll}, ...];
     `row` indexes ev['pixels_signals'] so the caller reads the analog waveform directly.
     """
     from larndsim.pixels_from_track import pixel2id, id2pixel
@@ -1044,7 +1049,7 @@ def muon_neighbor_pixels(ctx, ev, reach_pitches=3):
         _ix, _iy, plane = (int(v) for v in id2pixel(int(ids[k])))
         x0 = float(det.TPC_BORDERS[plane, 0, 0]); y0 = float(det.TPC_BORDERS[plane, 1, 0])
         for step in range(-reach_pitches, reach_pitches + 1):
-            if step == 0:
+            if step == 0 and not include_collectors:         # skip the on-track pad unless wanted
                 continue
             ixn = int(round((xs[k] + step * pitch * perp[0] - x0) / pitch))
             iyn = int(round((ys[k] + step * pitch * perp[1] - y0) / pitch))
@@ -1052,27 +1057,31 @@ def muon_neighbor_pixels(ctx, ev, reach_pitches=3):
                 continue
             pid = int(pixel2id(ixn, iyn, plane))
             r = row_of.get(pid)
-            if r is None or pid in seen or bool(coll[r]):     # off-grid, seen, or a collector
+            if r is None or pid in seen:                      # off-grid or already captured
+                continue
+            is_c = bool(coll[r])
+            if is_c and not include_collectors:               # a neighbour that is itself a collector
                 continue
             seen.add(pid)
             out.append(dict(row=int(r), pix_id=pid, x=float(xs[r]), y=float(ys[r]),
-                            dist=int(step), is_collection=bool(coll[r]), q_coll=float(qc[r])))
+                            dist=int(step), is_collection=is_c, q_coll=float(qc[r])))
     return out
 
 
 def burst_readout(ctx, cur, cadence_ticks, noise_e, rng):
-    """Forced 'burst-mode' readout of ONE pixel's pre-FEE current waveform.
+    """Burst-mode PIXEL READOUT of one pad's pre-FEE current: the charge a muon-tagged (external
+    t0) forced readout records, digitised every `cadence_ticks` ticks with NO discriminator gate.
 
-    Models a DAQ that samples-and-resets the charge integrator every `cadence_ticks` ticks
-    with NO discriminator gate, so a sub-threshold neighbour that never self-triggers still
-    yields a full waveform. Each window's recorded charge is the integrated current over that
-    window (ts * sum(current)); the FEE's running q_sum telescopes to exactly this in the
-    BUFFER_RISETIME << window limit (the 0.1 us shaper dies within ~1 tick -- verified against
-    fee.get_adc_values), so this reuses the SAME fee.digitize / vd.adc_to_charge calibration
-    the self-trigger path uses. That carries the ADC LSB and the pedestal, and the pedestal is
-    what lets the negative Ramo lobe round-trip (it maps to a code below pedestal, not clamped).
+    The integrator accumulates only the POSITIVE current -- Integral(floor(current, 0)) -- across
+    the whole drift; the negative Ramo lobe is NOT integrated. This matters at fsd_cube's granularity:
+    the ADC LSB is ~997 e-, larger than a single induction transient (~hundreds of e-), so digitising
+    each window independently would quantise the induction to zero. Accumulating the positive charge
+    over the many windows of the drift lifts it above a count. Each sample digitises the running
+    integrator value (+ readout noise) through the SAME fee.digitize / vd.adc_to_charge calibration
+    the real chip uses, so the staircase carries the true ADC granularity. (The raw analog waveform,
+    which keeps the negative lobe, is captured separately -- see `_crop_downsample`.)
 
-    Returns (t_us, q_e): one burst charge sample per window.
+    Returns (t_us, q_read_e): the digitised integrator value at each readout -- a rising staircase.
     """
     det = ctx.detector
     ts = float(det.TIME_SAMPLING)
@@ -1081,25 +1090,30 @@ def burst_readout(ctx, cur, cadence_ticks, noise_e, rng):
     nwin = w.size // W
     if nwin == 0:
         return np.zeros(0, np.float32), np.zeros(0, np.float32)
-    q_int = w[:nwin * W].reshape(nwin, W).sum(axis=1) * ts               # electrons per window
-    q_int = q_int + rng.normal(0.0, noise_e, size=nwin)                  # uncorrelated readout noise
-    adc = np.asarray(ctx.fee.digitize(q_int, det.GAIN, det.V_PEDESTAL))  # host-callable (numpy in/out)
-    q_rec = np.asarray(vd.adc_to_charge(ctx, adc), float)               # back to e-, carrying the LSB
-    t = (np.arange(nwin) + 0.5) * W * ts
-    return t.astype(np.float32), q_rec.astype(np.float32)
+    cum_pos = np.cumsum(np.maximum(w, 0.0)) * ts                # running positive-charge integral (e-)
+    idx = np.arange(1, nwin + 1) * W - 1                        # integrator value at each window end
+    q_int = cum_pos[idx] + rng.normal(0.0, noise_e, size=nwin)  # readout noise on the sampled integrator
+    adc = np.asarray(ctx.fee.digitize(q_int, det.GAIN, det.V_PEDESTAL))
+    q_read = np.asarray(vd.adc_to_charge(ctx, adc), float)      # e-, carrying the ~997 e- LSB
+    t = (np.arange(1, nwin + 1) * W) * ts
+    return t.astype(np.float32), q_read.astype(np.float32)
 
 
 def capture_burst(ctx, drift_cache, sample, theta, scales, cadence_ticks, reach,
                   noise_e, seed0, collect_frac=0.15):
-    """Burst-mode capture on a control sample: for each induction SCALE, re-induce the events,
-    find each track's transverse-neighbour (pure-induction) pixels, and record their forced
-    burst-mode waveforms. The scale axis is the induction-MODEL knob -- comparing the neighbour
-    waveforms at scale 1.0 vs a mis-model (0.5, 1.5) is the threshold-independent model test.
+    """Burst-mode capture on a muon control sample: for each induction SCALE, re-induce the
+    events and record the forced burst-mode waveform of every pixel in the BAND around the track
+    -- the on-track COLLECTORS and the transverse NEIGHBOURS out to +-reach pitches. This is what
+    a muon-tagged (external t0) continuous readout of the muon's column would see: the collection
+    pulse on the track pads and the induced sub-threshold pulses beside them, from t0 over the
+    whole readout window. The scale axis lets you watch the induced pulses change with the
+    induction model (collectors are induction-independent); nominal scale 1.0 is the plain readout.
 
-    Memory-flat: induces ONE event at a time and keeps only the (small) neighbour waveforms,
-    never a list of pre-signal caches. Event seeds depend on the event index ONLY (not the
-    scale), so the sole difference between scales is the induction physics; a dedicated rng
-    supplies the per-sample readout noise. Returns a list of per-neighbour records.
+    Memory-flat: induces ONE event at a time and keeps only the (small) per-pixel waveforms, never
+    a list of pre-signal caches. Event seeds depend on the event index ONLY (not the scale), so the
+    sole difference between scales is the induction physics; a dedicated rng supplies the readout
+    noise. Each record carries `t_near` -- the truth charge-arrival time -- so the ensemble can be
+    aligned on arrival (not on a noisy argmax) and the plots can mark when the charge lands.
     """
     recs = []
     bn_rng = np.random.default_rng((int(seed0) & 0xFFFFFFFF) ^ 0x9E3779B9)
@@ -1111,119 +1125,196 @@ def capture_burst(ctx, drift_cache, sample, theta, scales, cadence_ticks, reach,
                                   collect_frac=collect_frac)
                 if ev is None:
                     continue
-                for nb in muon_neighbor_pixels(ctx, ev, reach_pitches=reach):
-                    t, q = burst_readout(ctx, ev["pixels_signals"][nb["row"]],
-                                         cadence_ticks, noise_e, bn_rng)
+                t_near = np.asarray(ev["t_near"], float)
+                ts = float(ctx.detector.TIME_SAMPLING)
+                for nb in muon_neighbor_pixels(ctx, ev, reach_pitches=reach,
+                                               include_collectors=True):
+                    cur_full = np.asarray(ev["pixels_signals"][nb["row"]], float)
+                    t, q = burst_readout(ctx, cur_full, cadence_ticks, noise_e, bn_rng)  # DAQ readout
                     if q.size == 0:
                         continue
-                    ipk = int(np.argmax(q))                  # the positive lobe (what a discriminator sees)
+                    t_wf, cur_wf, chg_wf = _crop_downsample(cur_full, ts)   # raw analog (keeps -lobe)
+                    qpos = float(np.sum(np.maximum(cur_full, 0.0)) * ts)    # total positive induced charge
                     recs.append(dict(sample=str(sample), theta=float(theta), scale=float(scale),
-                                     dist=int(abs(nb["dist"])), ev=int(i), pix_id=int(nb["pix_id"]),
-                                     q_coll=float(nb["q_coll"]), peak=float(q[ipk]),
-                                     peak_abs=float(np.max(np.abs(q))), t=t, q=q))
+                                     dist=int(abs(nb["dist"])), sdist=int(nb["dist"]),
+                                     is_collection=bool(nb["is_collection"]),
+                                     ev=int(i), pix_id=int(nb["pix_id"]), q_coll=float(nb["q_coll"]),
+                                     t_near=float(t_near[nb["row"]]) if t_near.size else np.nan,
+                                     qpos=qpos, qread=float(q[-1]), peak=qpos,   # peak := clean analog amplitude
+                                     t=t, q=q, t_wf=t_wf, cur=cur_wf, chg=chg_wf))
     set_induction(ctx, 1.0)
     return recs
 
 
 def save_burst(recs, path):
-    """Save burst-mode neighbour waveforms (from capture_burst) to an .npz for --refit."""
+    """Save burst-mode band waveforms (from capture_burst) to an .npz for --refit / viewing."""
     if not recs:
         return
-    scal = ("sample", "theta", "scale", "dist", "ev", "pix_id", "q_coll", "peak", "peak_abs")
-    kw = {k: np.asarray([r[k] for r in recs]) for k in scal}
-    for k in ("t", "q"):
-        kw[k] = _obj_array([r[k] for r in recs])
+    scal = ("sample", "theta", "scale", "dist", "sdist", "is_collection", "ev", "pix_id",
+            "q_coll", "t_near", "qpos", "qread", "peak")
+    _defaults = {"sdist": 0, "is_collection": False, "t_near": np.nan,
+                 "qpos": np.nan, "qread": np.nan}                    # for pre-band records
+    kw = {k: np.asarray([r.get(k, _defaults.get(k)) for r in recs]) for k in scal}
+    for k in ("t", "q", "t_wf", "cur", "chg"):                       # readout staircase + raw analog
+        kw[k] = _obj_array([r.get(k, np.zeros(0, np.float32)) for r in recs])
     np.savez(path, **kw)
-    print(f"  wrote {len(recs)} burst-mode neighbour waveforms to {path}")
+    ncoll = int(np.sum([bool(r.get("is_collection")) for r in recs]))
+    print(f"  wrote {len(recs)} burst-mode band waveforms to {path} "
+          f"({ncoll} on-track, {len(recs) - ncoll} neighbour; readout staircase + raw analog each)")
 
 
 def load_burst(path):
-    """Inverse of save_burst -> list of records (empty list if the file is absent)."""
+    """Inverse of save_burst -> list of records (empty list if the file is absent). Tolerant of
+    older files that predate the on-track collectors / raw analog (missing fields default in)."""
     if not path or not os.path.exists(path):
         return []
     d = np.load(path, allow_pickle=True)
     if "sample" not in d.files:
         return []
     n = len(d["sample"])
+    have = set(d.files)
+    def col(name, default, cast):
+        return (lambda i: cast(d[name][i])) if name in have else (lambda i: default)
+    def arr(name):
+        return (lambda i: np.asarray(d[name][i], float)) if name in have \
+            else (lambda i: np.zeros(0))
+    sdist = col("sdist", 0, int); iscol = col("is_collection", False, bool)
+    tnear = col("t_near", np.nan, float); qpos = col("qpos", np.nan, float)
+    qread = col("qread", np.nan, float)
+    twf, cur, chg = arr("t_wf"), arr("cur"), arr("chg")
     return [dict(sample=str(d["sample"][i]), theta=float(d["theta"][i]),
-                 scale=float(d["scale"][i]), dist=int(d["dist"][i]), ev=int(d["ev"][i]),
-                 pix_id=int(d["pix_id"][i]), q_coll=float(d["q_coll"][i]),
-                 peak=float(d["peak"][i]), peak_abs=float(d["peak_abs"][i]),
-                 t=np.asarray(d["t"][i], float), q=np.asarray(d["q"][i], float))
-            for i in range(n)]
+                 scale=float(d["scale"][i]), dist=int(d["dist"][i]), sdist=sdist(i),
+                 is_collection=iscol(i), ev=int(d["ev"][i]), pix_id=int(d["pix_id"][i]),
+                 q_coll=float(d["q_coll"][i]), t_near=tnear(i), qpos=qpos(i), qread=qread(i),
+                 peak=float(d["peak"][i]), t=np.asarray(d["t"][i], float),
+                 q=np.asarray(d["q"][i], float),
+                 t_wf=twf(i), cur=cur(i), chg=chg(i)) for i in range(n)]
 
 
-def _stack_on_peak(grp, half=8):
-    """Align each neighbour waveform to its own positive-peak sample and stack a +-half window,
-    so the mean transient SHAPE survives (the transient sits at each event's random drift depth,
-    so raw averaging would smear it away). Returns (rel_index, stacked 2-D array)."""
-    seg = []
+def _mean_on_arrival(grp, grid, tkey="t", vkey="q", right=0.0):
+    """Interpolate each band waveform onto a common time-since-charge-arrival grid (t - t_near)
+    and average. Using the TRUTH arrival time (not a noisy argmax) keeps the mean pulse sharp.
+    `tkey`/`vkey` pick the readout staircase ('t'/'q') or the raw analog ('t_wf'/'cur' or 'chg').
+    `right` is the fill past the last sample (0 for a transient, last value for a staircase).
+    Returns (mean, sem, n) or (None, None, 0)."""
+    acc = []
     for r in grp:
-        q = np.asarray(r["q"], float)
-        if q.size == 0:
+        t = np.asarray(r.get(tkey, ()), float); v = np.asarray(r.get(vkey, ()), float)
+        tn = r.get("t_near", np.nan)
+        if not np.isfinite(tn) or t.size < 2 or v.size != t.size:
             continue
-        p = int(np.argmax(q))
-        w = np.zeros(2 * half + 1)
-        a, b = p - half, p + half + 1
-        lo, hi = max(a, 0), min(b, q.size)
-        w[lo - a:hi - a] = q[lo:hi]
-        seg.append(w)
-    return np.arange(-half, half + 1), (np.vstack(seg) if seg else np.zeros((0, 2 * half + 1)))
+        rt = t[-1] if right == "last" else right
+        acc.append(np.interp(grid, t - tn, v, left=0.0, right=rt))
+    if not acc:
+        return None, None, 0
+    A = np.vstack(acc)
+    return A.mean(axis=0), A.std(axis=0) / sqrt(A.shape[0]), A.shape[0]
+
+
+def _adc_lsb(recs, default=997.0):
+    """Infer the ADC least-significant bit (e-) from the digitised readout: adc_to_charge is
+    linear in the integer ADC code, so distinct recorded charges are spaced by exactly one LSB,
+    and the smallest positive gap between them is that LSB."""
+    vals = [np.asarray(r.get("q", ()), float) for r in recs[:3000]]
+    vals = np.concatenate([v for v in vals if v.size]) if vals else np.zeros(0)
+    u = np.unique(np.round(vals[np.isfinite(vals)], 2))
+    dq = np.diff(u)
+    dq = dq[dq > 1.0]
+    return float(np.min(dq)) if dq.size else default
 
 
 def analyze_burst(recs, outdir, noise_e):
-    """The burst-mode deliverable: (1) the mean sub-threshold induction transient by neighbour
-    distance vs the noise band; (2) the induction-amplitude falloff with transverse distance,
-    nominal vs mis-model; (3) the discriminating power (how many sigma a +-50% induction error
-    separates from nominal) and its growth with muon count. Runs from the saved ti_burst.npz,
-    so it iterates locally with --refit."""
+    """The burst-mode outputs. First the COLUMN READOUT the user asked for: the mean forced-readout
+    waveform of the muon's band -- the on-track collectors and the transverse neighbours -- aligned
+    on the charge-arrival time (= tagger t0 + drift time), so you see the collection pulse on the
+    track and the induced pulses beside it. Then the neighbour-only analyses: (1) mean induction
+    transient by distance, (2) amplitude falloff nominal vs mis-model, (3) model-discrimination
+    power vs muon count. All run from the saved ti_burst.npz, so they iterate locally with --refit;
+    the per-pixel waveforms are in that file for your own plots too."""
     if not recs:
         return
     import matplotlib.pyplot as plt
-    print("\n=== Burst-mode sub-threshold induction waveforms (forced readout) ===")
+    print("\n=== Burst-mode column readout (forced, muon-tagged t0) ===")
     samples = sorted(set(r["sample"] for r in recs))
     scales = sorted(set(r["scale"] for r in recs))
-    dists = sorted(set(r["dist"] for r in recs))
     nom = 1.0 if 1.0 in scales else scales[len(scales) // 2]
 
-    def sel(sample, scale, dist):
-        return [r for r in recs if r["sample"] == sample and r["scale"] == scale
-                and r["dist"] == dist]
-
-    # (1) mean transient waveform by neighbour distance, at nominal induction
+    # ---- (0) THE COLUMN READOUT: two views of the band, aligned on charge arrival ----
+    #   TOP row  = the RAW analog induced-current waveform (keeps the negative Ramo lobe);
+    #   BOTTOM   = the DAQ pixel readout = accumulated Integral(floor(current,0)), digitised.
+    #   The bottom row shows why fsd_cube's ~997 e- LSB matters: a single induction transient is
+    #   sub-LSB, so only the accumulated positive charge over the drift clears one count.
+    lsb = _adc_lsb(recs)
+    print(f"  ADC LSB ~ {lsb:.0f} e- (fsd_cube); a single induction transient is sub-LSB, so the "
+          f"per-window\n  digitised readout can't see it -- the ACCUMULATED positive integral is "
+          f"the observable.")
+    dtwf = next((float(r["t_wf"][1] - r["t_wf"][0]) for r in recs
+                 if len(r.get("t_wf", ())) > 1), 0.1)
+    gwf = np.arange(-12.0, 8.0 + dtwf, dtwf)                      # fine grid for the transient
+    dt = next((float(r["t"][1] - r["t"][0]) for r in recs if len(r["t"]) > 1), 1.0)
+    grd = np.arange(-40.0, 20.0 + dt, dt)                        # coarse grid for the staircase
+    cmap = plt.get_cmap("viridis")
     for sample in samples:
-        any_dt = next((r for r in recs if r["sample"] == sample and len(r["t"]) > 1), None)
-        dt = float(any_dt["t"][1] - any_dt["t"][0]) if any_dt is not None else 1.0
-        fig, ax = plt.subplots(figsize=(6.6, 4.4))
-        cmap = plt.get_cmap("viridis")
-        drew = False
-        for di, dist in enumerate(dists):
-            grp = sel(sample, nom, dist)
-            if len(grp) < 2:
-                continue
-            rel, Q = _stack_on_peak(grp)
-            if Q.shape[0] == 0:
-                continue
-            mean = Q.mean(axis=0)
-            sem = Q.std(axis=0) / max(sqrt(Q.shape[0]), 1.0)
-            c = cmap(0.12 + 0.72 * di / max(len(dists) - 1, 1))
-            ax.plot(rel * dt, mean, color=c, lw=1.8,
-                    label=f"{dist} pitch  (N={Q.shape[0]})")
-            ax.fill_between(rel * dt, mean - sem, mean + sem, color=c, alpha=0.20, lw=0)
-            drew = True
-        if not drew:
-            plt.close(fig)
+        base = [r for r in recs if r["sample"] == sample and r["scale"] == nom]
+        coll = [r for r in base if r.get("is_collection", False)]
+        nbrs = [r for r in base if not r.get("is_collection", False)]
+        maxd = max((r["dist"] for r in nbrs), default=0)
+        if not coll and maxd == 0:
             continue
-        ax.axhline(0.0, color="0.6", lw=0.8)
-        ax.axhspan(-noise_e, noise_e, color="0.85", alpha=0.6, zorder=0,
-                   label=r"$\pm$noise (%.0f $e^-$)" % noise_e)
-        ax.set_xlabel(r"time relative to transient peak  ($\mu$s)")
-        ax.set_ylabel(r"burst-sample charge  ($e^-$)")
-        ax.set_title(f"Burst-mode induction transient — {sample}  (induction $\\times{nom:g}$)")
-        ax.legend(fontsize=8, loc="best")
-        ax.grid(alpha=0.25, lw=0.6)
+        fig, ax = plt.subplots(2, 2, figsize=(12.0, 8.0))
+        # TOP: raw analog current (bipolar, negative lobe)
+        mc, sc, nc = _mean_on_arrival(coll, gwf, tkey="t_wf", vkey="cur")
+        if mc is not None:
+            ax[0, 0].plot(gwf, mc, color=_C_SHW, lw=1.6)
+            ax[0, 0].fill_between(gwf, mc - sc, mc + sc, color=_C_SHW, alpha=0.2, lw=0)
+        ax[0, 0].set_title(f"on-track collectors — induced current  (N={nc})", fontsize=10)
+        ax[0, 0].set_ylabel("mean current (resp. units)")
+        for di in range(1, maxd + 1):
+            mn, se, nn = _mean_on_arrival([r for r in nbrs if r["dist"] == di], gwf,
+                                          tkey="t_wf", vkey="cur")
+            if mn is None:
+                continue
+            c = cmap(0.12 + 0.72 * (di - 1) / max(maxd - 1, 1))
+            ax[0, 1].plot(gwf, mn, color=c, lw=1.5, label=f"{di} pitch (N={nn})")
+            ax[0, 1].fill_between(gwf, mn - se, mn + se, color=c, alpha=0.15, lw=0)
+        ax[0, 1].set_title("neighbours — induced current (bipolar: +lobe leads, −lobe follows)",
+                           fontsize=10)
+        ax[0, 1].legend(fontsize=8)
+        # BOTTOM: DAQ readout = accumulated positive-charge staircase, digitised
+        mc, sc, nc = _mean_on_arrival(coll, grd, tkey="t", vkey="q", right="last")
+        if mc is not None:
+            ax[1, 0].plot(grd, mc, color=_C_SHW, lw=1.6, drawstyle="steps-mid")
+        ax[1, 0].set_title("on-track collectors — DAQ readout (∫ floor(I,0))", fontsize=10)
+        ax[1, 0].set_ylabel(r"mean recorded charge  ($e^-$)")
+        for di in range(1, maxd + 1):
+            mn, se, nn = _mean_on_arrival([r for r in nbrs if r["dist"] == di], grd,
+                                          tkey="t", vkey="q", right="last")
+            if mn is None:
+                continue
+            c = cmap(0.12 + 0.72 * (di - 1) / max(maxd - 1, 1))
+            ax[1, 1].plot(grd, mn, color=c, lw=1.5, drawstyle="steps-mid", label=f"{di} pitch")
+        ax[1, 1].axhline(lsb, color="0.4", ls="--", lw=1.0, label="1 ADC LSB (%.0f $e^-$)" % lsb)
+        ax[1, 1].set_title("neighbours — DAQ readout (sub-LSB unless accumulated)", fontsize=10)
+        ax[1, 1].legend(fontsize=8)
+        for a in ax.flat:
+            a.axvline(0.0, color="0.5", ls=":", lw=1.0)
+            a.grid(alpha=0.25, lw=0.6)
+        for a in ax[1]:
+            a.set_xlabel(r"time since charge arrival = $t_0$ + drift  ($\mu$s)")
+        fig.suptitle(f"Burst-mode column readout — {sample}  (induction $\\times{nom:g}$): "
+                     f"raw current (top) vs DAQ readout (bottom)", fontsize=12)
         fig.tight_layout()
-        _savefig(fig, f"{outdir}/ti_burst_waveforms_{sample}.png")
+        _savefig(fig, f"{outdir}/ti_burst_column_{sample}.png")
+
+    # the induction analyses below are about the NON-collecting neighbours only
+    nrecs = [r for r in recs if not r.get("is_collection", False)]
+    if not nrecs:
+        return
+    dists = sorted(set(r["dist"] for r in nrecs))
+
+    def sel(sample, scale, dist):
+        return [r for r in nrecs if r["sample"] == sample and r["scale"] == scale
+                and r["dist"] == dist]
 
     # (2) induction-amplitude falloff with transverse distance, one curve per scale
     fig, axes = plt.subplots(1, len(samples), figsize=(4.8 * len(samples), 4.2),
@@ -1246,7 +1337,7 @@ def analyze_burst(recs, outdir, noise_e):
         ax.set_xlabel("transverse distance (pitches)")
         ax.set_title(sample, fontsize=10.5)
         if si == 0:
-            ax.set_ylabel(r"mean burst peak charge  ($e^-$)")
+            ax.set_ylabel(r"mean positive induced charge $\int\!\lfloor I,0\rfloor$  ($e^-$)")
         ax.grid(alpha=0.25, lw=0.6); ax.legend(fontsize=8)
     fig.suptitle("Induction amplitude falloff — nominal vs mis-modelled induction", fontsize=12)
     fig.tight_layout()
@@ -1259,12 +1350,12 @@ def analyze_burst(recs, outdir, noise_e):
           ("sample", "mismodel", "N_nb", "N_mu", "sigma", "sigma@1e3mu"))
     drew = False
     for sample in samples:
-        g0 = [r for r in recs if r["sample"] == sample and r["scale"] == nom and r["dist"] == 1]
+        g0 = [r for r in nrecs if r["sample"] == sample and r["scale"] == nom and r["dist"] == 1]
         p0 = np.array([r["peak"] for r in g0], float)
         for scale in scales:
             if scale == nom:
                 continue
-            g1 = [r for r in recs if r["sample"] == sample and r["scale"] == scale
+            g1 = [r for r in nrecs if r["sample"] == sample and r["scale"] == scale
                   and r["dist"] == 1]
             p1 = np.array([r["peak"] for r in g1], float)
             if p0.size < 3 or p1.size < 3:
