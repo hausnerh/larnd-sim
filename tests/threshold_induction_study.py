@@ -3610,8 +3610,7 @@ def produce_burst_only(ctx, args):
                                         cad_ticks, int(args.burst_neighbors), noise_e,
                                         seed0=sd + 5000, collect_frac=args.collect_frac)
 
-        ns = (min(int(args.muon_scan_events), len(mu_drift)) if args.muon_scan_events
-              else len(mu_drift))
+        ns = min(int(args.muon_scan_events), len(mu_drift))   # 0 disables the scan (as documented)
         sc, sca = [], []
         if ns > 0:
             set_induction(ctx, 1.0); set_periodic_reset(ctx, base_reset)
