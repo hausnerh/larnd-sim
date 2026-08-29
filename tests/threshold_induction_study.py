@@ -244,17 +244,38 @@ def induction_mask(ctx):
 
 
 def set_induction(ctx, scale):
-    """Set ctx.response to a copy with neighbour-pad bins scaled by `scale`.
+    """Point ctx.response at the response table with the neighbour-pad bins scaled by `scale`.
 
     scale=1 -> nominal; 0 -> no neighbour induction (collection only); >1 stronger.
-    Uses the array module of the pristine response (cupy on a GPU node).
+
+    MEMORY: the fsd_cube response is ~1 GB on the GPU (MAX_RADIUS=12), and this is called once
+    per induction scale, so the naive `resp = r0.copy(); resp[m] = resp[m]*scale` is what tips a
+    tight GPU into OOM -- it allocates a full copy PLUS a boolean-mask gather AND a scatter, i.e.
+    up to ~3 transient full-size buffers. Instead we multiply the pristine table by a broadcast
+    (nx, ny, 1) factor straight into ONE reused work buffer: a single full-size buffer, no
+    per-bin temporaries. The result is bit-identical to the old path (verified). scale==1.0 just
+    aliases the pristine table -- no allocation at all.
     """
-    xp = vd.array_module(ctx) if hasattr(vd, "array_module") else _xp_of(ctx._response0)
-    resp = ctx._response0.copy()
-    if scale != 1.0:
-        m = xp.asarray(ctx._induction_mask)
-        resp[m] = resp[m] * scale
-    ctx.response = resp
+    xp = _xp_of(ctx._response0)
+    r0 = ctx._response0
+    if scale == 1.0:                        # nominal: alias the pristine table, no copy
+        ctx.response = r0
+        ctx.induction_scale = 1.0
+        return
+    # (nx, ny, 1, ...) multiplicative factor: `scale` on neighbour bins, 1 on each pad's own
+    # bins; broadcasts over the response time axis. The fancy index is on the SMALL (nx, ny)
+    # mask, not the big response. Rebuilt only when the scale changes.
+    if getattr(ctx, "_induction_factor_scale", None) != scale:
+        mask = xp.asarray(ctx._induction_mask)
+        factor = xp.ones(mask.shape, dtype=r0.dtype)
+        factor[mask] = r0.dtype.type(scale)
+        ctx._induction_factor = factor.reshape(mask.shape + (1,) * (r0.ndim - mask.ndim))
+        ctx._induction_factor_scale = scale
+    work = getattr(ctx, "_response_work", None)
+    if work is None or work.shape != r0.shape or work.dtype != r0.dtype:
+        work = ctx._response_work = xp.empty_like(r0)
+    xp.multiply(r0, ctx._induction_factor, out=work)   # in-place, no fancy-index temporary
+    ctx.response = work
     ctx.induction_scale = scale
 
 
