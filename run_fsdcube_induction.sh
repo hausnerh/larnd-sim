@@ -18,7 +18,7 @@
 set -euo pipefail
 
 DRY=0; [ "${1:-}" = "--dry-run" ] && DRY=1
-[ -n "${ND_WORK:-}" ] || source ~/dune_sim.sh          # get the env + helpers
+source ~/dune_sim.sh                                    # env vars AND helper functions (incont, nd_*)
 
 # ------------------------------- CONFIG --------------------------------------
 TAG=fsdcube_induction
@@ -30,7 +30,11 @@ MUON_EVENTS=250                                         # through-going muons fo
 BURST_EVENTS=80                                         # muons whose neighbour waveforms are captured
 WFTXT=25                                                # full-resolution 1-pitch induction waveforms -> text
 GRID_HRS=12; MUON_HRS=2; GEN_HRS=2                       # wall-clock per stage
-QOS=shared                                              # -c 128 already => ~224 GB, fits 1000 showers
+# Perlmutter GPU queues: 'shared' MUST be 32 cores per GPU (=> ~64 GB for 1 GPU); more RAM
+# needs 'regular' (exclusive full node: 4 GPUs, 128 cores, ~256 GB). 1000 fsd_cube showers at
+# MAX_RADIUS=12 need ~100 GB, so the GRID stage uses 'regular'; the lighter muon stage fits 'shared'.
+GRID_QOS=regular; MUON_QOS=shared; GEN_QOS=shared
+qcores() { [ "$1" = shared ] && echo "--gpus 1 -c 32" || echo "--gpus 4 -c 128"; }  # gpu qos -> resources
 EDEP=$ND_WORK/${TAG}.EDEPSIM.h5                          # generated in stage 1, consumed in stage 2
 OUT_GRID=$ND_WORK/tistudy_mult_grid
 OUT_MUON=$ND_WORK/tistudy_muon_burst
@@ -58,20 +62,26 @@ fi
 echo "   GDML : $FSDCUBE_GDML"
 if [ "$FSDCUBE_VERTEX" = "AUTO" ]; then
   echo "   deriving active-volume centre with ROOT (in-container)..."
-  FSDCUBE_VERTEX=$(incont "python3 - <<PY
-import ROOT, array
-g=ROOT.TGeoManager.Import('$FSDCUBE_GDML')
-name=next(v.GetName() for v in g.GetListOfVolumes() if 'Active' in v.GetName())
-def walk(node,hm):
-    mm=ROOT.TGeoHMatrix(hm); mm.Multiply(node.GetMatrix())
-    if node.GetVolume().GetName()==name: return mm
+  # write the query to a file and pass the GDML as argv -- feeding a heredoc THROUGH incont "$*"
+  # mangles the quoting; a file + argv is clean. The 'VERTEX' prefix lets us skip ROOT's chatter.
+  QRY=$ND_WORK/_${TAG}_vertex.py
+  cat > "$QRY" <<'PY'
+import ROOT, array, sys
+g = ROOT.TGeoManager.Import(sys.argv[1])
+name = next(v.GetName() for v in g.GetListOfVolumes() if 'Active' in v.GetName())
+def walk(node, hm):
+    m = ROOT.TGeoHMatrix(hm); m.Multiply(node.GetMatrix())
+    if node.GetVolume().GetName() == name: return m
     for i in range(node.GetVolume().GetNdaughters()):
-        r=walk(node.GetVolume().GetNode(i),mm)
+        r = walk(node.GetVolume().GetNode(i), m)
         if r: return r
-mm=walk(g.GetTopNode(),ROOT.TGeoHMatrix()); b=g.GetVolume(name).GetShape()
-loc=array.array('d',[b.GetOrigin()[0],b.GetOrigin()[1],b.GetOrigin()[2]]); gl=array.array('d',[0,0,0]); mm.LocalToMaster(loc,gl)
-print('%.4f %.4f %.4f'%(gl[0],gl[1],gl[2]))
-PY" | tail -1)
+m = walk(g.GetTopNode(), ROOT.TGeoHMatrix()); b = g.GetVolume(name).GetShape()
+loc = array.array('d', [b.GetOrigin()[0], b.GetOrigin()[1], b.GetOrigin()[2]]); gl = array.array('d', [0, 0, 0])
+m.LocalToMaster(loc, gl)
+print('VERTEX %.4f %.4f %.4f' % (gl[0], gl[1], gl[2]))
+PY
+  FSDCUBE_VERTEX=$(incont "python3 '$QRY' '$FSDCUBE_GDML'" 2>/dev/null | awk '/^VERTEX/{print $2,$3,$4}')
+  [ -n "$FSDCUBE_VERTEX" ] || { echo "!! ROOT vertex query failed; set FSDCUBE_VERTEX='x y z' (cm) explicitly."; exit 1; }
 fi
 echo "   VERTEX (cm): $FSDCUBE_VERTEX     SD: $FSDCUBE_SD"
 echo "   showers=$NSHOWER  thresholds=[$THRESHOLDS]  resets=[$RESETS]  wf-txt=$WFTXT"
@@ -88,7 +98,7 @@ cat > "$J1" <<EOF
 #!/bin/bash -l
 #SBATCH -A $ND_ACCT_CPU
 #SBATCH -C cpu
-#SBATCH -q $QOS
+#SBATCH -q $GEN_QOS
 #SBATCH -N 1 -t ${GEN_HRS}:00:00
 #SBATCH -o $ND_WORK/${TAG}_1_edep_%j.log
 source ~/dune_sim.sh
@@ -108,8 +118,8 @@ cat > "$J2" <<EOF
 #!/bin/bash -l
 #SBATCH -A $ND_ACCT_GPU
 #SBATCH -C gpu
-#SBATCH -q $QOS
-#SBATCH --gpus 1 -c 128 -N 1 -t ${GRID_HRS}:00:00
+#SBATCH -q $GRID_QOS
+#SBATCH $(qcores $GRID_QOS) -N 1 -t ${GRID_HRS}:00:00
 #SBATCH -o $ND_WORK/${TAG}_2_grid_%j.log
 source ~/dune_sim.sh
 nd_conda
@@ -125,8 +135,8 @@ cat > "$J3" <<EOF
 #!/bin/bash -l
 #SBATCH -A $ND_ACCT_GPU
 #SBATCH -C gpu
-#SBATCH -q $QOS
-#SBATCH --gpus 1 -c 128 -N 1 -t ${MUON_HRS}:00:00
+#SBATCH -q $MUON_QOS
+#SBATCH $(qcores $MUON_QOS) -N 1 -t ${MUON_HRS}:00:00
 #SBATCH -o $ND_WORK/${TAG}_3_muon_%j.log
 source ~/dune_sim.sh
 nd_conda
