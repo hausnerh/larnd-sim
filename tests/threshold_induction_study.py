@@ -1191,6 +1191,52 @@ def load_burst(path):
                  t_wf=twf(i), cur=cur(i), chg=chg(i)) for i in range(n)]
 
 
+def dump_induction_waveforms_txt(ctx, drift_cache, theta, n_files, outdir, seed, collect_frac=0.15):
+    """Write the FULL-resolution induced-current waveform of a selection of 1-pitch pure-induction
+    neighbours to plain-text files -- one file per pixel, a metadata header then two columns
+    `time_us  current` at the sim's native tick spacing (no cropping, no downsampling). Nominal
+    induction. Lets the raw induction pulses be inspected/fit outside the sim.
+
+    Returns the number of files written. Files land in <outdir>/induction_waveforms/."""
+    import os
+    d = os.path.join(outdir, "induction_waveforms"); os.makedirs(d, exist_ok=True)
+    ts = float(ctx.detector.TIME_SAMPLING)
+    vdrift = float(np.atleast_1d(getattr(ctx.detector, "V_DRIFT", np.nan)).ravel()[0])
+    set_induction(ctx, 1.0)          # pixels_signals is pre-FEE, so the reset value is irrelevant
+    written = 0
+    with _silence_device_stdout():
+        for i, dc in enumerate(drift_cache):
+            if written >= n_files:
+                break
+            ev = event_induce(ctx, dc[0], dc[1], dc[2], seed=seed + i, collect_frac=collect_frac)
+            if ev is None:
+                continue
+            tnear = np.asarray(ev["t_near"], float)
+            for nb in muon_neighbor_pixels(ctx, ev, reach_pitches=1):
+                if written >= n_files:
+                    break
+                if nb["is_collection"] or abs(nb["dist"]) != 1:
+                    continue
+                cur = np.asarray(ev["pixels_signals"][nb["row"]], float)
+                t = np.arange(cur.size) * ts
+                tn = tnear[nb["row"]]
+                depth = tn * vdrift if np.isfinite(tn) else float("nan")
+                fn = os.path.join(d, f"induction_th{int(round(theta)):02d}_ev{i:04d}_pix{nb['pix_id']}.txt")
+                with open(fn, "w") as f:
+                    f.write("# FSD Cube -- full-resolution 1-pitch pure-induction neighbour waveform\n")
+                    f.write(f"# detector={vd.detector_identity(ctx)[0]} sample=muon_th{int(round(theta)):02d} "
+                            f"event={i} pixel_id={nb['pix_id']}\n")
+                    f.write(f"# x={nb['x']:.4f}cm y={nb['y']:.4f}cm transverse_dist={nb['dist']}pitch "
+                            f"drift_depth={depth:.3f}cm charge_arrival_t={tn:.3f}us\n")
+                    f.write(f"# TIME_SAMPLING={ts}us ; columns: time_us\tcurrent_e_per_us\n")
+                    for tt, cc in zip(t, cur):
+                        f.write(f"{tt:.4f}\t{cc:.6g}\n")
+                written += 1
+    set_induction(ctx, 1.0)
+    print(f"  wrote {written} full-resolution 1-pitch induction waveforms to {d}/")
+    return written
+
+
 def _mean_on_arrival(grp, grid, tkey="t", vkey="q", right=0.0):
     """Interpolate each band waveform onto a common time-since-charge-arrival grid (t - t_near)
     and average. Using the TRUTH arrival time (not a noisy argmax) keeps the mean pulse sharp.
@@ -3115,6 +3161,16 @@ def parse_args():
                          "FEE-only self-trigger threshold scan (induction on/off). Minutes, not "
                          "hours, and no big-RAM allocation. The burst waveforms are threshold-"
                          "independent, so the threshold range only scans the self-trigger yield.")
+    ap.add_argument("--wf-txt", type=int, default=0,
+                    help="in a muon (--burst-only) run, ALSO write this many full-resolution "
+                         "1-pitch pure-induction neighbour waveforms to plain-text files "
+                         "(<outdir>/induction_waveforms/, columns time_us + current). 0 = off.")
+    ap.add_argument("--mult-grid", action="store_true",
+                    help="SHOWER PATH: read a large shower sample out over the FULL "
+                         "(--thresholds x --resets) grid at nominal induction and record every "
+                         "fired pixel's ADC-hit multiplicity, so the charge distributions split "
+                         "into 1-hit / 2-hit / 3+-hit / all. One pre-signal cache (no induction "
+                         "scan, no fits, no muons) -> memory allows a large --n-events.")
     ap.add_argument("--outdir", default="tistudy")
     return ap.parse_args()
 
@@ -3565,6 +3621,167 @@ def load_spectra(path):
     return spectra
 
 
+def aggregate_multiplicity_grid(ctx, evs, thresholds, resets, seed0):
+    """GPU: over the FULL (threshold x reset) grid, record every fired pixel with its ADC-hit
+    MULTIPLICITY on the nominal-induction shower cache. Reset changes recompile the fee kernel,
+    so loop reset OUTER to share each recompile; thresholds within a reset are FEE-only.
+
+    At each node we keep the 'all' record -- (summed charge, collection-truth, n_hits) for every
+    fired pixel -- from which the analysis slices 1-hit / 2-hit / 3+-hit / all-multiplicity charge
+    distributions. Returns [(thr, cycles, q, tr, n_hits), ...]."""
+    out = []
+    thr_arr = [float(t) for t in thresholds]; rst_arr = [int(r) for r in resets]
+    for ir, rst in enumerate(rst_arr):
+        for it, thr in enumerate(thr_arr):
+            q, tr, n = aggregate_hits(ctx, evs, thr, rst, 1.0,
+                                      seed0=seed0 + ir * 1000 + it)["all"]
+            q = np.asarray(q, float); n = np.asarray(n, np.int16)
+            out.append((thr, rst, q, np.asarray(tr, bool), n))
+            print(f"    thr={thr:.0f} rst={rst:>5d}: {q.size} fired  "
+                  f"(1h={int((n==1).sum())} 2h={int((n==2).sum())} 3+={int((n>=3).sum())})")
+    return out
+
+
+def produce_mult_grid(ctx, args):
+    """GPU (`--mult-grid`): a large shower sample read out over the full (threshold x reset) grid,
+    keeping every fired pixel's hit multiplicity so the charge distributions can be split
+    1-hit / 2-hit / 3+-hit / all. Nominal induction, ONE pre-signal cache (no induction scan, no
+    template fits, no muons) so memory is a single cache and N can be large. Returns a spectra
+    dict with `mult_grid` + meta."""
+    base_thr, base_reset = base_config(ctx, args)
+    ts = float(ctx.detector.TIME_SAMPLING)
+    noise_e = (float(args.noise_e) if args.noise_e is not None
+               else float(np.atleast_1d(getattr(ctx.detector, "UNCORRELATED_NOISE_CHARGE", 500.0)).ravel()[0]))
+    rng = np.random.default_rng(args.seed)
+    if args.edep_h5:
+        print(f"\nLoading real edep-sim showers from {args.edep_h5} ...")
+        raw = load_edep_events(args.edep_h5, args.n_events)
+        f_out = events_out_of_volume(raw, ctx)
+        if args.recenter_showers:
+            raw = recenter_events(raw, ctx, rng)
+            print(f"  loaded {len(raw)} events; re-centred "
+                  f"({100 * f_out:.1f}% were outside the active volume before)")
+        else:
+            print(f"  loaded {len(raw)} events ({100 * f_out:.1f}% of deposits outside the volume)")
+            if f_out > 0.01:
+                print(f"  *** WARNING: {100 * f_out:.1f}% OUTSIDE {args.config}'s volume -- wrong "
+                      f"geometry? regenerate edep in this GDML, or pass --recenter-showers.")
+    else:
+        print(f"\nGenerating {args.n_events} parametric showers (E={args.shower_energy:.0f} MeV)...")
+        raw = [build_shower_event(ctx, rng, energy_mev=args.shower_energy, n_dep=args.n_dep)
+               for _ in range(args.n_events)]
+    print("Computing drift + pixel geometry (cached, once)...")
+    drift = [d for d in (event_drift(ctx, r) for r in raw) if d is not None]
+    n_eff = len(drift)
+    print(f"  {n_eff}/{args.n_events} events produced collectable charge")
+    if n_eff == 0:
+        sys.exit("No events produced any pixels -- check shower placement / config.")
+    print("Inducing nominal-induction pre-FEE signals (cached, once)...")
+    set_induction(ctx, 1.0); set_periodic_reset(ctx, base_reset)
+    evs = [e for e in (event_induce(ctx, d[0], d[1], d[2], seed=args.seed + 100 + i,
+                                    collect_frac=args.collect_frac)
+                       for i, d in enumerate(drift)) if e is not None]
+    print(f"  pre-signal cache: {_cache_mb(evs):.1f} MB "
+          f"({_cache_mb(evs) / max(len(evs), 1):.2f} MB/event, MAX_RADIUS={ctx.detector.MAX_RADIUS} pix)")
+    thr_grid = sorted(set(float(t) for t in args.thresholds))
+    rst_grid = sorted(set(int(r) for r in args.resets))
+    print(f"\nMultiplicity grid: {len(thr_grid)} thresholds x {len(rst_grid)} resets "
+          f"= {len(thr_grid) * len(rst_grid)} nodes (FEE-only, nominal induction)...")
+    grid = aggregate_multiplicity_grid(ctx, evs, thr_grid, rst_grid, seed0=args.seed + 20000)
+    det_name, _g, det_path = vd.detector_identity(ctx)
+    meta = dict(base_threshold=base_thr, base_reset=base_reset, ts=ts, noise_e=noise_e,
+                n_shower=n_eff, thresholds=np.asarray(thr_grid, float),
+                resets=np.asarray(rst_grid, int), detector_name=str(det_name),
+                detector_path=str(det_path), edep=str(args.edep_h5 or "parametric"))
+    return dict(meta=meta, mult_grid=grid)
+
+
+def save_mult_grid(spectra, path):
+    """Save the multiplicity grid (from produce_mult_grid) to an .npz for --refit / plotting."""
+    kw = {"meta_" + k: np.asarray(v) for k, v in spectra["meta"].items()}
+    grid = spectra["mult_grid"]
+    kw["node_thr"] = np.asarray([g[0] for g in grid], float)
+    kw["node_rst"] = np.asarray([g[1] for g in grid], int)
+    kw["node_q"] = _obj_array([g[2] for g in grid])
+    kw["node_tr"] = _obj_array([g[3] for g in grid])
+    kw["node_n"] = _obj_array([g[4] for g in grid])
+    np.savez(path, **kw)
+    print(f"  wrote multiplicity grid ({len(grid)} nodes) to {path}")
+
+
+def load_mult_grid(path):
+    """Inverse of save_mult_grid -> the spectra dict consumed by analyze_mult_grid."""
+    d = np.load(path, allow_pickle=True)
+    meta = {k[5:]: (d[k].item() if d[k].ndim == 0 else d[k])
+            for k in d.files if k.startswith("meta_")}
+    thr, rst = d["node_thr"], d["node_rst"]
+    grid = [(float(thr[i]), int(rst[i]), np.asarray(d["node_q"][i], float),
+             np.asarray(d["node_tr"][i], bool), np.asarray(d["node_n"][i], np.int16))
+            for i in range(len(thr))]
+    return dict(meta=meta, mult_grid=grid)
+
+
+def analyze_mult_grid(spectra, outdir):
+    """CPU: charge-collection distributions from the (threshold x reset) multiplicity grid, split
+    into 1-hit / 2-hit / 3+-hit / all-multiplicity pixels. For each multiplicity class it writes a
+    small-multiples figure (one panel per reset, the thresholds overlaid) in both per-shower and
+    area-normalized form. Runs from the saved ti_mult_grid.npz, so it re-plots with --refit."""
+    import matplotlib.pyplot as plt
+    m = spectra["meta"]; nsh = int(m["n_shower"]); grid = spectra["mult_grid"]
+    thr_vals = sorted(set(g[0] for g in grid)); rst_vals = sorted(set(g[1] for g in grid))
+    node = {(g[0], g[1]): g for g in grid}
+    bins = np.arange(0, 42, 1.0); ctr = 0.5 * (bins[1:] + bins[:-1])          # ke-
+    cmap = plt.get_cmap("viridis")
+    print(f"\n=== Multiplicity-grid distributions ({m.get('detector_name','?')}, "
+          f"{nsh} showers, {len(grid)} nodes) ===")
+
+    def pick(q, n, cls):
+        return q[n == 1] if cls == "1" else q[n == 2] if cls == "2" \
+            else q[n >= 3] if cls == "3+" else q
+    rlab = lambda r: "reset off" if r < 0 else f"{r} cyc"
+    for cls, clab, slug in (("1", "single-hit", "1hit"), ("2", "two-hit", "2hit"),
+                            ("3+", "3+ hit", "3plus"), ("all", "all-multiplicity", "all")):
+        # console yield summary at the base reset
+        base_r = int(m["base_reset"])
+        row = []
+        for thr in thr_vals:
+            g = node.get((thr, base_r))
+            if g is not None:
+                row.append((thr, pick(np.asarray(g[2], float), np.asarray(g[4], np.int16), cls).size / nsh))
+        if row:
+            print(f"  {clab:16s} / shower @ reset {rlab(base_r)}: "
+                  + "  ".join(f"{t/1000:.2f}ke⁻={y:.2f}" for t, y in row))
+        for norm in (False, True):
+            ncol = min(len(rst_vals), 3); nrow = int(np.ceil(len(rst_vals) / ncol))
+            fig, axes = plt.subplots(nrow, ncol, figsize=(4.6 * ncol, 3.5 * nrow), squeeze=False)
+            for j, rst in enumerate(rst_vals):
+                ax = axes[j // ncol][j % ncol]
+                for it, thr in enumerate(thr_vals):
+                    g = node.get((thr, rst))
+                    if g is None:
+                        continue
+                    q = np.asarray(g[2], float) / 1000.0; nn = np.asarray(g[4], np.int16)
+                    h, _ = np.histogram(pick(q, nn, cls), bins=bins); h = h.astype(float)
+                    y = h / max(h.sum(), 1) if norm else h / nsh
+                    ax.step(ctr, y, where="mid", lw=1.5,
+                            color=cmap(0.12 + 0.76 * it / max(len(thr_vals) - 1, 1)),
+                            label=f"{thr/1000:.2f} ke⁻")
+                ax.set_title(rlab(rst), fontsize=10); ax.grid(alpha=0.25, lw=0.6)
+                ax.set_xlim(0, 40); ax.set_ylim(bottom=0)
+            for j in range(len(rst_vals), nrow * ncol):
+                axes[j // ncol][j % ncol].axis("off")
+            axes[0][0].legend(title="threshold", fontsize=8)
+            ylab = "Fraction of pixels / ke⁻" if norm else "Pixels / shower"
+            for r in range(nrow):
+                axes[r][0].set_ylabel(ylab)
+            for c in range(ncol):
+                axes[min(nrow - 1, (len(rst_vals) - 1) // ncol)][c].set_xlabel("Single-hit pixel charge (ke⁻)")
+            fig.suptitle(f"FSD Cube showers — {clab} pixel charge vs threshold × reset "
+                         f"({'area-normalized' if norm else 'per shower'})", fontsize=12)
+            fig.tight_layout()
+            _savefig(fig, f"{outdir}/mult_{slug}_{'norm' if norm else 'pershower'}.png")
+
+
 def produce_burst_only(ctx, args):
     """GPU, FAST PATH (`--burst-only`): parallel-muon burst-mode waveforms + a cheap FEE-only
     self-trigger threshold scan, and NOTHING else -- no showers, no template grid, no composite
@@ -3609,6 +3826,12 @@ def produce_burst_only(ctx, args):
             burst_recs += capture_burst(ctx, mu_drift[:nbev], name, theta, args.burst_inductions,
                                         cad_ticks, int(args.burst_neighbors), noise_e,
                                         seed0=sd + 5000, collect_frac=args.collect_frac)
+
+        # full-resolution 1-pitch induction waveforms as text (parallel muons only; theta=0 is the
+        # clean isochronous case with a line of collectors and pure-induction neighbours beside it)
+        if int(args.wf_txt) > 0 and int(round(theta)) == 0 and mu_drift:
+            dump_induction_waveforms_txt(ctx, mu_drift, float(theta), int(args.wf_txt),
+                                         args.outdir, seed=sd + 900, collect_frac=args.collect_frac)
 
         ns = min(int(args.muon_scan_events), len(mu_drift))   # 0 disables the scan (as documented)
         sc, sca = [], []
@@ -4450,6 +4673,28 @@ def main():
     if args.list_configs:
         list_named_configs(); return
     os.makedirs(args.outdir, exist_ok=True)
+
+    # ---- multiplicity-grid mode: its own produce/save/analyze (distinct spectra shape) ----
+    if args.mult_grid:
+        if args.refit:
+            print(f"REFIT mode: loading multiplicity grid from {args.refit} (no GPU) ...")
+            spectra = load_mult_grid(args.refit)
+        else:
+            from numba import cuda
+            if not cuda.is_available():
+                sys.exit("ERROR: no CUDA GPU available. Run on a GPU node, or --refit a saved "
+                         "ti_mult_grid.npz.")
+            resolve_config(args)
+            ctx = vd.load_simulation(args); vd.print_config(ctx)
+            ctx._response0 = ctx.response.copy(); ctx._induction_mask = induction_mask(ctx)
+            ctx.induction_scale = 1.0
+            spectra = produce_mult_grid(ctx, args)
+            save_mult_grid(spectra, f"{args.outdir}/ti_mult_grid.npz")
+            print(f"Wrote multiplicity grid to {args.outdir}/ti_mult_grid.npz\n  -> re-plot locally "
+                  f"with:  python tests/threshold_induction_study.py --refit "
+                  f"{args.outdir}/ti_mult_grid.npz --mult-grid --outdir {args.outdir}")
+        analyze_mult_grid(spectra, args.outdir)
+        print(f"\nWrote results + plots to {args.outdir}/"); print("=" * 70); return
 
     if args.refit:
         print(f"REFIT mode: loading spectra from {args.refit} (no GPU) ...")
