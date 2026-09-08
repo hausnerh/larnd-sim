@@ -35,12 +35,15 @@ EDEP=$ND_WORK/${TAG}.EDEPSIM.h5                          # generated in stage 1,
 OUT_GRID=$ND_WORK/tistudy_mult_grid
 OUT_MUON=$ND_WORK/tistudy_muon_burst
 
-# --------------------- fsd_cube GEOMETRY (VERIFY THESE) ----------------------
-# dune_sim.sh points ND_GEOM/ND_VERTEX/ND_SD at module0. edep MUST run in the
-# fsd_cube geometry or the showers land in the wrong volume. Set these to the
-# fsd_cube values; leave VERTEX=AUTO to derive the active-volume centre with ROOT.
-FSDCUBE_GDML="${FSDCUBE_GDML:-$(ls "$ND_WORK"/ND_Production/geometry/*fsd*cube*.gdml \
-                                  "$ND_WORK"/ND_Production/geometry/*fsd*.gdml 2>/dev/null | head -1 || true)}"
+# --------------------- fsd_cube GEOMETRY -------------------------------------
+# FSD Cube uses the SAME edep-sim GDML as FSD (fsd_with_cryostat.gdml); dune_sim.sh
+# otherwise points ND_GEOM/ND_VERTEX/ND_SD at module0, so we override them. The FSD
+# active volume is much larger than FSD Cube's readout region, so stage 2 uses
+# --recenter-showers to translate each shower into FSD Cube's own volume (larnd-sim
+# frame) -- which also randomises the position instead of the gun's single fixed vertex.
+# VERTEX just needs to be a valid point in the FSD LAr for the gun; AUTO derives the
+# active-volume centre with ROOT.
+FSDCUBE_GDML="${FSDCUBE_GDML:-$ND_WORK/ND_Production/geometry/fsd_with_cryostat.gdml}"
 FSDCUBE_VERTEX="${FSDCUBE_VERTEX:-AUTO}"                 # "x y z" in cm, or AUTO
 FSDCUBE_SD="${FSDCUBE_SD:-TPCActive_shape}"             # sensitive-detector name in the GDML
 
@@ -72,7 +75,8 @@ PY" | tail -1)
 fi
 echo "   VERTEX (cm): $FSDCUBE_VERTEX     SD: $FSDCUBE_SD"
 echo "   showers=$NSHOWER  thresholds=[$THRESHOLDS]  resets=[$RESETS]  wf-txt=$WFTXT"
-echo "   >>> verify VERTEX sits inside the fsd_cube active volume before a real run <<<"
+echo "   (stage 2 --recenter-showers places them in FSD Cube's volume; VERTEX only needs to be"
+echo "    a valid point in the FSD LAr so the gun produces showers)"
 
 mkdir -p "$OUT_GRID" "$OUT_MUON"
 J1=$ND_WORK/${TAG}_1_edep.sh
@@ -111,7 +115,7 @@ source ~/dune_sim.sh
 nd_conda
 cd "\$ND_SRC"
 python tests/threshold_induction_study.py --config fsd_cube --mult-grid \\
-  --edep-h5 "${EDEP}" --n-events $NSHOWER --outdir "$OUT_GRID" \\
+  --edep-h5 "${EDEP}" --recenter-showers --n-events $NSHOWER --outdir "$OUT_GRID" \\
   --thresholds $THRESHOLDS --resets $RESETS
 echo "STAGE2 DONE -> $OUT_GRID/ti_mult_grid.npz"
 EOF
