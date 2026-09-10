@@ -175,7 +175,7 @@ def build_shower_event(ctx, rng, plane=0, energy_mev=300.0, n_dep=400,
 
 
 def build_muon_event(ctx, rng, plane=0, theta_deg=45.0, length_cm=20.0,
-                     dedx=2.1, step_cm=0.3):
+                     dedx=2.1, step_cm=0.3, azimuth_deg=None):
     """A straight MIP muon track, parametrised by its angle to the PIXEL PLANE.
 
     theta_deg is the angle between the track and the pixel (anode) plane:
@@ -187,18 +187,35 @@ def build_muon_event(ctx, rng, plane=0, theta_deg=45.0, length_cm=20.0,
                (large sig_t_coll); that column is multi-hit, and the single-hit sample is the
                transverse-neighbour induction.
       * 45  -> tilted: each pixel sees charge over a time window set by the tilt.
-    The transverse position, depth and azimuth are randomised per event so different pixels
-    are sampled while the topology (angle) is held fixed. MIP dE/dx ~ 2.1 MeV/cm."""
+    The transverse position and depth are randomised per event so different pixels are sampled
+    while the topology (angle) is held fixed. MIP dE/dx ~ 2.1 MeV/cm.
+
+    azimuth_deg fixes the track's direction WITHIN the pixel plane. None -> random per event, so the
+    track runs DIAGONAL across the square grid: its collectors form a staircase (not one strip) and
+    transverse neighbours sit at mixed distances. A fixed value locks it to a grid axis -- 0 deg =
+    along pixel-x, so the muon lies on a SINGLE STRIP of pixels with clean +-k-pitch neighbours;
+    90 = along pixel-y. The transverse coordinate is then snapped onto a pixel-centre line so the
+    charge sits squarely on one strip rather than straddling two rows."""
     from math import radians, cos, sin
     det = ctx.detector
     x0, x1, y0, y1 = vd.active_volume(det, plane, margin=3.0)
     dmax = abs(det.DRIFT_LENGTH) - 3.0
     th = radians(theta_deg)
-    ph = rng.uniform(0.0, 2.0 * np.pi)
+    ph = rng.uniform(0.0, 2.0 * np.pi) if azimuth_deg is None else radians(azimuth_deg)
     dvec = np.array([cos(th) * cos(ph), cos(th) * sin(ph), sin(th)])   # (x, y, DEPTH)
     cx = rng.uniform(x0 + 0.2 * (x1 - x0), x1 - 0.2 * (x1 - x0))
     cy = rng.uniform(y0 + 0.2 * (y1 - y0), y1 - 0.2 * (y1 - y0))
     cdepth = rng.uniform(0.3 * dmax, 0.7 * dmax)
+    if azimuth_deg is not None:
+        # snap the TRANSVERSE in-plane coordinate onto a pixel-centre line (centre = border + i*pitch,
+        # verify_diffusion.pixel_xy_from_id) so the charge sits squarely on one strip, not straddling
+        # two rows. Along-track position and depth stay randomised -> different strips/depths sampled.
+        pitch = float(det.PIXEL_PITCH)
+        bx0 = float(det.TPC_BORDERS[plane, 0, 0]); by0 = float(det.TPC_BORDERS[plane, 1, 0])
+        if abs(cos(ph)) >= abs(sin(ph)):
+            cy = by0 + round((cy - by0) / pitch) * pitch     # track ~along x -> transverse is y
+        else:
+            cx = bx0 + round((cx - bx0) / pitch) * pitch     # track ~along y -> transverse is x
 
     n = max(int(length_cm / step_cm), 2)
     s = (np.arange(n) - 0.5 * n) * step_cm
@@ -218,6 +235,12 @@ def build_muon_event(ctx, rng, plane=0, theta_deg=45.0, length_cm=20.0,
         tracks[i]["pdg_id"] = 13
         tracks[i]["segment_id"] = i
     return tracks
+
+
+def _parse_azimuth(s):
+    """--muon-azimuth value -> azimuth in degrees (grid-aligned single-strip muon), or None for a
+    random per-event azimuth (track diagonal to the grid)."""
+    return None if str(s).strip().lower() in ("random", "rand", "none") else float(s)
 
 
 # ===========================================================================
@@ -1191,49 +1214,68 @@ def load_burst(path):
                  t_wf=twf(i), cur=cur(i), chg=chg(i)) for i in range(n)]
 
 
-def dump_induction_waveforms_txt(ctx, drift_cache, theta, n_files, outdir, seed, collect_frac=0.15):
-    """Write the FULL-resolution induced-current waveform of a selection of 1-pitch pure-induction
-    neighbours to plain-text files -- one file per pixel, a metadata header then two columns
-    `time_us  current` at the sim's native tick spacing (no cropping, no downsampling). Nominal
-    induction. Lets the raw induction pulses be inspected/fit outside the sim.
+def dump_induction_waveforms_txt(ctx, drift_cache, theta, n_events, outdir, seed,
+                                 collect_frac=0.15, max_files=4000):
+    """Write FULL-resolution current waveforms ALONG THE WHOLE MUON strip to plain-text files -- one
+    file per pixel, a metadata header then two columns `time_us  current` at the sim's native tick
+    spacing (no cropping, no downsampling), nominal induction. For each of the first `n_events` muon
+    events that collect charge, EVERY pixel of the track band is dumped, ordered head->tail:
+      * the on-track COLLECTORS  (kind=collection, dist 0)  -- the collection waveforms, and
+      * the +-1-pitch transverse NEIGHBORS (kind=induction) -- the pure-induction waveforms,
+    so both the collection pulse and the induced pulse are captured at every position along the muon.
+    `max_files` caps the total as a safety valve. Lets the raw pulses be inspected/fit outside the sim.
 
-    Returns the number of files written. Files land in <outdir>/induction_waveforms/."""
+    Returns the number of files written. Files land in <outdir>/induction_waveforms/
+    (coll_*.txt for collectors, induction_*.txt for neighbors)."""
     import os
     d = os.path.join(outdir, "induction_waveforms"); os.makedirs(d, exist_ok=True)
     ts = float(ctx.detector.TIME_SAMPLING)
+    pitch = float(ctx.detector.PIXEL_PITCH)
     vdrift = float(np.atleast_1d(getattr(ctx.detector, "V_DRIFT", np.nan)).ravel()[0])
     set_induction(ctx, 1.0)          # pixels_signals is pre-FEE, so the reset value is irrelevant
-    written = 0
+    written = 0; n_coll = 0; ev_done = 0; capped = False
     with _silence_device_stdout():
         for i, dc in enumerate(drift_cache):
-            if written >= n_files:
+            if ev_done >= n_events or capped:
                 break
             ev = event_induce(ctx, dc[0], dc[1], dc[2], seed=seed + i, collect_frac=collect_frac)
             if ev is None:
                 continue
+            band = [b for b in muon_neighbor_pixels(ctx, ev, reach_pitches=1, include_collectors=True)
+                    if abs(b["dist"]) <= 1]                       # collectors (0) + both 1-pitch sides
+            if not any(b["is_collection"] for b in band):
+                continue
+            band.sort(key=lambda b: (round(b["y"] / pitch), round(b["x"] / pitch)))   # head -> tail
             tnear = np.asarray(ev["t_near"], float)
-            for nb in muon_neighbor_pixels(ctx, ev, reach_pitches=1):
-                if written >= n_files:
+            for b in band:
+                if written >= max_files:
+                    capped = True
+                    print(f"  reached --wf-txt safety cap of {max_files} files; stopping early")
                     break
-                if nb["is_collection"] or abs(nb["dist"]) != 1:
-                    continue
-                cur = np.asarray(ev["pixels_signals"][nb["row"]], float)
+                kind = "collection" if b["is_collection"] else "induction"
+                cur = np.asarray(ev["pixels_signals"][b["row"]], float)
                 t = np.arange(cur.size) * ts
-                tn = tnear[nb["row"]]
+                tn = tnear[b["row"]]
                 depth = tn * vdrift if np.isfinite(tn) else float("nan")
-                fn = os.path.join(d, f"induction_th{int(round(theta)):02d}_ev{i:04d}_pix{nb['pix_id']}.txt")
+                pre = "coll" if b["is_collection"] else "induction"
+                fn = os.path.join(d, f"{pre}_th{int(round(theta)):02d}_ev{i:04d}_pix{b['pix_id']}.txt")
                 with open(fn, "w") as f:
-                    f.write("# FSD Cube -- full-resolution 1-pitch pure-induction neighbour waveform\n")
+                    desc = ("on-track collection" if b["is_collection"]
+                            else f"{abs(b['dist'])}-pitch pure-induction neighbor")
+                    f.write(f"# FSD Cube -- full-resolution {desc} waveform (muon strip, azimuth-locked)\n")
                     f.write(f"# detector={vd.detector_identity(ctx)[0]} sample=muon_th{int(round(theta)):02d} "
-                            f"event={i} pixel_id={nb['pix_id']}\n")
-                    f.write(f"# x={nb['x']:.4f}cm y={nb['y']:.4f}cm transverse_dist={nb['dist']}pitch "
+                            f"event={i} pixel_id={b['pix_id']} kind={kind} transverse_dist={b['dist']}pitch\n")
+                    f.write(f"# x={b['x']:.4f}cm y={b['y']:.4f}cm q_coll={b['q_coll']:.1f}e- "
                             f"drift_depth={depth:.3f}cm charge_arrival_t={tn:.3f}us\n")
                     f.write(f"# TIME_SAMPLING={ts}us ; columns: time_us\tcurrent_e_per_us\n")
                     for tt, cc in zip(t, cur):
                         f.write(f"{tt:.4f}\t{cc:.6g}\n")
                 written += 1
+                n_coll += int(b["is_collection"])
+            ev_done += 1
     set_induction(ctx, 1.0)
-    print(f"  wrote {written} full-resolution 1-pitch induction waveforms to {d}/")
+    print(f"  wrote {written} full-resolution waveforms along {ev_done} whole muon strip(s) "
+          f"({n_coll} collection + {written - n_coll} induction) to {d}/")
     return written
 
 
@@ -3069,6 +3111,11 @@ def parse_args():
                     help="events per muon sample (a MIP track lights up ~40 pixels, so a few "
                          "hundred is plenty). Capped at --n-events.")
     ap.add_argument("--muon-length", type=float, default=20.0, help="muon track length (cm)")
+    ap.add_argument("--muon-azimuth", type=str, default="0",
+                    help="azimuth of the muon WITHIN the pixel plane. '0' (default) = along the "
+                         "pixel-x axis, so each muon lies on a SINGLE STRIP of pixels (clean "
+                         "transverse-neighbour geometry); '90' = along pixel-y. Pass 'random' for a "
+                         "random azimuth per event (track runs diagonal to the grid, mixed distances).")
     ap.add_argument("--muon-scan-events", type=int, default=100,
                     help="events per muon sample used for the THRESHOLD/RESET scans "
                          "(0 disables them). Separate from --muon-events because the scans "
@@ -3162,9 +3209,11 @@ def parse_args():
                          "hours, and no big-RAM allocation. The burst waveforms are threshold-"
                          "independent, so the threshold range only scans the self-trigger yield.")
     ap.add_argument("--wf-txt", type=int, default=0,
-                    help="in a muon (--burst-only) run, ALSO write this many full-resolution "
-                         "1-pitch pure-induction neighbour waveforms to plain-text files "
-                         "(<outdir>/induction_waveforms/, columns time_us + current). 0 = off.")
+                    help="in a muon (--burst-only) run, ALSO dump full-resolution waveforms along "
+                         "the WHOLE muon strip for this many events -- every on-track collector "
+                         "(coll_*.txt) and every +-1-pitch pure-induction neighbor (induction_*.txt) "
+                         "-- to plain-text files (<outdir>/induction_waveforms/, columns time_us + "
+                         "current). ~230 files (~10 MB) per event. 0 = off.")
     ap.add_argument("--mult-grid", action="store_true",
                     help="SHOWER PATH: read a large shower sample out over the FULL "
                          "(--thresholds x --resets) grid at nominal induction and record every "
@@ -3824,7 +3873,8 @@ def produce_burst_only(ctx, args):
         name = "muon_th%02d" % int(round(theta))
         mu_n = int(args.muon_events)
         print(f"\nMuon '{name}' (theta={theta:.0f} deg to pixel plane): building {mu_n} events...")
-        mu_raw = [build_muon_event(ctx, rng, theta_deg=theta, length_cm=args.muon_length)
+        mu_raw = [build_muon_event(ctx, rng, theta_deg=theta, length_cm=args.muon_length,
+                                   azimuth_deg=_parse_azimuth(args.muon_azimuth))
                   for _ in range(mu_n)]
         mu_drift = [d for d in (event_drift(ctx, r) for r in mu_raw) if d is not None]
         sd = args.seed + 7000 + it * 1000
@@ -4070,7 +4120,8 @@ def produce_spectra(ctx, args):
         name = "muon_th%02d" % int(round(theta))
         mu_n = min(int(args.muon_events), int(args.n_events))
         print(f"\nMuon sample '{name}' (theta={theta:.0f} deg to pixel plane, {mu_n} events)...")
-        mu_raw = [build_muon_event(ctx, rng, theta_deg=float(theta), length_cm=args.muon_length)
+        mu_raw = [build_muon_event(ctx, rng, theta_deg=float(theta), length_cm=args.muon_length,
+                                   azimuth_deg=_parse_azimuth(args.muon_azimuth))
                   for _ in range(mu_n)]
         mu_drift = [d for d in (event_drift(ctx, r) for r in mu_raw) if d is not None]
         sd = args.seed + 7000 + it * 1000

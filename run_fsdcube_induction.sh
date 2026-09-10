@@ -28,7 +28,7 @@ THRESHOLDS="2500 3750 5000 6250 7500"                   # e-   (2.5 -> 7.5 ke- i
 RESETS="-1 1024 512 256 128 64"                         # PERIODIC_RESET_CYCLES (-1 = off)
 MUON_EVENTS=250                                         # through-going muons for the burst run
 BURST_EVENTS=80                                         # muons whose neighbour waveforms are captured
-WFTXT=25                                                # full-resolution 1-pitch induction waveforms -> text
+WFTXT=2                                                 # muon EVENTS whose whole strip (collectors + 1-pitch neighbors) -> full-res text (~230 files/ev)
 GRID_HRS=12; MUON_HRS=2; GEN_HRS=2                       # wall-clock per stage
 # Perlmutter GPU queues: 'shared' MUST be 32 cores per GPU (=> ~64 GB for 1 GPU); more RAM
 # needs 'regular' (exclusive full node: 4 GPUs, 128 cores, ~256 GB). 1000 fsd_cube showers at
