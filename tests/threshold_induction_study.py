@@ -3621,14 +3621,17 @@ def load_spectra(path):
     return spectra
 
 
-def aggregate_multiplicity_grid(ctx, evs, thresholds, resets, seed0):
+def aggregate_multiplicity_grid(ctx, evs, thresholds, resets, seed0, checkpoint=None):
     """GPU: over the FULL (threshold x reset) grid, record every fired pixel with its ADC-hit
     MULTIPLICITY on the nominal-induction shower cache. Reset changes recompile the fee kernel,
     so loop reset OUTER to share each recompile; thresholds within a reset are FEE-only.
 
     At each node we keep the 'all' record -- (summed charge, collection-truth, n_hits) for every
     fired pixel -- from which the analysis slices 1-hit / 2-hit / 3+-hit / all-multiplicity charge
-    distributions. Returns [(thr, cycles, q, tr, n_hits), ...]."""
+    distributions. Returns [(thr, cycles, q, tr, n_hits), ...].
+
+    `checkpoint`=(path, meta): if given, write the partial grid after every completed reset row,
+    so a wall-clock kill (or a cancel) keeps the finished nodes instead of losing everything."""
     out = []
     thr_arr = [float(t) for t in thresholds]; rst_arr = [int(r) for r in resets]
     for ir, rst in enumerate(rst_arr):
@@ -3638,7 +3641,11 @@ def aggregate_multiplicity_grid(ctx, evs, thresholds, resets, seed0):
             q = np.asarray(q, float); n = np.asarray(n, np.int16)
             out.append((thr, rst, q, np.asarray(tr, bool), n))
             print(f"    thr={thr:.0f} rst={rst:>5d}: {q.size} fired  "
-                  f"(1h={int((n==1).sum())} 2h={int((n==2).sum())} 3+={int((n>=3).sum())})")
+                  f"(1h={int((n==1).sum())} 2h={int((n==2).sum())} 3+={int((n>=3).sum())})",
+                  flush=True)
+        if checkpoint is not None:                    # crash-safe: persist each completed reset row
+            path, meta = checkpoint
+            save_mult_grid(dict(meta=meta, mult_grid=out), path)
     return out
 
 
@@ -3685,14 +3692,17 @@ def produce_mult_grid(ctx, args):
           f"({_cache_mb(evs) / max(len(evs), 1):.2f} MB/event, MAX_RADIUS={ctx.detector.MAX_RADIUS} pix)")
     thr_grid = sorted(set(float(t) for t in args.thresholds))
     rst_grid = sorted(set(int(r) for r in args.resets))
-    print(f"\nMultiplicity grid: {len(thr_grid)} thresholds x {len(rst_grid)} resets "
-          f"= {len(thr_grid) * len(rst_grid)} nodes (FEE-only, nominal induction)...")
-    grid = aggregate_multiplicity_grid(ctx, evs, thr_grid, rst_grid, seed0=args.seed + 20000)
     det_name, _g, det_path = vd.detector_identity(ctx)
     meta = dict(base_threshold=base_thr, base_reset=base_reset, ts=ts, noise_e=noise_e,
                 n_shower=n_eff, thresholds=np.asarray(thr_grid, float),
                 resets=np.asarray(rst_grid, int), detector_name=str(det_name),
                 detector_path=str(det_path), edep=str(args.edep_h5 or "parametric"))
+    ckpt = (os.path.join(args.outdir, "ti_mult_grid.npz"), meta)   # written after each reset row
+    print(f"\nMultiplicity grid: {len(thr_grid)} thresholds x {len(rst_grid)} resets "
+          f"= {len(thr_grid) * len(rst_grid)} nodes (FEE-only, nominal induction); "
+          f"checkpointing to {ckpt[0]} per reset row...")
+    grid = aggregate_multiplicity_grid(ctx, evs, thr_grid, rst_grid, seed0=args.seed + 20000,
+                                       checkpoint=ckpt)
     return dict(meta=meta, mult_grid=grid)
 
 

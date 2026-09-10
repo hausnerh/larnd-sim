@@ -124,7 +124,7 @@ cat > "$J2" <<EOF
 source ~/dune_sim.sh
 nd_conda
 cd "\$ND_SRC"
-python tests/threshold_induction_study.py --config fsd_cube --mult-grid \\
+python -u tests/threshold_induction_study.py --config fsd_cube --mult-grid \\
   --edep-h5 "${EDEP}" --recenter-showers --n-events $NSHOWER --outdir "$OUT_GRID" \\
   --thresholds $THRESHOLDS --resets $RESETS
 echo "STAGE2 DONE -> $OUT_GRID/ti_mult_grid.npz"
@@ -141,7 +141,7 @@ cat > "$J3" <<EOF
 source ~/dune_sim.sh
 nd_conda
 cd "\$ND_SRC"
-python tests/threshold_induction_study.py --config fsd_cube --burst-only \\
+python -u tests/threshold_induction_study.py --config fsd_cube --burst-only \\
   --burst-thetas 0 --muon-length 200 --muon-events $MUON_EVENTS \\
   --burst-events $BURST_EVENTS --burst-neighbors 3 --burst-inductions 0.5 1.0 1.5 \\
   --muon-scan-events 100 --muon-thresholds 2000 2500 3000 4000 5000 \\
