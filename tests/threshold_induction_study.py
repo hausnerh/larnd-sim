@@ -175,7 +175,7 @@ def build_shower_event(ctx, rng, plane=0, energy_mev=300.0, n_dep=400,
 
 
 def build_muon_event(ctx, rng, plane=0, theta_deg=45.0, length_cm=20.0,
-                     dedx=2.1, step_cm=0.3, azimuth_deg=None):
+                     dedx=2.1, step_cm=0.3, azimuth_deg=None, return_geom=False):
     """A straight MIP muon track, parametrised by its angle to the PIXEL PLANE.
 
     theta_deg is the angle between the track and the pixel (anode) plane:
@@ -195,7 +195,12 @@ def build_muon_event(ctx, rng, plane=0, theta_deg=45.0, length_cm=20.0,
     transverse neighbours sit at mixed distances. A fixed value locks it to a grid axis -- 0 deg =
     along pixel-x, so the muon lies on a SINGLE STRIP of pixels with clean +-k-pitch neighbours;
     90 = along pixel-y. The transverse coordinate is then snapped onto a pixel-centre line so the
-    charge sits squarely on one strip rather than straddling two rows."""
+    charge sits squarely on one strip rather than straddling two rows.
+
+    return_geom=True -> return (tracks, geom) where geom = {axis, idx, plane} names the strip we
+    KNOW the muon lies on (its pad row/column index), so downstream selection reads exactly the
+    on-strip line + transverse neighbours a priori (no PCA / is_collection guessing). geom is None
+    for a random azimuth (diagonal track has no single strip) -- callers fall back to PCA there."""
     from math import radians, cos, sin
     det = ctx.detector
     x0, x1, y0, y1 = vd.active_volume(det, plane, margin=3.0)
@@ -206,16 +211,23 @@ def build_muon_event(ctx, rng, plane=0, theta_deg=45.0, length_cm=20.0,
     cx = rng.uniform(x0 + 0.2 * (x1 - x0), x1 - 0.2 * (x1 - x0))
     cy = rng.uniform(y0 + 0.2 * (y1 - y0), y1 - 0.2 * (y1 - y0))
     cdepth = rng.uniform(0.3 * dmax, 0.7 * dmax)
+    geom = None
     if azimuth_deg is not None:
-        # snap the TRANSVERSE in-plane coordinate onto a pixel-centre line (centre = border + i*pitch,
-        # verify_diffusion.pixel_xy_from_id) so the charge sits squarely on one strip, not straddling
-        # two rows. Along-track position and depth stay randomised -> different strips/depths sampled.
+        # snap the TRANSVERSE in-plane coordinate onto the CENTRE of one pad row/column so the charge
+        # sits squarely on a single strip, not straddling two. The collection code bins a deposit at y
+        # to the pad it falls INSIDE (pad i covers [border+i*pitch, border+(i+1)*pitch)), so a pad
+        # centre is at border+(i+0.5)*pitch -- snapping to border+i*pitch (as verify_diffusion.
+        # pixel_xy_from_id reports pad position) lands on a boundary and splits the charge 50/50 across
+        # two rows. Use floor()+0.5 to hit the centre. Along-track position and depth stay randomised.
+        # `geom` then records WHICH strip (pad row/col index) the muon is on, for a-priori readout.
         pitch = float(det.PIXEL_PITCH)
         bx0 = float(det.TPC_BORDERS[plane, 0, 0]); by0 = float(det.TPC_BORDERS[plane, 1, 0])
         if abs(cos(ph)) >= abs(sin(ph)):
-            cy = by0 + round((cy - by0) / pitch) * pitch     # track ~along x -> transverse is y
+            cy = by0 + (np.floor((cy - by0) / pitch) + 0.5) * pitch   # track ~along x -> centre in y
+            geom = dict(axis="x", idx=int(np.floor((cy - by0) / pitch)), plane=int(plane))
         else:
-            cx = bx0 + round((cx - bx0) / pitch) * pitch     # track ~along y -> transverse is x
+            cx = bx0 + (np.floor((cx - bx0) / pitch) + 0.5) * pitch   # track ~along y -> centre in x
+            geom = dict(axis="y", idx=int(np.floor((cx - bx0) / pitch)), plane=int(plane))
 
     n = max(int(length_cm / step_cm), 2)
     s = (np.arange(n) - 0.5 * n) * step_cm
@@ -223,7 +235,7 @@ def build_muon_event(ctx, rng, plane=0, theta_deg=45.0, length_cm=20.0,
     inb = (X >= x0) & (X <= x1) & (Y >= y0) & (Y <= y1) & (D >= 0.5) & (D <= dmax)
     X, Y, D = X[inb], Y[inb], D[inb]
     if X.size < 2:
-        return vd.blank_tracks(0)
+        return (vd.blank_tracks(0), None) if return_geom else vd.blank_tracks(0)
     half = 0.5 * step_cm
     tracks = vd.blank_tracks(X.size)
     for i in range(X.size):
@@ -234,7 +246,7 @@ def build_muon_event(ctx, rng, plane=0, theta_deg=45.0, length_cm=20.0,
         vd.fill_segment(tracks[i], plane, p0, p1, dedx)
         tracks[i]["pdg_id"] = 13
         tracks[i]["segment_id"] = i
-    return tracks
+    return (tracks, geom) if return_geom else tracks
 
 
 def _parse_azimuth(s):
@@ -1091,6 +1103,52 @@ def muon_neighbor_pixels(ctx, ev, reach_pitches=3, include_collectors=False):
     return out
 
 
+def muon_band_pixels(ctx, ev, geom, reach_pitches=3):
+    """A-PRIORI band selection for an azimuth-locked (single-strip) muon. Because we chose the
+    strip when the muon was built, `geom` = {axis, idx, plane} tells us EXACTLY which pad row/column
+    the charge lands on -- so the collection line is that strip (dist 0) and the induction neighbours
+    are the pads +-1..+-reach pitches transverse to it, with exact distances. No PCA, no reliance on
+    the (noisy) is_collection label, no order-dependent dist. Each candidate pad is looked up in
+    ev['unique_pix']; those that received current (have a waveform row) are returned, ordered along
+    the strip. is_collection is set by GEOMETRY (on-strip line = collection, sides = induction) and
+    q_coll carries the truth amount so the split can still be inspected.
+
+    Returns [{row, pix_id, x, y, dist (signed pitches; 0 = on strip), is_collection, q_coll}, ...].
+    Use muon_neighbor_pixels (PCA) instead when geom is None (random-azimuth / diagonal track)."""
+    from larndsim.pixels_from_track import pixel2id
+    det = ctx.detector
+    nx, ny = int(det.N_PIXELS[0]), int(det.N_PIXELS[1])
+    ids = np.asarray(ev["unique_pix"], np.int64)
+    qc = np.asarray(ev["q_coll"], float)
+    xs, ys = vd.pixel_xy_from_id(det, ids)
+    row_of = {int(p): r for r, p in enumerate(ids)}
+    plane = int(geom.get("plane", 0)); idx = int(geom["idx"])
+    along_n = nx if geom["axis"] == "x" else ny        # index that runs ALONG the strip
+    trans_n = ny if geom["axis"] == "x" else nx        # index transverse to it (bounds check)
+    out = []
+    for a in range(along_n):                            # walk the strip head -> tail
+        for step in range(-reach_pitches, reach_pitches + 1):
+            j = idx + step
+            if not (0 <= j < trans_n):
+                continue
+            ixn, iyn = (a, j) if geom["axis"] == "x" else (j, a)
+            pid = int(pixel2id(ixn, iyn, plane))
+            r = row_of.get(pid)
+            if r is None:                               # pad off the induced set (no waveform)
+                continue
+            out.append(dict(row=int(r), pix_id=pid, x=float(xs[r]), y=float(ys[r]),
+                            dist=int(step), is_collection=(step == 0), q_coll=float(qc[r])))
+    return out
+
+
+def _muon_band(ctx, ev, geom, reach, include_collectors=True):
+    """Pick the a-priori strip band when geom is known, else fall back to the PCA-based selection.
+    Keeps capture/dump agnostic to how the muon's azimuth was set."""
+    if geom is not None:
+        return muon_band_pixels(ctx, ev, geom, reach_pitches=reach)
+    return muon_neighbor_pixels(ctx, ev, reach_pitches=reach, include_collectors=include_collectors)
+
+
 def burst_readout(ctx, cur, cadence_ticks, noise_e, rng):
     """Burst-mode PIXEL READOUT of one pad's pre-FEE current: the charge a muon-tagged (external
     t0) forced readout records, digitised every `cadence_ticks` ticks with NO discriminator gate.
@@ -1148,10 +1206,10 @@ def capture_burst(ctx, drift_cache, sample, theta, scales, cadence_ticks, reach,
                                   collect_frac=collect_frac)
                 if ev is None:
                     continue
+                geom = dc[3] if len(dc) > 3 else None       # a-priori strip (None -> PCA fallback)
                 t_near = np.asarray(ev["t_near"], float)
                 ts = float(ctx.detector.TIME_SAMPLING)
-                for nb in muon_neighbor_pixels(ctx, ev, reach_pitches=reach,
-                                               include_collectors=True):
+                for nb in _muon_band(ctx, ev, geom, reach, include_collectors=True):
                     cur_full = np.asarray(ev["pixels_signals"][nb["row"]], float)
                     t, q = burst_readout(ctx, cur_full, cadence_ticks, noise_e, bn_rng)  # DAQ readout
                     if q.size == 0:
@@ -1241,8 +1299,9 @@ def dump_induction_waveforms_txt(ctx, drift_cache, theta, n_events, outdir, seed
             ev = event_induce(ctx, dc[0], dc[1], dc[2], seed=seed + i, collect_frac=collect_frac)
             if ev is None:
                 continue
-            band = [b for b in muon_neighbor_pixels(ctx, ev, reach_pitches=1, include_collectors=True)
-                    if abs(b["dist"]) <= 1]                       # collectors (0) + both 1-pitch sides
+            geom = dc[3] if len(dc) > 3 else None             # a-priori strip (None -> PCA fallback)
+            band = [b for b in _muon_band(ctx, ev, geom, 1, include_collectors=True)
+                    if abs(b["dist"]) <= 1]                       # on-strip line (0) + both 1-pitch sides
             if not any(b["is_collection"] for b in band):
                 continue
             band.sort(key=lambda b: (round(b["y"] / pitch), round(b["x"] / pitch)))   # head -> tail
@@ -3874,9 +3933,13 @@ def produce_burst_only(ctx, args):
         mu_n = int(args.muon_events)
         print(f"\nMuon '{name}' (theta={theta:.0f} deg to pixel plane): building {mu_n} events...")
         mu_raw = [build_muon_event(ctx, rng, theta_deg=theta, length_cm=args.muon_length,
-                                   azimuth_deg=_parse_azimuth(args.muon_azimuth))
+                                   azimuth_deg=_parse_azimuth(args.muon_azimuth), return_geom=True)
                   for _ in range(mu_n)]
-        mu_drift = [d for d in (event_drift(ctx, r) for r in mu_raw) if d is not None]
+        mu_drift = []                                    # (drifted, neigh, radius, geom): geom = known strip
+        for tr, geom in mu_raw:
+            d = event_drift(ctx, tr)
+            if d is not None:
+                mu_drift.append((d[0], d[1], d[2], geom))
         sd = args.seed + 7000 + it * 1000
         print(f"  {len(mu_drift)}/{mu_n} events produced collectable charge")
 
@@ -4121,9 +4184,13 @@ def produce_spectra(ctx, args):
         mu_n = min(int(args.muon_events), int(args.n_events))
         print(f"\nMuon sample '{name}' (theta={theta:.0f} deg to pixel plane, {mu_n} events)...")
         mu_raw = [build_muon_event(ctx, rng, theta_deg=float(theta), length_cm=args.muon_length,
-                                   azimuth_deg=_parse_azimuth(args.muon_azimuth))
+                                   azimuth_deg=_parse_azimuth(args.muon_azimuth), return_geom=True)
                   for _ in range(mu_n)]
-        mu_drift = [d for d in (event_drift(ctx, r) for r in mu_raw) if d is not None]
+        mu_drift = []                                    # (drifted, neigh, radius, geom): geom = known strip
+        for tr, geom in mu_raw:
+            d = event_drift(ctx, tr)
+            if d is not None:
+                mu_drift.append((d[0], d[1], d[2], geom))
         sd = args.seed + 7000 + it * 1000
         set_induction(ctx, 1.0)
         mu_evs = [e for e in (event_induce(ctx, d[0], d[1], d[2], seed=sd + i,
