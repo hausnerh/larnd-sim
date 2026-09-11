@@ -3,9 +3,15 @@
 # slurm/shower_quick.sh  --  QUICK FSD Cube shower multiplicity-grid test, as a
 # detached Slurm batch job (survives SSH drops; no terminal needed).
 #
-# A small, fast check on an EXISTING edep file: N=150 showers over the 5-threshold
+# A small, fast check on an EXISTING edep file: N=40 showers over the 5-threshold
 # grid with a reduced reset set (-1, 512, 128). Use it to eyeball the multiplicity
 # distributions before committing to the full N=1000 x all-resets grid.
+#
+# NB: dense real showers at MAX_RADIUS=12 induce SLOWLY -- the one-time "Inducing
+# nominal-induction pre-FEE signals" step (~1 min/event) runs before the grid and is
+# NOT checkpointed, so it must finish inside the wall. That is why N is small here.
+# Scale --n-events up for more stats and raise -t with it (N=40 ~ under 1 h; each
+# extra ~50 events ~ +1 h). N=150 timed out a 2 h job at this step.
 #
 # Submit:
 #   sbatch slurm/shower_quick.sh                        # edep from $EDEP default below
@@ -23,7 +29,7 @@
 #SBATCH -C gpu
 #SBATCH -q shared
 #SBATCH --gpus 1 -c 32 -N 1
-#SBATCH -t 2:00:00
+#SBATCH -t 3:00:00
 #SBATCH -J fsdcube_shwr_q
 #SBATCH -o shower_quick_%j.log
 
@@ -42,7 +48,7 @@ fi
 echo "edep: $EDEP"
 
 python -u tests/threshold_induction_study.py --config fsd_cube --mult-grid \
-  --edep-h5 "$EDEP" --recenter-showers --n-events 150 \
+  --edep-h5 "$EDEP" --recenter-showers --n-events 40 \
   --outdir "$ND_WORK/tistudy_mult_quick" \
   --thresholds 2500 3750 5000 6250 7500 --resets -1 512 128
 
