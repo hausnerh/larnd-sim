@@ -600,6 +600,12 @@ def event_fee_hits(ctx, ev, threshold_e, seed, pops=_HIT_POPS):
     out["all"] = (np.asarray(q_all[hit_any].sum(axis=1), float),
                   ev["is_collection"][hit_any],
                   np.asarray(n_hits[hit_any], np.int16))
+    # per-HIT charges: every ADC sample as its own entry (a 2-hit pixel contributes 2), each tagged
+    # with its pixel's multiplicity so the same 1/2/3+/all split works. q_all is exactly 0 where
+    # adc<=0, so q_all[hit] is the flat list of real hit charges in pixel-then-sample order, which
+    # matches np.repeat(n_hits, n_hits) (each pixel's multiplicity repeated once per its hits).
+    out["perhit"] = (np.asarray(q_all[hit], float),
+                     np.repeat(n_hits, n_hits).astype(np.int16))
     for n in pops:
         sel = n_hits == n
         if not sel.any():
@@ -924,6 +930,7 @@ def aggregate_hits(ctx, evs, threshold_e, reset_cycles, induction_scale,
     set_periodic_reset(ctx, reset_cycles)
     acc = {n: ([], [], []) for n in pops}
     alla = ([], [], [])
+    pha = ([], [])                                    # per-hit (charge, parent multiplicity)
     with _silence_device_stdout():
         for i, ev in enumerate(evs):
             res = event_fee_hits(ctx, ev, threshold_e, seed=seed0 + i, pops=pops)
@@ -934,6 +941,9 @@ def aggregate_hits(ctx, evs, threshold_e, reset_cycles, induction_scale,
             qa, ta, na = res["all"]
             if qa.size:
                 alla[0].append(qa); alla[1].append(ta); alla[2].append(na)
+            qp, npp = res["perhit"]
+            if qp.size:
+                pha[0].append(qp); pha[1].append(npp)
     out = {}
     for n in pops:
         qs, trs, auxs = acc[n]
@@ -943,6 +953,8 @@ def aggregate_hits(ctx, evs, threshold_e, reset_cycles, induction_scale,
     out["all"] = (_empty_all() if not alla[0] else
                   (np.concatenate(alla[0]), np.concatenate(alla[1]),
                    np.concatenate(alla[2])))
+    out["perhit"] = ((np.empty(0), np.empty(0, np.int16)) if not pha[0] else
+                     (np.concatenate(pha[0]), np.concatenate(pha[1])))
     return out
 
 
@@ -3149,6 +3161,14 @@ def parse_args():
     ap.add_argument("--edep-h5", default=None,
                     help="dumpTree.py edep-sim HDF5; use its real 'segments' per "
                          "event instead of the parametric shower generator")
+    ap.add_argument("--edep-offset", type=int, default=0,
+                    help="skip this many events at the start of --edep-h5 before taking --n-events, "
+                         "so a job array can process disjoint slices of one edep file (task k -> "
+                         "events [k*N:(k+1)*N]).")
+    ap.add_argument("--merge-grids", nargs="+", default=None,
+                    help="MERGE mode (no GPU): combine several ti_mult_grid.npz partials from a split "
+                         "run into one full-stats grid in --outdir, then plot. Concatenates each "
+                         "(threshold,reset) node's per-pixel/per-hit arrays and sums n_shower.")
     ap.add_argument("--recenter-showers", action="store_true",
                     help="rigidly translate each --edep-h5 event into THIS config's active "
                          "volume (random transverse position + drift depth). Required to "
@@ -3354,8 +3374,11 @@ def resolve_config(args):
     return args
 
 
-def load_edep_events(path, max_events=None):
+def load_edep_events(path, max_events=None, offset=0):
     """Real edep-sim showers: per-event `tracks` arrays from a dumpTree HDF5.
+
+    `offset` skips that many leading events before taking `max_events`, so a job array can process
+    disjoint slices of one edep file (task k -> events [k*N : (k+1)*N]).
 
     dumpTree.py writes a `segments` dataset whose dtype is the SAME as this study's
     SEGMENTS_DTYPE (both copy cli/dumpTree.py:segments_dtype), so each event's rows
@@ -3368,6 +3391,8 @@ def load_edep_events(path, max_events=None):
         seg = f["segments"][:]
     shared = [n for n in seg.dtype.names if n in vd.SEGMENTS_DTYPE.names]
     ev_ids = np.unique(seg["event_id"])
+    if offset:
+        ev_ids = ev_ids[int(offset):]
     if max_events:
         ev_ids = ev_ids[:max_events]
     events = []
@@ -3736,7 +3761,9 @@ def aggregate_multiplicity_grid(ctx, evs, thresholds, resets, seed0, checkpoint=
 
     At each node we keep the 'all' record -- (summed charge, collection-truth, n_hits) for every
     fired pixel -- from which the analysis slices 1-hit / 2-hit / 3+-hit / all-multiplicity charge
-    distributions. Returns [(thr, cycles, q, tr, n_hits), ...].
+    distributions. Returns [(thr, cycles, q, tr, n_hits, perhit_q, perhit_n), ...], where q/tr/n_hits
+    are per-PIXEL (q summed over the pixel's hits) and perhit_q/perhit_n are per-HIT (one entry per
+    ADC sample, tagged with its pixel's multiplicity).
 
     `checkpoint`=(path, meta): if given, write the partial grid after every completed reset row,
     so a wall-clock kill (or a cancel) keeps the finished nodes instead of losing everything."""
@@ -3744,10 +3771,11 @@ def aggregate_multiplicity_grid(ctx, evs, thresholds, resets, seed0, checkpoint=
     thr_arr = [float(t) for t in thresholds]; rst_arr = [int(r) for r in resets]
     for ir, rst in enumerate(rst_arr):
         for it, thr in enumerate(thr_arr):
-            q, tr, n = aggregate_hits(ctx, evs, thr, rst, 1.0,
-                                      seed0=seed0 + ir * 1000 + it)["all"]
+            res = aggregate_hits(ctx, evs, thr, rst, 1.0, seed0=seed0 + ir * 1000 + it)
+            q, tr, n = res["all"]; phq, phn = res["perhit"]
             q = np.asarray(q, float); n = np.asarray(n, np.int16)
-            out.append((thr, rst, q, np.asarray(tr, bool), n))
+            out.append((thr, rst, q, np.asarray(tr, bool), n,
+                        np.asarray(phq, float), np.asarray(phn, np.int16)))
             print(f"    thr={thr:.0f} rst={rst:>5d}: {q.size} fired  "
                   f"(1h={int((n==1).sum())} 2h={int((n==2).sum())} 3+={int((n>=3).sum())})",
                   flush=True)
@@ -3769,8 +3797,10 @@ def produce_mult_grid(ctx, args):
                else float(np.atleast_1d(getattr(ctx.detector, "UNCORRELATED_NOISE_CHARGE", 500.0)).ravel()[0]))
     rng = np.random.default_rng(args.seed)
     if args.edep_h5:
-        print(f"\nLoading real edep-sim showers from {args.edep_h5} ...")
-        raw = load_edep_events(args.edep_h5, args.n_events)
+        off = int(getattr(args, "edep_offset", 0) or 0)
+        print(f"\nLoading real edep-sim showers from {args.edep_h5} "
+              f"(events [{off}:{off + args.n_events}]) ...")
+        raw = load_edep_events(args.edep_h5, args.n_events, offset=off)
         f_out = events_out_of_volume(raw, ctx)
         if args.recenter_showers:
             raw = recenter_events(raw, ctx, rng)
@@ -3823,6 +3853,8 @@ def save_mult_grid(spectra, path):
     kw["node_q"] = _obj_array([g[2] for g in grid])
     kw["node_tr"] = _obj_array([g[3] for g in grid])
     kw["node_n"] = _obj_array([g[4] for g in grid])
+    kw["node_phq"] = _obj_array([g[5] if len(g) > 5 else np.empty(0) for g in grid])       # per-hit Q
+    kw["node_phn"] = _obj_array([g[6] if len(g) > 6 else np.empty(0, np.int16) for g in grid])
     np.savez(path, **kw)
     print(f"  wrote multiplicity grid ({len(grid)} nodes) to {path}")
 
@@ -3833,20 +3865,60 @@ def load_mult_grid(path):
     meta = {k[5:]: (d[k].item() if d[k].ndim == 0 else d[k])
             for k in d.files if k.startswith("meta_")}
     thr, rst = d["node_thr"], d["node_rst"]
+    has_ph = "node_phq" in d.files                    # per-hit only in newer files
     grid = [(float(thr[i]), int(rst[i]), np.asarray(d["node_q"][i], float),
-             np.asarray(d["node_tr"][i], bool), np.asarray(d["node_n"][i], np.int16))
+             np.asarray(d["node_tr"][i], bool), np.asarray(d["node_n"][i], np.int16),
+             np.asarray(d["node_phq"][i], float) if has_ph else np.empty(0),
+             np.asarray(d["node_phn"][i], np.int16) if has_ph else np.empty(0, np.int16))
             for i in range(len(thr))]
     return dict(meta=meta, mult_grid=grid)
 
 
+def merge_mult_grids(paths):
+    """Combine several ti_mult_grid.npz partials (a split run over disjoint shower slices) into one
+    full-stats grid: for each (threshold, reset) node concatenate the per-pixel (q/tr/n) and per-hit
+    (phq/phn) arrays across partials, and sum n_shower in meta. The (thr,reset) grid must match across
+    partials; a node missing from a partial is simply skipped for that partial."""
+    parts = [load_mult_grid(p) for p in paths]
+    order, acc = [], {}
+    nsh_total = 0
+    for gd in parts:
+        nsh_total += int(gd["meta"]["n_shower"])
+        for g in gd["mult_grid"]:
+            key = (float(g[0]), int(g[1]))
+            if key not in acc:
+                acc[key] = [[], [], [], [], []]; order.append(key)
+            cols = acc[key]
+            cols[0].append(np.asarray(g[2], float))
+            cols[1].append(np.asarray(g[3], bool))
+            cols[2].append(np.asarray(g[4], np.int16))
+            cols[3].append(np.asarray(g[5] if len(g) > 5 else np.empty(0), float))
+            cols[4].append(np.asarray(g[6] if len(g) > 6 else np.empty(0), np.int16))
+    merged = [(k[0], k[1],
+               np.concatenate(acc[k][0]) if acc[k][0] else np.empty(0),
+               np.concatenate(acc[k][1]) if acc[k][1] else np.empty(0, bool),
+               np.concatenate(acc[k][2]) if acc[k][2] else np.empty(0, np.int16),
+               np.concatenate(acc[k][3]) if acc[k][3] else np.empty(0),
+               np.concatenate(acc[k][4]) if acc[k][4] else np.empty(0, np.int16))
+              for k in order]
+    meta = dict(parts[0]["meta"]); meta["n_shower"] = nsh_total
+    print(f"  merged {len(parts)} partials -> {nsh_total} showers, {len(merged)} nodes")
+    return dict(meta=meta, mult_grid=merged)
+
+
 def analyze_mult_grid(spectra, outdir):
-    """CPU: charge-collection distributions from the (threshold x reset) multiplicity grid, split
-    into 1-hit / 2-hit / 3+-hit / all-multiplicity pixels. For each multiplicity class it writes a
-    small-multiples figure (one panel per reset, the thresholds overlaid) in both per-shower and
-    area-normalized form. Runs from the saved ti_mult_grid.npz, so it re-plots with --refit."""
+    """CPU: charge distributions from the (threshold x reset) multiplicity grid, split into
+    1-hit / 2-hit / 3+-hit / all pixels. For each class it writes, in per-shower and area-normalized
+    form, TWO framings -- panels-per-reset (colour=threshold) and panels-per-threshold
+    (colour=reset, '_byreset') -- for TWO charge quantities: per-PIXEL TOTAL Q (summed over a pixel's
+    hits) and, when the file carries it, per-HIT Q ('_perhit', one entry per ADC sample so a 2-hit
+    pixel adds 2 entries). Panels share a y-axis. Runs from ti_mult_grid.npz, so it re-plots with --refit."""
     import matplotlib.pyplot as plt
     m = spectra["meta"]; nsh = int(m["n_shower"]); grid = spectra["mult_grid"]
-    thr_vals = sorted(set(g[0] for g in grid)); rst_vals = sorted(set(g[1] for g in grid))
+    thr_vals = sorted(set(g[0] for g in grid))
+    # order resets by RESET INTERVAL, longest first: 'off' (-1) is no periodic reset = an infinite
+    # interval, and more cycles = a longer interval (512 cyc > 128 cyc). So off sits next to 512.
+    rst_vals = sorted(set(g[1] for g in grid), key=lambda r: (np.inf if r < 0 else r), reverse=True)
     node = {(g[0], g[1]): g for g in grid}
     bins = np.arange(0, 42, 1.0); ctr = 0.5 * (bins[1:] + bins[:-1])          # ke-
     cmap = plt.get_cmap("viridis")
@@ -3856,12 +3928,55 @@ def analyze_mult_grid(spectra, outdir):
     def pick(q, n, cls):
         return q[n == 1] if cls == "1" else q[n == 2] if cls == "2" \
             else q[n >= 3] if cls == "3+" else q
-    rlab = lambda r: "reset off" if r < 0 else f"{r} cyc"
+    rlab = lambda r: "reset off" if r < 0 else f"{r} cyc"        # panel title
+    rcol = lambda r: "off" if r < 0 else f"{r} cyc"              # compact legend label
+    thrlab = lambda t: f"{t / 1000:.2f} ke$^-$"
+
+    def fig(panels, curves, vals_of, norm, panel_title, curve_label, legend_title,
+            count, xlabel, suptitle, outpath):
+        """One small-multiples figure: a panel per `panels` value, `curves` overlaid by colour, one
+        shared y-axis. vals_of(panel, curve) -> the ke- charges to histogram (or None to skip)."""
+        ncol = min(len(panels), 3); nrow = int(np.ceil(len(panels) / ncol))
+        f, axes = plt.subplots(nrow, ncol, figsize=(4.6 * ncol, 3.5 * nrow),
+                               squeeze=False, sharey=True)
+        ymax = 0.0
+        for j, pv in enumerate(panels):
+            ax = axes[j // ncol][j % ncol]
+            for ic, cv in enumerate(curves):
+                vals = vals_of(pv, cv)
+                if vals is None:
+                    continue
+                h, _ = np.histogram(vals, bins=bins); h = h.astype(float)
+                y = h / max(h.sum(), 1) if norm else h / nsh
+                ymax = max(ymax, float(y.max()) if y.size else 0.0)
+                ax.step(ctr, y, where="mid", lw=1.5,
+                        color=cmap(0.12 + 0.76 * ic / max(len(curves) - 1, 1)),
+                        label=curve_label(cv))
+            ax.set_title(panel_title(pv), fontsize=10); ax.grid(alpha=0.25, lw=0.6); ax.set_xlim(0, 40)
+        axes[0][0].set_ylim(0, ymax * 1.05 if ymax > 0 else 1.0)         # shared across panels
+        for j in range(len(panels), nrow * ncol):
+            axes[j // ncol][j % ncol].axis("off")
+        axes[0][0].legend(title=legend_title, fontsize=8)
+        ylab = f"Fraction of {count} / ke$^-$" if norm else f"{count.capitalize()} / shower"
+        for r in range(nrow):
+            axes[r][0].set_ylabel(ylab)
+        for c in range(ncol):
+            axes[min(nrow - 1, (len(panels) - 1) // ncol)][c].set_xlabel(xlabel)
+        f.suptitle(suptitle, fontsize=12); f.tight_layout()
+        _savefig(f, outpath)
+
+    # charge sources: per-PIXEL total Q (always) and per-HIT Q (only if the file carries it). Each
+    # entry: (count-noun, q-index, n-index, axis word, {class: qualifier}, filename suffix).
+    sources = [("pixels", 2, 4, "Total pixel charge Q",
+                {"1": "1 hit", "2": "2 hits summed", "3+": "3+ hits summed", "all": "all hits summed"}, "")]
+    if any(len(g) > 5 and np.asarray(g[5]).size for g in grid):
+        sources.append(("hits", 5, 6, "Per-hit charge Q",
+                        {"1": "from 1-hit pixels", "2": "from 2-hit pixels",
+                         "3+": "from 3+ hit pixels", "all": "every hit"}, "_perhit"))
+
     for cls, clab, slug in (("1", "single-hit", "1hit"), ("2", "two-hit", "2hit"),
                             ("3+", "3+ hit", "3plus"), ("all", "all-multiplicity", "all")):
-        # console yield summary at the base reset
-        base_r = int(m["base_reset"])
-        row = []
+        base_r = int(m["base_reset"]); row = []                          # console yield summary (total Q)
         for thr in thr_vals:
             g = node.get((thr, base_r))
             if g is not None:
@@ -3869,35 +3984,28 @@ def analyze_mult_grid(spectra, outdir):
         if row:
             print(f"  {clab:16s} / shower @ reset {rlab(base_r)}: "
                   + "  ".join(f"{t/1000:.2f}ke⁻={y:.2f}" for t, y in row))
-        for norm in (False, True):
-            ncol = min(len(rst_vals), 3); nrow = int(np.ceil(len(rst_vals) / ncol))
-            fig, axes = plt.subplots(nrow, ncol, figsize=(4.6 * ncol, 3.5 * nrow), squeeze=False)
-            for j, rst in enumerate(rst_vals):
-                ax = axes[j // ncol][j % ncol]
-                for it, thr in enumerate(thr_vals):
-                    g = node.get((thr, rst))
-                    if g is None:
-                        continue
-                    q = np.asarray(g[2], float) / 1000.0; nn = np.asarray(g[4], np.int16)
-                    h, _ = np.histogram(pick(q, nn, cls), bins=bins); h = h.astype(float)
-                    y = h / max(h.sum(), 1) if norm else h / nsh
-                    ax.step(ctr, y, where="mid", lw=1.5,
-                            color=cmap(0.12 + 0.76 * it / max(len(thr_vals) - 1, 1)),
-                            label=f"{thr/1000:.2f} ke⁻")
-                ax.set_title(rlab(rst), fontsize=10); ax.grid(alpha=0.25, lw=0.6)
-                ax.set_xlim(0, 40); ax.set_ylim(bottom=0)
-            for j in range(len(rst_vals), nrow * ncol):
-                axes[j // ncol][j % ncol].axis("off")
-            axes[0][0].legend(title="threshold", fontsize=8)
-            ylab = "Fraction of pixels / ke⁻" if norm else "Pixels / shower"
-            for r in range(nrow):
-                axes[r][0].set_ylabel(ylab)
-            for c in range(ncol):
-                axes[min(nrow - 1, (len(rst_vals) - 1) // ncol)][c].set_xlabel("Single-hit pixel charge (ke⁻)")
-            fig.suptitle(f"FSD Cube showers — {clab} pixel charge vs threshold × reset "
-                         f"({'area-normalized' if norm else 'per shower'})", fontsize=12)
-            fig.tight_layout()
-            _savefig(fig, f"{outdir}/mult_{slug}_{'norm' if norm else 'pershower'}.png")
+
+        for count, qi, ni, qword, qmap, fsuf in sources:
+            xlabel = f"{qword} ({qmap[cls]}) [ke$^-$]"
+
+            def vals_of(thr, rst, _qi=qi, _ni=ni):
+                g = node.get((thr, rst))
+                if g is None:
+                    return None
+                return pick(np.asarray(g[_qi], float) / 1000.0, np.asarray(g[_ni], np.int16), cls)
+
+            for norm in (False, True):
+                tag = "norm" if norm else "pershower"; base = "area-normalized" if norm else "per shower"
+                # framing 1: panels = reset, colour = threshold
+                fig(rst_vals, thr_vals, lambda rst, thr: vals_of(thr, rst), norm,
+                    rlab, thrlab, "threshold", count, xlabel,
+                    f"FSD Cube showers — {qword} ({clab} pixels) vs threshold × reset ({base})",
+                    f"{outdir}/mult_{slug}_{tag}{fsuf}.png")
+                # framing 2: panels = threshold, colour = reset
+                fig(thr_vals, rst_vals, lambda thr, rst: vals_of(thr, rst), norm,
+                    lambda t: f"{t/1000:.2f} ke$^-$ threshold", rcol, "reset", count, xlabel,
+                    f"FSD Cube showers — {qword} ({clab} pixels) vs reset × threshold ({base})",
+                    f"{outdir}/mult_{slug}_{tag}{fsuf}_byreset.png")
 
 
 def produce_burst_only(ctx, args):
@@ -4801,6 +4909,15 @@ def main():
     if args.list_configs:
         list_named_configs(); return
     os.makedirs(args.outdir, exist_ok=True)
+
+    # ---- merge mode: combine split-run grid partials into one full-stats grid (no GPU) ----
+    if args.merge_grids:
+        print(f"MERGE mode: combining {len(args.merge_grids)} grid partials (no GPU) ...")
+        spectra = merge_mult_grids(args.merge_grids)
+        save_mult_grid(spectra, f"{args.outdir}/ti_mult_grid.npz")
+        analyze_mult_grid(spectra, args.outdir)
+        print(f"\nWrote merged grid ({int(spectra['meta']['n_shower'])} showers) + plots to "
+              f"{args.outdir}/"); print("=" * 70); return
 
     # ---- multiplicity-grid mode: its own produce/save/analyze (distinct spectra shape) ----
     if args.mult_grid:
