@@ -3195,6 +3195,10 @@ def parse_args():
                          "pixel-x axis, so each muon lies on a SINGLE STRIP of pixels (clean "
                          "transverse-neighbour geometry); '90' = along pixel-y. Pass 'random' for a "
                          "random azimuth per event (track runs diagonal to the grid, mixed distances).")
+    ap.add_argument("--muon-azimuths", type=float, nargs="+", default=None,
+                    help="with --mult-grid-muons: the IN-PLANE azimuth angles (deg, vs the pixel-grid "
+                         "axis) to build in-plane muons at -- 0 = along a pixel row, 90 = the column, "
+                         "45 = diagonal. --n-events is split across them. Default 0 45 90.")
     ap.add_argument("--muon-scan-events", type=int, default=100,
                     help="events per muon sample used for the THRESHOLD/RESET scans "
                          "(0 disables them). Separate from --muon-events because the scans "
@@ -3299,6 +3303,11 @@ def parse_args():
                          "fired pixel's ADC-hit multiplicity, so the charge distributions split "
                          "into 1-hit / 2-hit / 3+-hit / all. One pre-signal cache (no induction "
                          "scan, no fits, no muons) -> memory allows a large --n-events.")
+    ap.add_argument("--mult-grid-muons", action="store_true",
+                    help="with --mult-grid: run the grid on parametric through-going MUONS "
+                         "(build_muon_event at --muon-thetas / --muon-azimuth / --muon-length, "
+                         "--n-events split across the thetas) instead of showers/edep. Gives the "
+                         "muon hit-multiplicity + per-hit Q grid; tags the output sample='muons'.")
     ap.add_argument("--outdir", default="tistudy")
     return ap.parse_args()
 
@@ -3796,7 +3805,19 @@ def produce_mult_grid(ctx, args):
     noise_e = (float(args.noise_e) if args.noise_e is not None
                else float(np.atleast_1d(getattr(ctx.detector, "UNCORRELATED_NOISE_CHARGE", 500.0)).ravel()[0]))
     rng = np.random.default_rng(args.seed)
-    if args.edep_h5:
+    muon_mode = bool(getattr(args, "mult_grid_muons", False))
+    if muon_mode:
+        # IN-PLANE muons: the track lies in a plane PARALLEL TO THE ANODE (out-of-plane angle = 0),
+        # and we sweep the AZIMUTH = the in-plane angle between the muon and the pixel-grid axis
+        # (0 = along a pixel row, 90 = along the column, 45 = diagonal). That in-plane angle is the
+        # 'theta' the muon-angle study means -- NOT the track's angle out of the anode plane.
+        azs = [float(a) for a in (getattr(args, "muon_azimuths", None) or [0.0, 45.0, 90.0])]
+        per = max(1, int(args.n_events) // len(azs))
+        print(f"\nGenerating ~{per * len(azs)} IN-PLANE muon events "
+              f"(in-plane azimuth vs pixel grid = {azs} deg, length={args.muon_length} cm)...")
+        raw = [build_muon_event(ctx, rng, theta_deg=0.0, length_cm=args.muon_length, azimuth_deg=a)
+               for a in azs for _ in range(per)]
+    elif args.edep_h5:
         off = int(getattr(args, "edep_offset", 0) or 0)
         print(f"\nLoading real edep-sim showers from {args.edep_h5} "
               f"(events [{off}:{off + args.n_events}]) ...")
@@ -3834,7 +3855,8 @@ def produce_mult_grid(ctx, args):
     meta = dict(base_threshold=base_thr, base_reset=base_reset, ts=ts, noise_e=noise_e,
                 n_shower=n_eff, thresholds=np.asarray(thr_grid, float),
                 resets=np.asarray(rst_grid, int), detector_name=str(det_name),
-                detector_path=str(det_path), edep=str(args.edep_h5 or "parametric"))
+                detector_path=str(det_path), edep=str(args.edep_h5 or "parametric"),
+                sample=("muons" if muon_mode else "showers"))
     ckpt = (os.path.join(args.outdir, "ti_mult_grid.npz"), meta)   # written after each reset row
     print(f"\nMultiplicity grid: {len(thr_grid)} thresholds x {len(rst_grid)} resets "
           f"= {len(thr_grid) * len(rst_grid)} nodes (FEE-only, nominal induction); "
@@ -3915,6 +3937,8 @@ def analyze_mult_grid(spectra, outdir):
     pixel adds 2 entries). Panels share a y-axis. Runs from ti_mult_grid.npz, so it re-plots with --refit."""
     import matplotlib.pyplot as plt
     m = spectra["meta"]; nsh = int(m["n_shower"]); grid = spectra["mult_grid"]
+    samp = str(m.get("sample", "showers"))            # 'showers' or 'muons' (muon mult-grid sets it)
+    ev = "muon" if samp.startswith("muon") else "shower"   # per-event noun for axis labels
     thr_vals = sorted(set(g[0] for g in grid))
     # order resets by RESET INTERVAL, longest first: 'off' (-1) is no periodic reset = an infinite
     # interval, and more cycles = a longer interval (512 cyc > 128 cyc). So off sits next to 512.
@@ -3957,7 +3981,7 @@ def analyze_mult_grid(spectra, outdir):
         for j in range(len(panels), nrow * ncol):
             axes[j // ncol][j % ncol].axis("off")
         axes[0][0].legend(title=legend_title, fontsize=8)
-        ylab = f"Fraction of {count} / ke$^-$" if norm else f"{count.capitalize()} / shower"
+        ylab = f"Fraction of {count} / ke$^-$" if norm else f"{count.capitalize()} / {ev}"
         for r in range(nrow):
             axes[r][0].set_ylabel(ylab)
         for c in range(ncol):
@@ -3995,17 +4019,124 @@ def analyze_mult_grid(spectra, outdir):
                 return pick(np.asarray(g[_qi], float) / 1000.0, np.asarray(g[_ni], np.int16), cls)
 
             for norm in (False, True):
-                tag = "norm" if norm else "pershower"; base = "area-normalized" if norm else "per shower"
+                tag = "norm" if norm else "pershower"; base = "area-normalized" if norm else f"per {ev}"
                 # framing 1: panels = reset, colour = threshold
                 fig(rst_vals, thr_vals, lambda rst, thr: vals_of(thr, rst), norm,
                     rlab, thrlab, "threshold", count, xlabel,
-                    f"FSD Cube showers — {qword} ({clab} pixels) vs threshold × reset ({base})",
+                    f"FSD Cube {samp} — {qword} ({clab} pixels) vs threshold × reset ({base})",
                     f"{outdir}/mult_{slug}_{tag}{fsuf}.png")
                 # framing 2: panels = threshold, colour = reset
                 fig(thr_vals, rst_vals, lambda thr, rst: vals_of(thr, rst), norm,
                     lambda t: f"{t/1000:.2f} ke$^-$ threshold", rcol, "reset", count, xlabel,
-                    f"FSD Cube showers — {qword} ({clab} pixels) vs reset × threshold ({base})",
+                    f"FSD Cube {samp} — {qword} ({clab} pixels) vs reset × threshold ({base})",
                     f"{outdir}/mult_{slug}_{tag}{fsuf}_byreset.png")
+
+    analyze_multiplicity_spectrum(spectra, outdir)     # n_hits distribution vs threshold x reset
+    analyze_shoulder_split(spectra, outdir)            # per-hit Q split: single- vs multi-hit pixels
+
+
+def analyze_multiplicity_spectrum(spectra, outdir):
+    """Distribution of per-pixel HIT MULTIPLICITY (how many pixels fire 1, 2, 3, ... times) across
+    the threshold x reset grid: panels-per-reset (thresholds overlaid) and the byreset transpose,
+    per-shower and area-normalized. n_hits >= NMAX piles into the last bin."""
+    import matplotlib.pyplot as plt
+    m = spectra["meta"]; nsh = int(m["n_shower"]); grid = spectra["mult_grid"]
+    samp = str(m.get("sample", "showers"))
+    ev = "muon" if samp.startswith("muon") else "shower"
+    thr_vals = sorted(set(g[0] for g in grid))
+    rst_vals = sorted(set(g[1] for g in grid), key=lambda r: (np.inf if r < 0 else r), reverse=True)
+    node = {(g[0], g[1]): g for g in grid}
+    NMAX = 12
+    mbins = np.arange(0.5, NMAX + 1.5, 1.0); mctr = np.arange(1, NMAX + 1)
+    cmap = plt.get_cmap("viridis")
+    rlab = lambda r: "reset off" if r < 0 else f"{r} cyc"
+    rcol = lambda r: "off" if r < 0 else f"{r} cyc"
+    thrlab = lambda t: f"{t / 1000:.2f} ke$^-$"
+    def nhist(g, norm):
+        n = np.clip(np.asarray(g[4], np.int16).astype(float), 1, NMAX)
+        h, _ = np.histogram(n, bins=mbins); h = h.astype(float)
+        return h / max(h.sum(), 1) if norm else h / nsh
+    def onefig(panels, curves, getg, norm, ptitle, clabel, ltitle, suptitle, outpath):
+        ncol = min(len(panels), 3); nrow = int(np.ceil(len(panels) / ncol))
+        f, axes = plt.subplots(nrow, ncol, figsize=(4.6 * ncol, 3.4 * nrow), squeeze=False, sharey=True)
+        ymax = 0.0
+        for j, pv in enumerate(panels):
+            ax = axes[j // ncol][j % ncol]
+            for ic, cv in enumerate(curves):
+                g = getg(pv, cv)
+                if g is None:
+                    continue
+                y = nhist(g, norm); ymax = max(ymax, y.max() if y.size else 0.0)
+                ax.step(mctr, y, where="mid", lw=1.6,
+                        color=cmap(0.12 + 0.76 * ic / max(len(curves) - 1, 1)), label=clabel(cv))
+            ax.set_title(ptitle(pv), fontsize=10); ax.grid(alpha=.25)
+            ax.set_xlim(0.5, NMAX + 0.5); ax.set_xticks(range(2, NMAX + 1, 2))
+        axes[0][0].set_ylim(0, ymax * 1.05 if ymax > 0 else 1.0)
+        for j in range(len(panels), nrow * ncol):
+            axes[j // ncol][j % ncol].axis("off")
+        axes[0][0].legend(title=ltitle, fontsize=8)
+        yl = "Fraction of fired pixels" if norm else f"Pixels / {ev}"
+        for r in range(nrow):
+            axes[r][0].set_ylabel(yl)
+        for c in range(ncol):
+            axes[min(nrow - 1, (len(panels) - 1) // ncol)][c].set_xlabel(
+                f"Hit multiplicity  (n_hits; >={NMAX} in last bin)")
+        f.suptitle(suptitle, fontsize=12); f.tight_layout(); _savefig(f, outpath)
+    for norm in (False, True):
+        tag = "norm" if norm else "pershower"; base = "area-normalized" if norm else f"per {ev}"
+        onefig(rst_vals, thr_vals, lambda r, t: node.get((t, r)), norm, rlab, thrlab, "threshold",
+               f"FSD Cube {samp} — hit-multiplicity distribution vs threshold × reset ({base})",
+               f"{outdir}/mult_spectrum_{tag}.png")
+        onefig(thr_vals, rst_vals, lambda t, r: node.get((t, r)), norm,
+               lambda t: f"{t/1000:.2f} ke$^-$ threshold", rcol, "reset",
+               f"FSD Cube {samp} — hit-multiplicity distribution vs reset × threshold ({base})",
+               f"{outdir}/mult_spectrum_{tag}_byreset.png")
+
+
+def analyze_shoulder_split(spectra, outdir):
+    """Reproduce the 'Hit Q for all dt' per-hit spectrum (50 bins, 0-50 ke-, matching mjkramer's
+    notebook) SPLIT into single-hit-pixel hits vs multi-hit-pixel hits, to test which population
+    carries the mid-Q shoulder. One figure per reset, a panel per threshold, overlaying: all hits,
+    single-hit-pixel hits (per-hit parent n==1), multi-hit-pixel hits (n>=2). Each histogram is
+    divided by the TOTAL hit count, so single + multi add to all (fraction of all hits per bin).
+    Needs per-hit data (newer files); skipped otherwise."""
+    import matplotlib.pyplot as plt
+    m = spectra["meta"]; grid = spectra["mult_grid"]; samp = str(m.get("sample", "showers"))
+    if not any(len(g) > 5 and np.asarray(g[5]).size for g in grid):
+        print("  (shoulder split skipped: file has no per-hit data -- re-run to capture it)")
+        return
+    thr_vals = sorted(set(g[0] for g in grid))
+    rst_vals = sorted(set(g[1] for g in grid), key=lambda r: (np.inf if r < 0 else r), reverse=True)
+    node = {(g[0], g[1]): g for g in grid}
+    qb = np.linspace(0, 50, 51); qc = 0.5 * (qb[1:] + qb[:-1])          # 50 bins, 0-50 ke- (notebook)
+    for rst in rst_vals:
+        ncol = min(len(thr_vals), 3); nrow = int(np.ceil(len(thr_vals) / ncol))
+        f, axes = plt.subplots(nrow, ncol, figsize=(4.6 * ncol, 3.4 * nrow), squeeze=False, sharey=True)
+        ymax = 0.0
+        for j, thr in enumerate(thr_vals):
+            ax = axes[j // ncol][j % ncol]; g = node.get((thr, rst))
+            if g is not None and np.asarray(g[5]).size:
+                q = np.asarray(g[5], float) / 1000.0; nn = np.asarray(g[6], np.int16)
+                tot = max(q.size, 1)
+                for vals, lab, col in ((q, "all hits", "0.25"),
+                                       (q[nn == 1], "single-hit pixels", "C0"),
+                                       (q[nn >= 2], "multi-hit pixels", "C1")):
+                    h, _ = np.histogram(vals, bins=qb); y = h.astype(float) / tot
+                    ymax = max(ymax, y.max() if y.size else 0.0)
+                    ax.step(qc, y, where="mid", lw=1.6, color=col, label=lab)
+            ax.set_title(f"{thr/1000:.2f} ke$^-$ threshold", fontsize=10)
+            ax.grid(alpha=.25); ax.set_xlim(0, 50)
+        axes[0][0].set_ylim(0, ymax * 1.05 if ymax > 0 else 1.0)
+        for j in range(len(thr_vals), nrow * ncol):
+            axes[j // ncol][j % ncol].axis("off")
+        axes[0][0].legend(fontsize=8)
+        for r in range(nrow):
+            axes[r][0].set_ylabel("Fraction of hits / bin")
+        for c in range(ncol):
+            axes[min(nrow - 1, (len(thr_vals) - 1) // ncol)][c].set_xlabel("Hit Q [ke$^-$]")
+        rt = "off" if rst < 0 else f"{rst} cyc"; rtag = "off" if rst < 0 else f"{rst}cyc"
+        f.suptitle(f"FSD Cube {samp} — per-hit Q, single- vs multi-hit pixels (reset {rt})", fontsize=12)
+        f.tight_layout(); _savefig(f, f"{outdir}/shoulder_qsplit_{rtag}.png")
 
 
 def produce_burst_only(ctx, args):

@@ -6,8 +6,9 @@
 # Produces the muon threshold/reset scans + burst-mode band capture AND dumps the
 # full-resolution waveforms along the WHOLE muon strip -- every on-track collector
 # (coll_*.txt) and every +-1-pitch pure-induction neighbor (induction_*.txt) --
-# for --wf-txt events. Muons are azimuth-locked to a single pixel strip
-# (--muon-azimuth default 0), not diagonal to the grid.
+# for --wf-txt events. Muons are VERTICAL (downward): in-plane azimuth = 90 deg, i.e. the track
+# runs along the short/vertical y anode axis over ONE x-column of pixels, at fixed drift depth
+# (out-of-plane theta = 0, isochronous) -- cosmic-like, not the horizontal/beam orientation.
 #
 # Submit:
 #   sbatch slurm/muon_burst.sh                    # uses the -A account below
@@ -37,6 +38,6 @@ python -u tests/threshold_induction_study.py --config fsd_cube --burst-only \
   --burst-thetas 0 --muon-length 200 --muon-events 250 --burst-events 80 \
   --burst-neighbors 3 --burst-inductions 0.5 1.0 1.5 --muon-scan-events 100 \
   --muon-thresholds 2000 2500 3000 4000 5000 \
-  --muon-azimuth 0 --wf-txt 2 --outdir "$ND_WORK/tistudy_muon_burst"
+  --muon-azimuth 90 --wf-txt 2 --outdir "$ND_WORK/tistudy_muon_burst"
 
 echo "DONE -> $ND_WORK/tistudy_muon_burst"
