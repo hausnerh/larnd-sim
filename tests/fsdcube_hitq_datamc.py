@@ -59,18 +59,18 @@ def pixel2id_abs(z, y):
 
 def accumulate_q(files, adc_min, adc_max, max_events=None, verbose=True):
     """Loop FLOW files/events with plain h5py (follow the charge/events -> calib_prompt_hits
-    references), apply the ADC event cut, and return (q, n, m): q and n are PER-HIT (hit charge ke-,
-    and the hit-multiplicity of that hit's pixel within its event, so any Q population is a slice --
-    n==1 single-hit, n==2 two-hit, all hits, ...); m is PER-PIXEL (one entry per fired pixel = how
-    many hits that pixel saw), for the pixel hit-multiplicity distribution. Multiplicity is per event
-    (a pad hit in two events = two n==1 entries / two m==1 pixels).
+    references), apply the ADC event cut, and return (q, n, m, qlast): q and n are PER-HIT (hit charge
+    ke-, and the hit-multiplicity of that hit's pixel within its event, so any Q population is a slice
+    -- n==1 single-hit, n==2 two-hit, all hits, ...); m and qlast are PER-PIXEL (one entry per fired
+    pixel) -- m = how many hits that pixel saw, qlast = the charge of that pixel's LAST hit (largest
+    drift time within the event). Multiplicity is per event (a pad hit in two events = two m==1 pixels).
 
     Reference layout (standard ndlar_flow): charge/events/ref/charge/calib_prompt_hits/ref is
     (n_links, 2) with col0 = event index, col1 = hit index; .../ref_region[e] = (start, stop) slices
     that ref array for event e; hits live in charge/calib_prompt_hits/data (fields z, y, Q)."""
     import h5py
     REFG = "charge/events/ref/charge/calib_prompt_hits"
-    qacc, nacc, macc = [], [], []   # per-hit Q, per-hit parent multiplicity, per-PIXEL multiplicity
+    qacc, nacc, macc, lacc = [], [], [], []   # per-hit Q, per-hit mult, per-pixel mult, per-pixel last-hit Q
     for fi, path in enumerate(files):
         try:
             try:
@@ -91,7 +91,8 @@ def accumulate_q(files, adc_min, adc_max, max_events=None, verbose=True):
                 r_start = np.asarray(reg["start"]); r_stop = np.asarray(reg["stop"])
                 hit_of_ref = np.asarray(h[f"{REFG}/ref"][:, 1])        # ref col1 = hit index
                 hd = h["charge/calib_prompt_hits/data"]
-                z_all = np.asarray(hd["z"]); y_all = np.asarray(hd["y"]); q_all = np.asarray(hd["Q"])
+                z_all = np.asarray(hd["z"]); y_all = np.asarray(hd["y"])
+                q_all = np.asarray(hd["Q"]); t_all = np.asarray(hd["t_drift"])
                 for e in idx:
                     st, sp = int(r_start[e]), int(r_stop[e])
                     if sp <= st:
@@ -99,10 +100,15 @@ def accumulate_q(files, adc_min, adc_max, max_events=None, verbose=True):
                     hi = hit_of_ref[st:sp]
                     pid = pixel2id_abs(z_all[hi], y_all[hi])
                     q = q_all[hi].astype(float)            # 'Q' already ke- (no scaling, per notebook)
+                    t = t_all[hi].astype(float)
                     _, inv, counts = np.unique(pid, return_inverse=True, return_counts=True)
                     qacc.append(q)
                     nacc.append(counts[inv].astype(np.int16))    # each HIT's pixel multiplicity
                     macc.append(counts.astype(np.int16))         # each PIXEL's multiplicity (one entry/pixel)
+                    # charge of each pixel's LAST hit = the hit with the largest drift time in this event
+                    o = np.lexsort((t, pid)); pid_s, q_s = pid[o], q[o]   # sort by pixel, then time
+                    last = np.ones(pid_s.size, bool); last[:-1] = pid_s[:-1] != pid_s[1:]
+                    lacc.append(q_s[last])                       # one entry per pixel = its max-t hit's Q
         except Exception as e:
             print(f"  !! skip {path}: {e}")
             continue
@@ -110,7 +116,7 @@ def accumulate_q(files, adc_min, adc_max, max_events=None, verbose=True):
             print(f"  [{fi + 1}/{len(files)}] {Path(path).name}: "
                   f"all={sum(a.size for a in qacc)}", flush=True)
     cat = lambda L, dt=float: np.concatenate(L) if L else np.zeros(0, dt)
-    return cat(qacc), cat(nacc, np.int16), cat(macc, np.int16)
+    return cat(qacc), cat(nacc, np.int16), cat(macc, np.int16), cat(lacc)
 
 
 def _density(q):
@@ -170,7 +176,7 @@ def main():
                                  squeeze=False, sharey=True)
         for ax, prc in zip(axes[0], args.prc):
             # DATA = solid black; SIM = dashed, DUNE palette colour (cycle if several MC series)
-            qd, nd, _ = store[(prc, "data")]; qs, ns, _ = store[(prc, "sim")]
+            qd, nd, _, _ = store[(prc, "data")]; qs, ns, _, _ = store[(prc, "sim")]
             ax.step(*_density(selfn(qd, nd)), where="mid", ls="-",
                     color=DATA_COLOR, lw=1.8, label=f"data prc{prc}")
             ax.step(*_density(selfn(qs, ns)), where="mid", ls="--",
@@ -183,22 +189,40 @@ def main():
         print(f"wrote {args.outdir}/hitq_split_{slug}.png")
 
     # ---- pixel hit-multiplicity: for each fired pixel, how many hits it saw -- data vs MC ----
-    NM = 10
+    # dynamic axis: run x out to the max multiplicity across all 4 datasets (no overflow bin)
+    NM = max((int(store[(prc, src)][2].max()) for prc in args.prc for src in ("data", "sim")
+              if store[(prc, src)][2].size), default=1)
     mbins = np.arange(0.5, NM + 1.5); mctr = np.arange(1, NM + 1)
     fig, axes = plt.subplots(1, len(args.prc), figsize=(6.4 * len(args.prc), 4.6),
                              squeeze=False, sharey=True)
     for ax, prc in zip(axes[0], args.prc):
         for src, ls, col in (("data", "-", DATA_COLOR), ("sim", "--", MC_COLORS[0])):
             m = store[(prc, src)][2]
-            h, _ = np.histogram(np.clip(m, 1, NM), bins=mbins); h = h.astype(float); s = h.sum()
+            h, _ = np.histogram(m, bins=mbins); h = h.astype(float); s = h.sum()
             lbl = f"{src} prc{prc}" + ("" if src == "data" else f" ({store[(prc,'simcfg')]})")
             ax.step(mctr, h / s if s else h, where="mid", ls=ls, color=col, lw=1.8, label=lbl)
-        ax.set_title(f"prc{prc}"); ax.set_xlabel(f"pixel hit multiplicity  (>= {NM} in last bin)")
+        ax.set_title(f"prc{prc}"); ax.set_xlabel("pixel hit multiplicity")
         ax.set_ylabel("Fraction of fired pixels"); ax.set_xlim(0.5, NM + 0.5)
-        ax.set_xticks(range(1, NM + 1)); ax.legend(fontsize=8); ax.grid(alpha=.5, color=GRID_COLOR, lw=0.6)
+        ax.set_xticks(range(1, NM + 1, max(1, NM // 15)))
+        ax.legend(fontsize=8); ax.grid(alpha=.5, color=GRID_COLOR, lw=0.6)
     fig.suptitle("FSDCube pixel hit-multiplicity -- data vs sim", fontsize=13)
     fig.tight_layout(); fig.savefig(f"{args.outdir}/hitq_pixmult.png", dpi=120)
     print(f"wrote {args.outdir}/hitq_pixmult.png")
+
+    # ---- charge of each pixel's LAST hit -- data vs MC ----
+    fig, axes = plt.subplots(1, len(args.prc), figsize=(6.4 * len(args.prc), 4.6),
+                             squeeze=False, sharey=True)
+    for ax, prc in zip(axes[0], args.prc):
+        for src, ls, col in (("data", "-", DATA_COLOR), ("sim", "--", MC_COLORS[0])):
+            ql = store[(prc, src)][3]                 # per-pixel last-hit charge
+            lbl = f"{src} prc{prc}" + ("" if src == "data" else f" ({store[(prc,'simcfg')]})")
+            ax.step(*_density(ql), where="mid", ls=ls, color=col, lw=1.8, label=lbl)
+        ax.set_title(f"prc{prc}"); ax.set_xlabel(R"last-hit Q [ke$^-$]")
+        ax.set_ylabel("Density"); ax.set_xlim(QMIN, QMAX)
+        ax.legend(fontsize=8); ax.grid(alpha=.5, color=GRID_COLOR, lw=0.6)
+    fig.suptitle("FSDCube per-pixel last-hit charge -- data vs sim", fontsize=13)
+    fig.tight_layout(); fig.savefig(f"{args.outdir}/hitq_lasthit.png", dpi=120)
+    print(f"wrote {args.outdir}/hitq_lasthit.png")
 
 
 if __name__ == "__main__":
