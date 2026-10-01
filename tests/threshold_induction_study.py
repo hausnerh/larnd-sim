@@ -1297,8 +1297,14 @@ def dump_induction_waveforms_txt(ctx, drift_cache, theta, n_events, outdir, seed
 
     Returns the number of files written. Files land in <outdir>/induction_waveforms/
     (coll_*.txt for collectors, induction_*.txt for neighbors)."""
-    import os
+    import os, glob
     d = os.path.join(outdir, "induction_waveforms"); os.makedirs(d, exist_ok=True)
+    # clear this run's waveform type from any PRIOR run first: filenames are keyed by (event, pixel),
+    # so a rerun with a different geometry (e.g. a horizontal az=0 run then a vertical az=90 run at the
+    # same seed -> same depth) writes DIFFERENT pixel ids and would otherwise pile up alongside the old
+    # ones, mixing two orthogonal tracks under one event label.
+    for _old in glob.glob(os.path.join(d, "coll_*.txt")) + glob.glob(os.path.join(d, "induction_*.txt")):
+        os.remove(_old)
     ts = float(ctx.detector.TIME_SAMPLING)
     pitch = float(ctx.detector.PIXEL_PITCH)
     vdrift = float(np.atleast_1d(getattr(ctx.detector, "V_DRIFT", np.nan)).ravel()[0])
