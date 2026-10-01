@@ -53,16 +53,17 @@ def pixel2id_abs(z, y):
 
 def accumulate_q(files, adc_min, adc_max, max_events=None, verbose=True):
     """Loop FLOW files/events with plain h5py (follow the charge/events -> calib_prompt_hits
-    references), apply the ADC event cut, group hits by pixel WITHIN EACH EVENT, and return per-hit
-    Q (ke-) for three populations: (all, single-hit-pixel, multi-hit-pixel). Multiplicity is counted
-    per event (a pad hit in two events = two single-hit entries).
+    references), apply the ADC event cut, and return TWO parallel per-hit arrays: (q, n) where q is
+    the hit charge (ke-) and n is the hit-multiplicity of that hit's pixel WITHIN its event. Any
+    population is then a slice: n==1 (single-hit), n==2 (two-hit), all hits, etc. Multiplicity is
+    per event (a pad hit in two events = two n==1 entries).
 
     Reference layout (standard ndlar_flow): charge/events/ref/charge/calib_prompt_hits/ref is
     (n_links, 2) with col0 = event index, col1 = hit index; .../ref_region[e] = (start, stop) slices
     that ref array for event e; hits live in charge/calib_prompt_hits/data (fields z, y, Q)."""
     import h5py
     REFG = "charge/events/ref/charge/calib_prompt_hits"
-    allq, singq, multq = [], [], []
+    qacc, nacc = [], []
     for fi, path in enumerate(files):
         try:
             try:
@@ -91,20 +92,17 @@ def accumulate_q(files, adc_min, adc_max, max_events=None, verbose=True):
                     hi = hit_of_ref[st:sp]
                     pid = pixel2id_abs(z_all[hi], y_all[hi])
                     q = q_all[hi].astype(float)            # 'Q' already ke- (no scaling, per notebook)
-                    allq.append(q)
-                    order = np.argsort(pid, kind="stable")
-                    pid_s, q_s = pid[order], q[order]
-                    _, start, counts = np.unique(pid_s, return_index=True, return_counts=True)
-                    for a0, ct in zip(start, counts):
-                        (singq if ct == 1 else multq).append(q_s[a0:a0 + ct])
+                    _, inv, counts = np.unique(pid, return_inverse=True, return_counts=True)
+                    qacc.append(q)
+                    nacc.append(counts[inv].astype(np.int16))   # each hit's pixel multiplicity
         except Exception as e:
             print(f"  !! skip {path}: {e}")
             continue
         if verbose:
             print(f"  [{fi + 1}/{len(files)}] {Path(path).name}: "
-                  f"all={sum(a.size for a in allq)}", flush=True)
-    cat = lambda L: np.concatenate(L) if L else np.zeros(0)
-    return cat(allq), cat(singq), cat(multq)
+                  f"all={sum(a.size for a in qacc)}", flush=True)
+    cat = lambda L, dt=float: np.concatenate(L) if L else np.zeros(0, dt)
+    return cat(qacc), cat(nacc, np.int16)
 
 
 def _density(q):
@@ -140,7 +138,7 @@ def main():
     os.makedirs(args.outdir, exist_ok=True)
     cap = lambda L: L[: args.max_files] if args.max_files else L
 
-    # gather per-hit Q (all/single/multi) for data + sim, per prc
+    # gather per-hit (Q, pixel-multiplicity) for data + sim, per prc
     store = {}
     for prc in args.prc:
         df = cap(data_files(args.data_base, prc))
@@ -153,34 +151,25 @@ def main():
         store[(prc, "sim")] = accumulate_q(sf, args.adc_min, args.adc_max, args.max_events)
         store[(prc, "simcfg")] = scfg
 
-    # ---- Figure 1: reproduce cell 13 -- all-hits per-hit Q, data (solid) vs sim (dashed) ----
-    fig, axes = plt.subplots(1, len(args.prc), figsize=(6.4 * len(args.prc), 4.6), squeeze=False)
-    for ax, prc in zip(axes[0], args.prc):
-        for src, ls in (("data", "-"), ("sim", "--")):
-            c, y = _density(store[(prc, src)][0])
-            ax.step(c, y, where="mid", ls=ls,
-                    label=f"{src} prc{prc}" + ("" if src == "data" else f" ({store[(prc,'simcfg')]})"))
-        ax.set_title(f"Q for all dt -- prc{prc}"); ax.set_xlabel(R"Hit Q [ke$^-$]")
-        ax.set_ylabel("Density"); ax.set_xlim(QMIN, QMAX); ax.legend(fontsize=8); ax.grid(alpha=.25)
-    fig.tight_layout(); fig.savefig(f"{args.outdir}/hitq_datamc.png", dpi=120)
-    print(f"\nwrote {args.outdir}/hitq_datamc.png")
-
-    # ---- Figure 2: the shoulder split -- all / single-hit-pix / multi-hit-pix, data & sim ----
-    for src in ("data", "sim"):
-        fig, axes = plt.subplots(1, len(args.prc), figsize=(6.4 * len(args.prc), 4.6), squeeze=False, sharey=True)
+    # ---- one figure per pixel-multiplicity population, DATA (solid) + SIM (dashed) on the SAME
+    #      canvas for a natural comparison; prc configs as side-by-side panels ----
+    POPS = [("mult1",   "single-hit pixels (n = 1)", lambda q, n: q[n == 1]),
+            ("mult2",   "two-hit pixels (n = 2)",    lambda q, n: q[n == 2]),
+            ("multAll", "all hits",                  lambda q, n: q)]
+    for slug, title, selfn in POPS:
+        fig, axes = plt.subplots(1, len(args.prc), figsize=(6.4 * len(args.prc), 4.6),
+                                 squeeze=False, sharey=True)
         for ax, prc in zip(axes[0], args.prc):
-            qa, qs, qm = store[(prc, src)]
-            for q, lab, col in ((qa, "all hits", "0.25"),
-                                (qs, "single-hit pixels", "C0"),
-                                (qm, "multi-hit pixels", "C1")):
-                c, y = _density(q)
-                ax.step(c, y, where="mid", color=col, label=lab)
-            tag = f"prc{prc}" + ("" if src == "data" else f"  {store[(prc,'simcfg')]}")
-            ax.set_title(f"{src} {tag}"); ax.set_xlabel(R"Hit Q [ke$^-$]")
+            for src, ls, col in (("data", "-", "C0"), ("sim", "--", "C1")):
+                q, n = store[(prc, src)]
+                c, y = _density(selfn(q, n))
+                lbl = f"{src} prc{prc}" + ("" if src == "data" else f" ({store[(prc,'simcfg')]})")
+                ax.step(c, y, where="mid", ls=ls, color=col, label=lbl)
+            ax.set_title(f"prc{prc}"); ax.set_xlabel(R"Hit Q [ke$^-$]")
             ax.set_ylabel("Density"); ax.set_xlim(QMIN, QMAX); ax.legend(fontsize=8); ax.grid(alpha=.25)
-        fig.suptitle(f"Hit Q split by pixel multiplicity -- {src}", fontsize=13)
-        fig.tight_layout(); fig.savefig(f"{args.outdir}/hitq_split_{src}.png", dpi=120)
-        print(f"wrote {args.outdir}/hitq_split_{src}.png")
+        fig.suptitle(f"FSDCube Hit Q -- {title} -- data vs sim", fontsize=13)
+        fig.tight_layout(); fig.savefig(f"{args.outdir}/hitq_split_{slug}.png", dpi=120)
+        print(f"wrote {args.outdir}/hitq_split_{slug}.png")
 
 
 if __name__ == "__main__":
