@@ -19,6 +19,7 @@
 # Needs: h5py, numpy, matplotlib (all in the larnd env). No h5flow, no GPU, no larnd-sim import.
 # =============================================================================
 import argparse, os
+os.environ.setdefault("HDF5_USE_FILE_LOCKING", "FALSE")   # NERSC /dvs_ro read-only CFS can't take HDF5's lock
 from collections import defaultdict
 from pathlib import Path
 import numpy as np
@@ -64,7 +65,11 @@ def accumulate_q(files, adc_min, adc_max, max_events=None, verbose=True):
     allq, singq, multq = [], [], []
     for fi, path in enumerate(files):
         try:
-            with h5py.File(str(path), "r") as h:
+            try:
+                fh = h5py.File(str(path), "r", locking=False)    # read-only CFS: skip the lock
+            except TypeError:                                     # older h5py without the locking kwarg
+                fh = h5py.File(str(path), "r")
+            with fh as h:
                 adc = np.asarray(h["charge/events/data"]["ADC"])
                 sel = np.ones(adc.shape, bool)
                 if adc_min:
