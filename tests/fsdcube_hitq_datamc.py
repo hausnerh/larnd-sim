@@ -59,17 +59,18 @@ def pixel2id_abs(z, y):
 
 def accumulate_q(files, adc_min, adc_max, max_events=None, verbose=True):
     """Loop FLOW files/events with plain h5py (follow the charge/events -> calib_prompt_hits
-    references), apply the ADC event cut, and return TWO parallel per-hit arrays: (q, n) where q is
-    the hit charge (ke-) and n is the hit-multiplicity of that hit's pixel WITHIN its event. Any
-    population is then a slice: n==1 (single-hit), n==2 (two-hit), all hits, etc. Multiplicity is
-    per event (a pad hit in two events = two n==1 entries).
+    references), apply the ADC event cut, and return (q, n, m): q and n are PER-HIT (hit charge ke-,
+    and the hit-multiplicity of that hit's pixel within its event, so any Q population is a slice --
+    n==1 single-hit, n==2 two-hit, all hits, ...); m is PER-PIXEL (one entry per fired pixel = how
+    many hits that pixel saw), for the pixel hit-multiplicity distribution. Multiplicity is per event
+    (a pad hit in two events = two n==1 entries / two m==1 pixels).
 
     Reference layout (standard ndlar_flow): charge/events/ref/charge/calib_prompt_hits/ref is
     (n_links, 2) with col0 = event index, col1 = hit index; .../ref_region[e] = (start, stop) slices
     that ref array for event e; hits live in charge/calib_prompt_hits/data (fields z, y, Q)."""
     import h5py
     REFG = "charge/events/ref/charge/calib_prompt_hits"
-    qacc, nacc = [], []
+    qacc, nacc, macc = [], [], []   # per-hit Q, per-hit parent multiplicity, per-PIXEL multiplicity
     for fi, path in enumerate(files):
         try:
             try:
@@ -100,7 +101,8 @@ def accumulate_q(files, adc_min, adc_max, max_events=None, verbose=True):
                     q = q_all[hi].astype(float)            # 'Q' already ke- (no scaling, per notebook)
                     _, inv, counts = np.unique(pid, return_inverse=True, return_counts=True)
                     qacc.append(q)
-                    nacc.append(counts[inv].astype(np.int16))   # each hit's pixel multiplicity
+                    nacc.append(counts[inv].astype(np.int16))    # each HIT's pixel multiplicity
+                    macc.append(counts.astype(np.int16))         # each PIXEL's multiplicity (one entry/pixel)
         except Exception as e:
             print(f"  !! skip {path}: {e}")
             continue
@@ -108,7 +110,7 @@ def accumulate_q(files, adc_min, adc_max, max_events=None, verbose=True):
             print(f"  [{fi + 1}/{len(files)}] {Path(path).name}: "
                   f"all={sum(a.size for a in qacc)}", flush=True)
     cat = lambda L, dt=float: np.concatenate(L) if L else np.zeros(0, dt)
-    return cat(qacc), cat(nacc, np.int16)
+    return cat(qacc), cat(nacc, np.int16), cat(macc, np.int16)
 
 
 def _density(q):
@@ -168,9 +170,10 @@ def main():
                                  squeeze=False, sharey=True)
         for ax, prc in zip(axes[0], args.prc):
             # DATA = solid black; SIM = dashed, DUNE palette colour (cycle if several MC series)
-            ax.step(*_density(selfn(*store[(prc, "data")])), where="mid", ls="-",
+            qd, nd, _ = store[(prc, "data")]; qs, ns, _ = store[(prc, "sim")]
+            ax.step(*_density(selfn(qd, nd)), where="mid", ls="-",
                     color=DATA_COLOR, lw=1.8, label=f"data prc{prc}")
-            ax.step(*_density(selfn(*store[(prc, "sim")])), where="mid", ls="--",
+            ax.step(*_density(selfn(qs, ns)), where="mid", ls="--",
                     color=MC_COLORS[0], lw=1.8, label=f"sim prc{prc} ({store[(prc,'simcfg')]})")
             ax.set_title(f"prc{prc}"); ax.set_xlabel(R"Hit Q [ke$^-$]")
             ax.set_ylabel("Density"); ax.set_xlim(QMIN, QMAX)
@@ -178,6 +181,24 @@ def main():
         fig.suptitle(f"FSDCube Hit Q -- {title} -- data vs sim", fontsize=13)
         fig.tight_layout(); fig.savefig(f"{args.outdir}/hitq_split_{slug}.png", dpi=120)
         print(f"wrote {args.outdir}/hitq_split_{slug}.png")
+
+    # ---- pixel hit-multiplicity: for each fired pixel, how many hits it saw -- data vs MC ----
+    NM = 10
+    mbins = np.arange(0.5, NM + 1.5); mctr = np.arange(1, NM + 1)
+    fig, axes = plt.subplots(1, len(args.prc), figsize=(6.4 * len(args.prc), 4.6),
+                             squeeze=False, sharey=True)
+    for ax, prc in zip(axes[0], args.prc):
+        for src, ls, col in (("data", "-", DATA_COLOR), ("sim", "--", MC_COLORS[0])):
+            m = store[(prc, src)][2]
+            h, _ = np.histogram(np.clip(m, 1, NM), bins=mbins); h = h.astype(float); s = h.sum()
+            lbl = f"{src} prc{prc}" + ("" if src == "data" else f" ({store[(prc,'simcfg')]})")
+            ax.step(mctr, h / s if s else h, where="mid", ls=ls, color=col, lw=1.8, label=lbl)
+        ax.set_title(f"prc{prc}"); ax.set_xlabel(f"pixel hit multiplicity  (>= {NM} in last bin)")
+        ax.set_ylabel("Fraction of fired pixels"); ax.set_xlim(0.5, NM + 0.5)
+        ax.set_xticks(range(1, NM + 1)); ax.legend(fontsize=8); ax.grid(alpha=.5, color=GRID_COLOR, lw=0.6)
+    fig.suptitle("FSDCube pixel hit-multiplicity -- data vs sim", fontsize=13)
+    fig.tight_layout(); fig.savefig(f"{args.outdir}/hitq_pixmult.png", dpi=120)
+    print(f"wrote {args.outdir}/hitq_pixmult.png")
 
 
 if __name__ == "__main__":
