@@ -34,6 +34,12 @@ NX, NY = 128, 80
 QBINS, QMIN, QMAX = 50, 0, 50                            # ke-
 CUTS = dict(adc_min=0.2e6, adc_max=0.5e6)               # event-level cut on charge/events 'ADC'
 
+# DUNE official plot-style palette (Okabe-Ito variant, from dune-plot-style's dune.mplstyle):
+# black is data (solid); the rest are the MC colors (dashed), cycled if several MC series.
+DUNE_COLORS = ["#000000", "#D55E00", "#56B4E9", "#E69F00", "#009E73", "#CC79A7", "#0072B2", "#F0E442"]
+DATA_COLOR, MC_COLORS = DUNE_COLORS[0], DUNE_COLORS[1:]
+GRID_COLOR = "#b2b2b2"                                   # dune.mplstyle grid.color
+
 # default file locations (mkramer's; override on the CLI if they move)
 SIM_BASE_DEF = "/pscratch/sd/m/mkramer/test/larnd-sim.segFFE3/output/skim_more"
 DATA_BASE_DEF = ("/dvs_ro/cfs/cdirs/dunepro/www/data/nd-production/FSDCube"
@@ -153,20 +159,22 @@ def main():
 
     # ---- one figure per pixel-multiplicity population, DATA (solid) + SIM (dashed) on the SAME
     #      canvas for a natural comparison; prc configs as side-by-side panels ----
-    POPS = [("mult1",   "single-hit pixels (n = 1)", lambda q, n: q[n == 1]),
-            ("mult2",   "two-hit pixels (n = 2)",    lambda q, n: q[n == 2]),
-            ("multAll", "all hits",                  lambda q, n: q)]
+    POPS = [("mult1",     "single-hit pixels (n = 1)", lambda q, n: q[n == 1]),
+            ("mult2",     "two-hit pixels (n = 2)",    lambda q, n: q[n == 2]),
+            ("mult3plus", "3+-hit pixels (n >= 3)",    lambda q, n: q[n >= 3]),
+            ("multAll",   "all hits",                  lambda q, n: q)]
     for slug, title, selfn in POPS:
         fig, axes = plt.subplots(1, len(args.prc), figsize=(6.4 * len(args.prc), 4.6),
                                  squeeze=False, sharey=True)
         for ax, prc in zip(axes[0], args.prc):
-            for src, ls, col in (("data", "-", "C0"), ("sim", "--", "C1")):
-                q, n = store[(prc, src)]
-                c, y = _density(selfn(q, n))
-                lbl = f"{src} prc{prc}" + ("" if src == "data" else f" ({store[(prc,'simcfg')]})")
-                ax.step(c, y, where="mid", ls=ls, color=col, label=lbl)
+            # DATA = solid black; SIM = dashed, DUNE palette colour (cycle if several MC series)
+            ax.step(*_density(selfn(*store[(prc, "data")])), where="mid", ls="-",
+                    color=DATA_COLOR, lw=1.8, label=f"data prc{prc}")
+            ax.step(*_density(selfn(*store[(prc, "sim")])), where="mid", ls="--",
+                    color=MC_COLORS[0], lw=1.8, label=f"sim prc{prc} ({store[(prc,'simcfg')]})")
             ax.set_title(f"prc{prc}"); ax.set_xlabel(R"Hit Q [ke$^-$]")
-            ax.set_ylabel("Density"); ax.set_xlim(QMIN, QMAX); ax.legend(fontsize=8); ax.grid(alpha=.25)
+            ax.set_ylabel("Density"); ax.set_xlim(QMIN, QMAX)
+            ax.legend(fontsize=8); ax.grid(alpha=.5, color=GRID_COLOR, lw=0.6)
         fig.suptitle(f"FSDCube Hit Q -- {title} -- data vs sim", fontsize=13)
         fig.tight_layout(); fig.savefig(f"{args.outdir}/hitq_split_{slug}.png", dpi=120)
         print(f"wrote {args.outdir}/hitq_split_{slug}.png")
