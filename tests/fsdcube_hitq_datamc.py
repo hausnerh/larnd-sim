@@ -6,7 +6,8 @@
 #
 # This does NOT import that notebook -- it copies the WORKFLOW so you can run and
 # modify it yourself. It reads the SAME FLOW files (real data + mkramer's larnd-sim)
-# via h5flow, builds per-pixel hit lists PER EVENT, and histograms the per-hit charge
+# with plain h5py (following the charge/events -> calib_prompt_hits references, so NO
+# h5flow dependency), builds per-pixel hit lists PER EVENT, and histograms the per-hit charge
 # Q (50 bins, 0-50 ke-, density) -- then overlays data vs sim for prc2 | prc16, and
 # ADDS the split the notebook was missing: all hits / single-hit-pixel hits /
 # multi-hit-pixel hits, to see which population carries the mid-Q shoulder.
@@ -15,7 +16,7 @@
 #   python tests/fsdcube_hitq_datamc.py --outdir hitq_out
 #   python tests/fsdcube_hitq_datamc.py --prc 2 16 --sim-r 3 --max-files 20 --outdir hitq_out
 #
-# Needs: h5flow, numpy, matplotlib. Pure analysis -- no GPU, no larnd-sim import.
+# Needs: h5py, numpy, matplotlib (all in the larnd env). No h5flow, no GPU, no larnd-sim import.
 # =============================================================================
 import argparse, os
 from collections import defaultdict
@@ -50,36 +51,47 @@ def pixel2id_abs(z, y):
 
 
 def accumulate_q(files, adc_min, adc_max, max_events=None, verbose=True):
-    """Loop FLOW files/events, apply the ADC event cut, group hits by pixel WITHIN EACH EVENT,
-    and return per-hit Q (ke-) for three populations: (all, single-hit-pixel, multi-hit-pixel).
-    Multiplicity is counted per event (a pad hit in two events = two single-hit entries)."""
-    from h5flow.data import H5FlowDataManager
+    """Loop FLOW files/events with plain h5py (follow the charge/events -> calib_prompt_hits
+    references), apply the ADC event cut, group hits by pixel WITHIN EACH EVENT, and return per-hit
+    Q (ke-) for three populations: (all, single-hit-pixel, multi-hit-pixel). Multiplicity is counted
+    per event (a pad hit in two events = two single-hit entries).
+
+    Reference layout (standard ndlar_flow): charge/events/ref/charge/calib_prompt_hits/ref is
+    (n_links, 2) with col0 = event index, col1 = hit index; .../ref_region[e] = (start, stop) slices
+    that ref array for event e; hits live in charge/calib_prompt_hits/data (fields z, y, Q)."""
+    import h5py
+    REFG = "charge/events/ref/charge/calib_prompt_hits"
     allq, singq, multq = [], [], []
     for fi, path in enumerate(files):
         try:
-            with H5FlowDataManager(str(path), mode="r") as f:
-                evts = f["charge/events/data"]
-                sel = np.ones(evts.shape, bool)
+            with h5py.File(str(path), "r") as h:
+                adc = np.asarray(h["charge/events/data"]["ADC"])
+                sel = np.ones(adc.shape, bool)
                 if adc_min:
-                    sel &= evts["ADC"] >= adc_min
+                    sel &= adc >= adc_min
                 if adc_max:
-                    sel &= evts["ADC"] <= adc_max
+                    sel &= adc <= adc_max
                 idx = np.nonzero(sel)[0]
                 if max_events:
                     idx = idx[:max_events]
-                for evt in idx:
-                    hits = f["charge/events", "charge/calib_prompt_hits", evt][0]
-                    hits = hits.data[~hits.mask["id"]]
-                    if len(hits) == 0:
+                reg = h[f"{REFG}/ref_region"]
+                r_start = np.asarray(reg["start"]); r_stop = np.asarray(reg["stop"])
+                hit_of_ref = np.asarray(h[f"{REFG}/ref"][:, 1])        # ref col1 = hit index
+                hd = h["charge/calib_prompt_hits/data"]
+                z_all = np.asarray(hd["z"]); y_all = np.asarray(hd["y"]); q_all = np.asarray(hd["Q"])
+                for e in idx:
+                    st, sp = int(r_start[e]), int(r_stop[e])
+                    if sp <= st:
                         continue
-                    pid = pixel2id_abs(hits["z"], hits["y"])
-                    q = np.asarray(hits["Q"], float)       # already ke- (no scaling, per notebook)
+                    hi = hit_of_ref[st:sp]
+                    pid = pixel2id_abs(z_all[hi], y_all[hi])
+                    q = q_all[hi].astype(float)            # 'Q' already ke- (no scaling, per notebook)
                     allq.append(q)
                     order = np.argsort(pid, kind="stable")
                     pid_s, q_s = pid[order], q[order]
                     _, start, counts = np.unique(pid_s, return_index=True, return_counts=True)
-                    for st, ct in zip(start, counts):
-                        (singq if ct == 1 else multq).append(q_s[st:st + ct])
+                    for a0, ct in zip(start, counts):
+                        (singq if ct == 1 else multq).append(q_s[a0:a0 + ct])
         except Exception as e:
             print(f"  !! skip {path}: {e}")
             continue
