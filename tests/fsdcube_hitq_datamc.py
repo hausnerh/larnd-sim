@@ -139,7 +139,8 @@ def data_files(data_base, prc):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--prc", type=int, nargs="+", default=[2, 16], help="parity configs to plot (panels)")
-    ap.add_argument("--sim-r", type=int, default=3, help="sim readout radius r3/r4 (default 3)")
+    ap.add_argument("--sim-r", type=int, nargs="+", default=[3, 4],
+                    help="sim readout radius/radii to overlay as separate MC curves, e.g. 3 4 (default both)")
     ap.add_argument("--sim-var", default="", help="sim variant suffix, e.g. _noFFE (default none)")
     ap.add_argument("--data-base", default=DATA_BASE_DEF)
     ap.add_argument("--sim-base", default=SIM_BASE_DEF)
@@ -152,18 +153,25 @@ def main():
     os.makedirs(args.outdir, exist_ok=True)
     cap = lambda L: L[: args.max_files] if args.max_files else L
 
-    # gather per-hit (Q, pixel-multiplicity) for data + sim, per prc
+    # gather per-hit (Q, multiplicity, last-hit Q) for data + each sim radius, per prc
     store = {}
     for prc in args.prc:
         df = cap(data_files(args.data_base, prc))
-        scfg, sf = sim_files(args.sim_base, prc, args.sim_r, args.sim_var)
-        sf = cap(sf)
-        print(f"\nprc{prc}: {len(df)} data files, {len(sf)} sim files ({scfg})")
+        print(f"\nprc{prc}: {len(df)} data files")
         print(" data:")
         store[(prc, "data")] = accumulate_q(df, args.adc_min, args.adc_max, args.max_events)
-        print(" sim:")
-        store[(prc, "sim")] = accumulate_q(sf, args.adc_min, args.adc_max, args.max_events)
-        store[(prc, "simcfg")] = scfg
+        for r in args.sim_r:
+            scfg, sf = sim_files(args.sim_base, prc, r, args.sim_var)
+            sf = cap(sf)
+            print(f" sim r{r} ({scfg}): {len(sf)} files")
+            store[(prc, "sim", r)] = accumulate_q(sf, args.adc_min, args.adc_max, args.max_events)
+
+    # one plotting series per prc: data (solid black) + each sim radius (dashed, distinct DUNE colour)
+    def series(prc):
+        out = [(f"data prc{prc}", DATA_COLOR, "-", store[(prc, "data")])]
+        for i, r in enumerate(args.sim_r):
+            out.append((f"sim r{r} prc{prc}", MC_COLORS[i % len(MC_COLORS)], "--", store[(prc, "sim", r)]))
+        return out
 
     # ---- one figure per pixel-multiplicity population, DATA (solid) + SIM (dashed) on the SAME
     #      canvas for a natural comparison; prc configs as side-by-side panels ----
@@ -175,12 +183,10 @@ def main():
         fig, axes = plt.subplots(1, len(args.prc), figsize=(6.4 * len(args.prc), 4.6),
                                  squeeze=False, sharey=True)
         for ax, prc in zip(axes[0], args.prc):
-            # DATA = solid black; SIM = dashed, DUNE palette colour (cycle if several MC series)
-            qd, nd, _, _ = store[(prc, "data")]; qs, ns, _, _ = store[(prc, "sim")]
-            ax.step(*_density(selfn(qd, nd)), where="mid", ls="-",
-                    color=DATA_COLOR, lw=1.8, label=f"data prc{prc}")
-            ax.step(*_density(selfn(qs, ns)), where="mid", ls="--",
-                    color=MC_COLORS[0], lw=1.8, label=f"sim prc{prc} ({store[(prc,'simcfg')]})")
+            # DATA = solid black; each SIM radius = dashed, distinct DUNE palette colour
+            for lbl, col, ls, tup in series(prc):
+                q, n, _, _ = tup
+                ax.step(*_density(selfn(q, n)), where="mid", ls=ls, color=col, lw=1.8, label=lbl)
             ax.set_title(f"prc{prc}"); ax.set_xlabel(R"Hit Q [ke$^-$]")
             ax.set_ylabel("Density"); ax.set_xlim(QMIN, QMAX)
             ax.legend(fontsize=8); ax.grid(alpha=.5, color=GRID_COLOR, lw=0.6)
@@ -190,16 +196,15 @@ def main():
 
     # ---- pixel hit-multiplicity: for each fired pixel, how many hits it saw -- data vs MC ----
     # dynamic axis: run x out to the max multiplicity across all 4 datasets (no overflow bin)
-    NM = max((int(store[(prc, src)][2].max()) for prc in args.prc for src in ("data", "sim")
-              if store[(prc, src)][2].size), default=1)
+    NM = max((int(tup[2].max()) for prc in args.prc for _, _, _, tup in series(prc) if tup[2].size),
+             default=1)
     mbins = np.arange(0.5, NM + 1.5); mctr = np.arange(1, NM + 1)
     fig, axes = plt.subplots(1, len(args.prc), figsize=(6.4 * len(args.prc), 4.6),
                              squeeze=False, sharey=True)
     for ax, prc in zip(axes[0], args.prc):
-        for src, ls, col in (("data", "-", DATA_COLOR), ("sim", "--", MC_COLORS[0])):
-            m = store[(prc, src)][2]
+        for lbl, col, ls, tup in series(prc):
+            m = tup[2]
             h, _ = np.histogram(m, bins=mbins); h = h.astype(float); s = h.sum()
-            lbl = f"{src} prc{prc}" + ("" if src == "data" else f" ({store[(prc,'simcfg')]})")
             ax.step(mctr, h / s if s else h, where="mid", ls=ls, color=col, lw=1.8, label=lbl)
         ax.set_title(f"prc{prc}"); ax.set_xlabel("pixel hit multiplicity")
         ax.set_ylabel("Fraction of fired pixels"); ax.set_xlim(0.5, NM + 0.5)
@@ -213,9 +218,8 @@ def main():
     fig, axes = plt.subplots(1, len(args.prc), figsize=(6.4 * len(args.prc), 4.6),
                              squeeze=False, sharey=True)
     for ax, prc in zip(axes[0], args.prc):
-        for src, ls, col in (("data", "-", DATA_COLOR), ("sim", "--", MC_COLORS[0])):
-            ql = store[(prc, src)][3]                 # per-pixel last-hit charge
-            lbl = f"{src} prc{prc}" + ("" if src == "data" else f" ({store[(prc,'simcfg')]})")
+        for lbl, col, ls, tup in series(prc):
+            ql = tup[3]                               # per-pixel last-hit charge
             ax.step(*_density(ql), where="mid", ls=ls, color=col, lw=1.8, label=lbl)
         ax.set_title(f"prc{prc}"); ax.set_xlabel(R"last-hit Q [ke$^-$]")
         ax.set_ylabel("Density"); ax.set_xlim(QMIN, QMAX)
