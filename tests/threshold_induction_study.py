@@ -175,7 +175,7 @@ def build_shower_event(ctx, rng, plane=0, energy_mev=300.0, n_dep=400,
 
 
 def build_muon_event(ctx, rng, plane=0, theta_deg=45.0, length_cm=20.0,
-                     dedx=2.1, step_cm=0.3, azimuth_deg=None, return_geom=False):
+                     dedx=2.1, step_cm=0.05, azimuth_deg=None, return_geom=False):
     """A straight MIP muon track, parametrised by its angle to the PIXEL PLANE.
 
     theta_deg is the angle between the track and the pixel (anode) plane:
@@ -189,6 +189,12 @@ def build_muon_event(ctx, rng, plane=0, theta_deg=45.0, length_cm=20.0,
       * 45  -> tilted: each pixel sees charge over a time window set by the tilt.
     The transverse position and depth are randomised per event so different pixels are sampled
     while the topology (angle) is held fixed. MIP dE/dx ~ 2.1 MeV/cm.
+
+    step_cm must stay well BELOW the pixel pitch (and the transverse diffusion sigma): the track is
+    deposited as abutting `step_cm` segments, and if that spacing is comparable to the pitch
+    (e.g. the old 0.3 cm ~= 0.8 * 0.372 cm pitch) it ALIASES against the pixel grid, so collection
+    lands on a periodic subset of pads (a comb) instead of a continuous line. 0.05 cm (~0.13 pitch,
+    ~edep-sim granularity) samples every pad many times -> continuous collection.
 
     azimuth_deg fixes the track's direction WITHIN the pixel plane. None -> random per event, so the
     track runs DIAGONAL across the square grid: its collectors form a staircase (not one strip) and
