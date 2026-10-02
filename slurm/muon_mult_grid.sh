@@ -18,7 +18,7 @@
 #SBATCH -C gpu
 #SBATCH -q shared
 #SBATCH --gpus 1 -c 32 -N 1
-#SBATCH -t 2:00:00
+#SBATCH -t 6:00:00
 #SBATCH -J fsdcube_mumult
 #SBATCH -o muon_mult_%j.log
 
@@ -32,6 +32,6 @@ mkdir -p "$OUT"
 echo "vertical (downward) muons: in-plane azimuth 90 deg, one x-column -> $OUT"
 
 python -u tests/threshold_induction_study.py --config fsd_cube --mult-grid --mult-grid-muons \
-  --n-events 600 --muon-azimuths 90 --muon-length 200 --outdir "$OUT" \
+  --n-events 300 --muon-azimuths 90 --muon-length 200 --outdir "$OUT" \
   --thresholds 2500 3750 5000 6250 7500 --resets -1 1024 512 256 128 64
 echo "DONE -> $OUT/ti_mult_grid.npz (sample=muons, vertical / in-plane azimuth 90 deg)"

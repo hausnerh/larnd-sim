@@ -24,7 +24,7 @@
 #SBATCH -C gpu
 #SBATCH -q shared
 #SBATCH --gpus 1 -c 32 -N 1
-#SBATCH -t 2:00:00
+#SBATCH -t 6:00:00
 #SBATCH -J fsdcube_muon
 #SBATCH -o muon_burst_%j.log
 
@@ -35,8 +35,8 @@ cd "$ND_SRC"
 GIT_TERMINAL_PROMPT=0 git pull --ff-only 2>&1 || echo "note: git pull skipped/failed -- running current checkout"
 
 python -u tests/threshold_induction_study.py --config fsd_cube --burst-only \
-  --burst-thetas 0 --muon-length 200 --muon-events 250 --burst-events 80 \
-  --burst-neighbors 3 --burst-inductions 0.5 1.0 1.5 --muon-scan-events 100 \
+  --burst-thetas 0 --muon-length 200 --muon-events 150 --burst-events 40 \
+  --burst-neighbors 3 --burst-inductions 0.5 1.0 1.5 --muon-scan-events 60 \
   --muon-thresholds 2000 2500 3000 4000 5000 \
   --muon-azimuth 90 --wf-txt 2 --outdir "$ND_WORK/tistudy_muon_burst"
 
