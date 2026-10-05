@@ -175,7 +175,8 @@ def build_shower_event(ctx, rng, plane=0, energy_mev=300.0, n_dep=400,
 
 
 def build_muon_event(ctx, rng, plane=0, theta_deg=45.0, length_cm=20.0,
-                     dedx=2.1, step_cm=0.07, azimuth_deg=None, return_geom=False):
+                     dedx=2.1, step_cm=0.07, azimuth_deg=None, return_geom=False,
+                     edge_margin_cm=0.0):
     """A straight MIP muon track, parametrised by its angle to the PIXEL PLANE.
 
     theta_deg is the angle between the track and the pixel (anode) plane:
@@ -207,10 +208,16 @@ def build_muon_event(ctx, rng, plane=0, theta_deg=45.0, length_cm=20.0,
     return_geom=True -> return (tracks, geom) where geom = {axis, idx, plane} names the strip we
     KNOW the muon lies on (its pad row/column index), so downstream selection reads exactly the
     on-strip line + transverse neighbours a priori (no PCA / is_collection guessing). geom is None
-    for a random azimuth (diagonal track has no single strip) -- callers fall back to PCA there."""
+    for a random azimuth (diagonal track has no single strip) -- callers fall back to PCA there.
+
+    edge_margin_cm insets the anode face the track is clipped to. 0.0 (default) = THROUGH-GOING:
+    the track spans the full face edge-to-edge, so charge reaches every pad in its row/column. A
+    positive value stops the charge that many cm short of each edge (the old 3 cm did this, which is
+    why the end pads showed q_coll=0); any fiducial cut should be a separate analysis mask, not baked
+    into the deposit."""
     from math import radians, cos, sin
     det = ctx.detector
-    x0, x1, y0, y1 = vd.active_volume(det, plane, margin=3.0)
+    x0, x1, y0, y1 = vd.active_volume(det, plane, margin=edge_margin_cm)
     dmax = abs(det.DRIFT_LENGTH) - 3.0
     th = radians(theta_deg)
     ph = rng.uniform(0.0, 2.0 * np.pi) if azimuth_deg is None else radians(azimuth_deg)
