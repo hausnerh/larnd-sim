@@ -8,13 +8,21 @@
 # modify it yourself. It reads the SAME FLOW files (real data + mkramer's larnd-sim)
 # with plain h5py (following the charge/events -> calib_prompt_hits references, so NO
 # h5flow dependency), builds per-pixel hit lists PER EVENT, and histograms the per-hit charge
-# Q (50 bins, 0-50 ke-, density) -- then overlays data vs sim for prc2 | prc16, and
+# Q (50 bins, 0-50 ke-) -- then overlays data vs sim for prc2 | prc16, and
 # ADDS the split the notebook was missing: all hits / single-hit-pixel hits /
 # multi-hit-pixel hits, to see which population carries the mid-Q shoulder.
 #
+# --norm picks the normalization (one plot set per scheme, under <outdir>/<scheme>/):
+#   single  -- divide each dataset by its # single-hit pixels (m==1): every dataset then has
+#              the SAME single-hit count, so the n==1 curves coincide by construction and any
+#              residual in the mult2/3+/all populations is a SHAPE effect, not a normalization one.
+#   shower  -- divide by the # showers (selected events with hits): entries per shower.
+#   density -- area-normalized, shape only (the original behaviour).
+# The pixel hit-multiplicity x-axis is capped by --mult-max (default 20).
+#
 # Run on NERSC (where the FLOW files and h5flow live), e.g.:
-#   python tests/fsdcube_hitq_datamc.py --outdir hitq_out
-#   python tests/fsdcube_hitq_datamc.py --prc 2 16 --sim-r 3 --max-files 20 --outdir hitq_out
+#   python tests/fsdcube_hitq_datamc.py --outdir hitq_out                       # all 3 norms
+#   python tests/fsdcube_hitq_datamc.py --norm single --prc 2 16 --sim-r 3 --max-files 20 --outdir hitq_out
 #
 # Needs: h5py, numpy, matplotlib (all in the larnd env). No h5flow, no GPU, no larnd-sim import.
 # =============================================================================
@@ -59,11 +67,12 @@ def pixel2id_abs(z, y):
 
 def accumulate_q(files, adc_min, adc_max, max_events=None, verbose=True):
     """Loop FLOW files/events with plain h5py (follow the charge/events -> calib_prompt_hits
-    references), apply the ADC event cut, and return (q, n, m, qlast): q and n are PER-HIT (hit charge
+    references), apply the ADC event cut, and return (q, n, m, qlast, nev): q and n are PER-HIT (hit charge
     ke-, and the hit-multiplicity of that hit's pixel within its event, so any Q population is a slice
     -- n==1 single-hit, n==2 two-hit, all hits, ...); m and qlast are PER-PIXEL (one entry per fired
     pixel) -- m = how many hits that pixel saw, qlast = the charge of that pixel's LAST hit (largest
-    drift time within the event). Multiplicity is per event (a pad hit in two events = two m==1 pixels).
+    drift time within the event). nev = # selected showers (events passing the ADC cut that have hits).
+    Multiplicity is per event (a pad hit in two events = two m==1 pixels).
 
     Reference layout (standard ndlar_flow): charge/events/ref/charge/calib_prompt_hits/ref is
     (n_links, 2) with col0 = event index, col1 = hit index; .../ref_region[e] = (start, stop) slices
@@ -71,6 +80,7 @@ def accumulate_q(files, adc_min, adc_max, max_events=None, verbose=True):
     import h5py
     REFG = "charge/events/ref/charge/calib_prompt_hits"
     qacc, nacc, macc, lacc = [], [], [], []   # per-hit Q, per-hit mult, per-pixel mult, per-pixel last-hit Q
+    nev = 0                                    # # selected showers (events with hits) -> per-shower norm
     for fi, path in enumerate(files):
         try:
             try:
@@ -97,6 +107,7 @@ def accumulate_q(files, adc_min, adc_max, max_events=None, verbose=True):
                     st, sp = int(r_start[e]), int(r_stop[e])
                     if sp <= st:
                         continue
+                    nev += 1
                     hi = hit_of_ref[st:sp]
                     pid = pixel2id_abs(z_all[hi], y_all[hi])
                     q = q_all[hi].astype(float)            # 'Q' already ke- (no scaling, per notebook)
@@ -116,15 +127,7 @@ def accumulate_q(files, adc_min, adc_max, max_events=None, verbose=True):
             print(f"  [{fi + 1}/{len(files)}] {Path(path).name}: "
                   f"all={sum(a.size for a in qacc)}", flush=True)
     cat = lambda L, dt=float: np.concatenate(L) if L else np.zeros(0, dt)
-    return cat(qacc), cat(nacc, np.int16), cat(macc, np.int16), cat(lacc)
-
-
-def _density(q):
-    h, edges = np.histogram(q, bins=QBINS, range=(QMIN, QMAX))
-    w = edges[1] - edges[0]
-    s = h.sum()
-    ctr = 0.5 * (edges[1:] + edges[:-1])
-    return ctr, (h / (s * w) if s else h.astype(float))   # density (area = 1)
+    return cat(qacc), cat(nacc, np.int16), cat(macc, np.int16), cat(lacc), nev
 
 
 def sim_files(sim_base, prc, r, var=""):
@@ -149,6 +152,15 @@ def main():
     ap.add_argument("--max-files", type=int, default=None, help="cap files per sample (quick tests)")
     ap.add_argument("--max-events", type=int, default=None, help="cap selected events per file")
     ap.add_argument("--outdir", default="hitq_out")
+    ap.add_argument("--norm", nargs="+", default=["single", "shower", "density"],
+                    choices=["single", "shower", "density"],
+                    help="normalization scheme(s); one plot set per scheme in <outdir>/<scheme>/. "
+                         "single = divide each dataset by its # single-hit pixels (entries / single-hit "
+                         "pixel) so every dataset has the SAME single-hit count -> residuals are shape, "
+                         "not normalization; shower = divide by # showers (entries / shower); "
+                         "density = area-normalized, shape only (default: all three)")
+    ap.add_argument("--mult-max", type=int, default=20,
+                    help="cap the pixel hit-multiplicity x-axis at this value (default 20)")
     args = ap.parse_args()
     os.makedirs(args.outdir, exist_ok=True)
     cap = lambda L: L[: args.max_files] if args.max_files else L
@@ -173,60 +185,95 @@ def main():
             out.append((f"sim r{r} prc{prc}", MC_COLORS[i % len(MC_COLORS)], "--", store[(prc, "sim", r)]))
         return out
 
-    # ---- one figure per pixel-multiplicity population, DATA (solid) + SIM (dashed) on the SAME
-    #      canvas for a natural comparison; prc configs as side-by-side panels ----
+    BINW = (QMAX - QMIN) / QBINS
+
+    def counts(q):
+        h, edges = np.histogram(q, bins=QBINS, range=(QMIN, QMAX))
+        return 0.5 * (edges[1:] + edges[:-1]), h.astype(float)
+
+    nsingle = lambda tup: max(int((tup[2] == 1).sum()), 1)   # # single-hit pixels (m == 1)
+    nshower = lambda tup: max(int(tup[4]), 1)                 # # showers (selected events with hits)
+
+    # Per-dataset normalization WEIGHT for a scheme. density is per-histogram (area = 1, shape only);
+    # single/shower are ONE per-dataset scalar applied to every population the same way, so the different
+    # multiplicity slices stay on a common scale -> you can tell a pure normalization offset from a real
+    # shape difference. 'single' pins the n==1 Q area (and the mult==1 bin) to 1 for every dataset by
+    # construction: that is the "same number of single-hit pixels in each dataset" the study wants.
+    def weight(scheme, tup, hsum):
+        if scheme == "single":
+            return 1.0 / nsingle(tup)                    # entries / single-hit pixel
+        if scheme == "shower":
+            return 1.0 / nshower(tup)                    # entries / shower
+        return (1.0 / (hsum * BINW)) if hsum else 0.0    # density (area 1), per histogram
+
+    YLAB = {"single": "Entries / single-hit pixel", "shower": "Entries / shower", "density": "Density"}
+    NOTE = {"single": "norm: same # single-hit pixels per dataset",
+            "shower": "norm: per shower", "density": "area-normalized (shape only)"}
+
     POPS = [("mult1",     "single-hit pixels (n = 1)", lambda q, n: q[n == 1]),
             ("mult2",     "two-hit pixels (n = 2)",    lambda q, n: q[n == 2]),
             ("mult3plus", "3+-hit pixels (n >= 3)",    lambda q, n: q[n >= 3]),
             ("multAll",   "all hits",                  lambda q, n: q)]
-    for slug, title, selfn in POPS:
+
+    # pixel hit-multiplicity x-axis: run out to the data max but cap at --mult-max (default 20)
+    NM_raw = max((int(tup[2].max()) for prc in args.prc for _, _, _, tup in series(prc) if tup[2].size),
+                 default=1)
+    NM = min(NM_raw, args.mult_max)
+    mbins = np.arange(0.5, NM + 1.5); mctr = np.arange(1, NM + 1)
+    xticks = list(range(1, NM + 1, 1 if NM <= 20 else max(1, NM // 20)))
+
+    for scheme in args.norm:
+        sdir = os.path.join(args.outdir, scheme)
+        os.makedirs(sdir, exist_ok=True)
+
+        # ---- one figure per pixel-multiplicity population, DATA (solid) + SIM (dashed) on the SAME
+        #      canvas for a natural comparison; prc configs as side-by-side panels ----
+        for slug, title, selfn in POPS:
+            fig, axes = plt.subplots(1, len(args.prc), figsize=(6.4 * len(args.prc), 4.6),
+                                     squeeze=False, sharey=True)
+            for ax, prc in zip(axes[0], args.prc):
+                for lbl, col, ls, tup in series(prc):
+                    ctr, h = counts(selfn(tup[0], tup[1]))
+                    ax.step(ctr, h * weight(scheme, tup, h.sum()), where="mid",
+                            ls=ls, color=col, lw=1.8, label=lbl)
+                ax.set_title(f"prc{prc}"); ax.set_xlabel(R"Hit Q [ke$^-$]")
+                ax.set_ylabel(YLAB[scheme]); ax.set_xlim(QMIN, QMAX)
+                ax.legend(fontsize=8); ax.grid(alpha=.5, color=GRID_COLOR, lw=0.6)
+            fig.suptitle(f"FSDCube Hit Q -- {title} -- data vs sim  [{NOTE[scheme]}]", fontsize=13)
+            fig.tight_layout(); fig.savefig(f"{sdir}/hitq_split_{slug}.png", dpi=120)
+            print(f"wrote {sdir}/hitq_split_{slug}.png")
+
+        # ---- pixel hit-multiplicity: for each fired pixel, how many hits it saw -- data vs MC ----
         fig, axes = plt.subplots(1, len(args.prc), figsize=(6.4 * len(args.prc), 4.6),
                                  squeeze=False, sharey=True)
         for ax, prc in zip(axes[0], args.prc):
-            # DATA = solid black; each SIM radius = dashed, distinct DUNE palette colour
             for lbl, col, ls, tup in series(prc):
-                q, n, _, _ = tup
-                ax.step(*_density(selfn(q, n)), where="mid", ls=ls, color=col, lw=1.8, label=lbl)
-            ax.set_title(f"prc{prc}"); ax.set_xlabel(R"Hit Q [ke$^-$]")
-            ax.set_ylabel("Density"); ax.set_xlim(QMIN, QMAX)
+                h, _ = np.histogram(tup[2], bins=mbins); h = h.astype(float)
+                # density -> fraction of fired pixels; single/shower -> the per-dataset scalar
+                w = (1.0 / h.sum() if h.sum() else 0.0) if scheme == "density" else weight(scheme, tup, h.sum())
+                ax.step(mctr, h * w, where="mid", ls=ls, color=col, lw=1.8, label=lbl)
+            ax.set_title(f"prc{prc}"); ax.set_xlabel("pixel hit multiplicity")
+            ax.set_ylabel("Fraction of fired pixels" if scheme == "density" else YLAB[scheme])
+            ax.set_xlim(0.5, NM + 0.5); ax.set_xticks(xticks)
             ax.legend(fontsize=8); ax.grid(alpha=.5, color=GRID_COLOR, lw=0.6)
-        fig.suptitle(f"FSDCube Hit Q -- {title} -- data vs sim", fontsize=13)
-        fig.tight_layout(); fig.savefig(f"{args.outdir}/hitq_split_{slug}.png", dpi=120)
-        print(f"wrote {args.outdir}/hitq_split_{slug}.png")
+        fig.suptitle(f"FSDCube pixel hit-multiplicity -- data vs sim  [{NOTE[scheme]}]", fontsize=13)
+        fig.tight_layout(); fig.savefig(f"{sdir}/hitq_pixmult.png", dpi=120)
+        print(f"wrote {sdir}/hitq_pixmult.png")
 
-    # ---- pixel hit-multiplicity: for each fired pixel, how many hits it saw -- data vs MC ----
-    # dynamic axis: run x out to the max multiplicity across all 4 datasets (no overflow bin)
-    NM = max((int(tup[2].max()) for prc in args.prc for _, _, _, tup in series(prc) if tup[2].size),
-             default=1)
-    mbins = np.arange(0.5, NM + 1.5); mctr = np.arange(1, NM + 1)
-    fig, axes = plt.subplots(1, len(args.prc), figsize=(6.4 * len(args.prc), 4.6),
-                             squeeze=False, sharey=True)
-    for ax, prc in zip(axes[0], args.prc):
-        for lbl, col, ls, tup in series(prc):
-            m = tup[2]
-            h, _ = np.histogram(m, bins=mbins); h = h.astype(float); s = h.sum()
-            ax.step(mctr, h / s if s else h, where="mid", ls=ls, color=col, lw=1.8, label=lbl)
-        ax.set_title(f"prc{prc}"); ax.set_xlabel("pixel hit multiplicity")
-        ax.set_ylabel("Fraction of fired pixels"); ax.set_xlim(0.5, NM + 0.5)
-        ax.set_xticks(range(1, NM + 1, max(1, NM // 15)))
-        ax.legend(fontsize=8); ax.grid(alpha=.5, color=GRID_COLOR, lw=0.6)
-    fig.suptitle("FSDCube pixel hit-multiplicity -- data vs sim", fontsize=13)
-    fig.tight_layout(); fig.savefig(f"{args.outdir}/hitq_pixmult.png", dpi=120)
-    print(f"wrote {args.outdir}/hitq_pixmult.png")
-
-    # ---- charge of each pixel's LAST hit -- data vs MC ----
-    fig, axes = plt.subplots(1, len(args.prc), figsize=(6.4 * len(args.prc), 4.6),
-                             squeeze=False, sharey=True)
-    for ax, prc in zip(axes[0], args.prc):
-        for lbl, col, ls, tup in series(prc):
-            ql = tup[3]                               # per-pixel last-hit charge
-            ax.step(*_density(ql), where="mid", ls=ls, color=col, lw=1.8, label=lbl)
-        ax.set_title(f"prc{prc}"); ax.set_xlabel(R"last-hit Q [ke$^-$]")
-        ax.set_ylabel("Density"); ax.set_xlim(QMIN, QMAX)
-        ax.legend(fontsize=8); ax.grid(alpha=.5, color=GRID_COLOR, lw=0.6)
-    fig.suptitle("FSDCube per-pixel last-hit charge -- data vs sim", fontsize=13)
-    fig.tight_layout(); fig.savefig(f"{args.outdir}/hitq_lasthit.png", dpi=120)
-    print(f"wrote {args.outdir}/hitq_lasthit.png")
+        # ---- charge of each pixel's LAST hit -- data vs MC ----
+        fig, axes = plt.subplots(1, len(args.prc), figsize=(6.4 * len(args.prc), 4.6),
+                                 squeeze=False, sharey=True)
+        for ax, prc in zip(axes[0], args.prc):
+            for lbl, col, ls, tup in series(prc):
+                ctr, h = counts(tup[3])                   # per-pixel last-hit charge
+                ax.step(ctr, h * weight(scheme, tup, h.sum()), where="mid",
+                        ls=ls, color=col, lw=1.8, label=lbl)
+            ax.set_title(f"prc{prc}"); ax.set_xlabel(R"last-hit Q [ke$^-$]")
+            ax.set_ylabel(YLAB[scheme]); ax.set_xlim(QMIN, QMAX)
+            ax.legend(fontsize=8); ax.grid(alpha=.5, color=GRID_COLOR, lw=0.6)
+        fig.suptitle(f"FSDCube per-pixel last-hit charge -- data vs sim  [{NOTE[scheme]}]", fontsize=13)
+        fig.tight_layout(); fig.savefig(f"{sdir}/hitq_lasthit.png", dpi=120)
+        print(f"wrote {sdir}/hitq_lasthit.png")
 
 
 if __name__ == "__main__":
