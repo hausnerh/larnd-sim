@@ -12,6 +12,12 @@
 # Submit (4 tasks x 250 = 1000 showers):
 #   sbatch slurm/shower_grid_array.sh
 #   EDEP=/path/showers.h5 NSLICE=250 sbatch --array=0-3 slurm/shower_grid_array.sh
+#
+# EDEP may be ONE edep file, a quoted glob, or a directory -- e.g. mkramer's larnd-sim
+# OUTPUT (it carries its input 'segments' through), so the sweep re-runs HIS showers:
+#   EDEP='/pscratch/sd/m/mkramer/test/larnd-sim.segFFE3/output/skim_more/prc*_r*_patch_noDrop/*.hdf5' \
+#     NSLICE=250 sbatch --array=0-3 slurm/shower_grid_array.sh
+# Set RECENTER=0 to keep his in-frame positions (default recenters, as for own showers).
 # Then, after all tasks finish, merge:
 #   sbatch --dependency=afterok:<arrayJobID> slurm/merge_grids.sh    # or run merge_grids.sh args by hand
 #
@@ -39,15 +45,21 @@ cd "$ND_SRC"
 GIT_TERMINAL_PROMPT=0 git pull --ff-only 2>&1 || echo "note: git pull skipped/failed -- running current checkout"
 
 EDEP="${EDEP:-$ND_WORK/fsdcube_induction.EDEPSIM.h5}"
-[ -f "$EDEP" ] || { echo "!! no edep file at $EDEP -- set EDEP=<path> and resubmit"; exit 1; }
+# EDEP may be a file, a glob, or a directory (Python-side expansion); accept any that resolves.
+case "$EDEP" in
+  *[*?[]*) compgen -G "$EDEP" >/dev/null || { echo "!! --edep-h5 glob matched nothing: $EDEP"; exit 1; } ;;
+  *) [ -e "$EDEP" ] || { echo "!! no edep path at $EDEP -- set EDEP=<file|glob|dir> and resubmit"; exit 1; } ;;
+esac
+RECENTER="${RECENTER:-1}"
+[ "$RECENTER" = "0" ] && RECENTER_FLAG="" || RECENTER_FLAG="--recenter-showers"
 k="$SLURM_ARRAY_TASK_ID"
 OFFSET=$(( k * NSLICE ))
 OUT="$ND_WORK/tistudy_grid_full/part_${k}"
 mkdir -p "$OUT"
-echo "task $k: edep=$EDEP  slice=[${OFFSET}:$(( OFFSET + NSLICE ))]  out=$OUT"
+echo "task $k: edep=$EDEP  recenter=$RECENTER  slice=[${OFFSET}:$(( OFFSET + NSLICE ))]  out=$OUT"
 
 python -u tests/threshold_induction_study.py --config fsd_cube --mult-grid \
-  --edep-h5 "$EDEP" --recenter-showers --edep-offset "$OFFSET" --n-events "$NSLICE" \
+  --edep-h5 "$EDEP" $RECENTER_FLAG --edep-offset "$OFFSET" --n-events "$NSLICE" \
   --seed $(( 12345 + k )) --outdir "$OUT" \
   --thresholds $THRESHOLDS --resets $RESETS
 

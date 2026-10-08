@@ -614,6 +614,12 @@ def event_fee_hits(ctx, ev, threshold_e, seed, pops=_HIT_POPS):
     out["all"] = (np.asarray(q_all[hit_any].sum(axis=1), float),
                   ev["is_collection"][hit_any],
                   np.asarray(n_hits[hit_any], np.int16))
+    # per-pixel LAST-hit charge (the fired ADC sample with the largest hit time), aligned 1:1 with
+    # out["all"] -- the kramer "last-hit Q" observable. Mask non-fired samples to -inf so argmax lands
+    # on the latest real sample; pixels that never fired are dropped by the same hit_any slice.
+    _tlast = np.where(hit, ticks, -np.inf).argmax(axis=1)
+    _qlast = np.asarray(q_all[np.arange(adc.shape[0]), _tlast], float)
+    out["qlast"] = _qlast[hit_any]
     # per-HIT charges: every ADC sample as its own entry (a 2-hit pixel contributes 2), each tagged
     # with its pixel's multiplicity so the same 1/2/3+/all split works. q_all is exactly 0 where
     # adc<=0, so q_all[hit] is the flat list of real hit charges in pixel-then-sample order, which
@@ -945,6 +951,7 @@ def aggregate_hits(ctx, evs, threshold_e, reset_cycles, induction_scale,
     acc = {n: ([], [], []) for n in pops}
     alla = ([], [], [])
     pha = ([], [])                                    # per-hit (charge, parent multiplicity)
+    qla = []                                          # per-pixel last-hit charge (aligned with 'all')
     with _silence_device_stdout():
         for i, ev in enumerate(evs):
             res = event_fee_hits(ctx, ev, threshold_e, seed=seed0 + i, pops=pops)
@@ -955,6 +962,7 @@ def aggregate_hits(ctx, evs, threshold_e, reset_cycles, induction_scale,
             qa, ta, na = res["all"]
             if qa.size:
                 alla[0].append(qa); alla[1].append(ta); alla[2].append(na)
+                qla.append(res["qlast"])              # same hit_any order as 'all' -> stays aligned
             qp, npp = res["perhit"]
             if qp.size:
                 pha[0].append(qp); pha[1].append(npp)
@@ -969,6 +977,7 @@ def aggregate_hits(ctx, evs, threshold_e, reset_cycles, induction_scale,
                    np.concatenate(alla[2])))
     out["perhit"] = ((np.empty(0), np.empty(0, np.int16)) if not pha[0] else
                      (np.concatenate(pha[0]), np.concatenate(pha[1])))
+    out["qlast"] = np.concatenate(qla) if qla else np.empty(0)
     return out
 
 
@@ -3179,12 +3188,14 @@ def parse_args():
     ap.add_argument("--pixel-layout", default=None)
     ap.add_argument("--sim-properties", default=None)
     ap.add_argument("--edep-h5", default=None,
-                    help="dumpTree.py edep-sim HDF5; use its real 'segments' per "
-                         "event instead of the parametric shower generator")
+                    help="dumpTree edep-sim HDF5, OR a larnd-sim output .hdf5 that carries its "
+                         "input 'segments' through (re-runs those same showers through the "
+                         "sweep). May be one file, a glob, or a directory; matches are read in "
+                         "sorted order as one event list. Used instead of the parametric generator.")
     ap.add_argument("--edep-offset", type=int, default=0,
-                    help="skip this many events at the start of --edep-h5 before taking --n-events, "
-                         "so a job array can process disjoint slices of one edep file (task k -> "
-                         "events [k*N:(k+1)*N]).")
+                    help="skip this many events at the start of --edep-h5 (across the whole "
+                         "glob/dir, file-ordered) before taking --n-events, so a job array can "
+                         "process disjoint slices (task k -> events [k*N:(k+1)*N]).")
     ap.add_argument("--merge-grids", nargs="+", default=None,
                     help="MERGE mode (no GPU): combine several ti_mult_grid.npz partials from a split "
                          "run into one full-stats grid in --outdir, then plot. Concatenates each "
@@ -3403,35 +3414,85 @@ def resolve_config(args):
     return args
 
 
+# A dumpTree edep file stores the deposits as `segments`; a larnd-sim OUTPUT file
+# carries the very same input `segments` through alongside its packets (older tags
+# name it `tracks`, and some dumpTree variants nest it under `mc_truth/`). Trying all
+# three lets this loader re-use mkramer's larnd-sim output directly -- i.e. re-run his
+# own showers through the threshold/reset sweep without regenerating any upstream sim.
+_EDEP_SEG_KEYS = ("segments", "mc_truth/segments", "tracks")
+
+
+def _edep_seg_dataset(f):
+    for k in _EDEP_SEG_KEYS:
+        if k in f:
+            return f[k]
+    raise KeyError(
+        f"{f.filename}: no segments dataset (looked for {_EDEP_SEG_KEYS}); "
+        f"top-level keys present: {list(f.keys())}. Pass a dumpTree edep-sim HDF5 "
+        f"or a larnd-sim output .hdf5 that carries its input segments.")
+
+
 def load_edep_events(path, max_events=None, offset=0):
-    """Real edep-sim showers: per-event `tracks` arrays from a dumpTree HDF5.
+    """Real edep-sim showers: per-event deposit arrays from a dumpTree edep HDF5 OR a
+    larnd-sim OUTPUT HDF5 (which carries the same input `segments` through).
 
-    `offset` skips that many leading events before taking `max_events`, so a job array can process
-    disjoint slices of one edep file (task k -> events [k*N : (k+1)*N]).
+    `path` may be one file, a glob (``.../prc*_r*_patch_noDrop/*.hdf5``), or a directory;
+    matches are read in sorted order and concatenated into one global, file-ordered event
+    list. Each file numbers its events from 0, so events are keyed by (file, event_id) to
+    stay distinct across files.
 
-    dumpTree.py writes a `segments` dataset whose dtype is the SAME as this study's
-    SEGMENTS_DTYPE (both copy cli/dumpTree.py:segments_dtype), so each event's rows
-    drop straight into the quench->drift->induction->FEE pipeline in place of
-    build_shower_event(). Rows are grouped by `event_id`; shared fields are copied
-    so the loader is robust to minor dtype differences between larnd-sim versions.
+    `offset` skips that many leading events of that global list before taking `max_events`,
+    so a job array processes disjoint slices (task k -> events [k*N : (k+1)*N]) whether the
+    sample is one big file or a directory of per-run files. To keep a directory slice cheap,
+    only the `event_id` column is scanned up front; full rows are read back only from the
+    files that actually hold the requested slice.
+
+    Segment dtype matches this study's SEGMENTS_DTYPE (both copy cli/dumpTree.py); shared
+    fields are copied per event so the loader is robust to minor dtype differences between
+    larnd-sim versions. Rows feed quench->drift->induction->FEE in place of build_shower_event().
     """
-    import h5py
-    with h5py.File(path, "r") as f:
-        seg = f["segments"][:]
-    shared = [n for n in seg.dtype.names if n in vd.SEGMENTS_DTYPE.names]
-    ev_ids = np.unique(seg["event_id"])
+    import glob as _glob, os, h5py
+    if isinstance(path, (list, tuple)):
+        paths = list(path)
+    elif any(c in str(path) for c in "*?["):
+        paths = sorted(_glob.glob(path))
+    elif os.path.isdir(path):
+        paths = sorted(_glob.glob(os.path.join(path, "*.h5")) +
+                       _glob.glob(os.path.join(path, "*.hdf5")))
+    else:
+        paths = [path]
+    if not paths:
+        raise FileNotFoundError(f"--edep-h5 matched no files: {path}")
+
+    index = []  # global, file-ordered (file_idx, event_id)
+    for fi, p in enumerate(paths):
+        with h5py.File(p, "r") as f:
+            eids = np.unique(np.asarray(_edep_seg_dataset(f).fields("event_id")[:]))
+        index.extend((fi, e) for e in eids)
     if offset:
-        ev_ids = ev_ids[int(offset):]
+        index = index[int(offset):]
     if max_events:
-        ev_ids = ev_ids[:max_events]
-    events = []
-    for eid in ev_ids:
-        rows = seg[seg["event_id"] == eid]
-        tr = vd.blank_tracks(len(rows))
-        for name in shared:
-            tr[name] = rows[name]
-        events.append(tr)
-    return events
+        index = index[:int(max_events)]
+    if not index:
+        return []
+
+    want = {}
+    for fi, e in index:
+        want.setdefault(fi, set()).add(e)
+    cache = {}
+    for fi, eset in want.items():
+        with h5py.File(paths[fi], "r") as f:
+            seg = _edep_seg_dataset(f)[:]
+        shared = [n for n in seg.dtype.names if n in vd.SEGMENTS_DTYPE.names]
+        byid = {}
+        for e in eset:
+            rows = seg[seg["event_id"] == e]
+            tr = vd.blank_tracks(len(rows))
+            for name in shared:
+                tr[name] = rows[name]
+            byid[e] = tr
+        cache[fi] = byid
+    return [cache[fi][e] for fi, e in index]
 
 
 _POS_FIELDS = (("x", "x_start", "x_end"), ("y", "y_start", "y_end"), ("z", "z_start", "z_end"))
@@ -3792,7 +3853,8 @@ def aggregate_multiplicity_grid(ctx, evs, thresholds, resets, seed0, checkpoint=
     fired pixel -- from which the analysis slices 1-hit / 2-hit / 3+-hit / all-multiplicity charge
     distributions. Returns [(thr, cycles, q, tr, n_hits, perhit_q, perhit_n), ...], where q/tr/n_hits
     are per-PIXEL (q summed over the pixel's hits) and perhit_q/perhit_n are per-HIT (one entry per
-    ADC sample, tagged with its pixel's multiplicity).
+    ADC sample, tagged with its pixel's multiplicity). qlast (8th slot) is per-PIXEL last-hit Q,
+    aligned with q/tr/n_hits.
 
     `checkpoint`=(path, meta): if given, write the partial grid after every completed reset row,
     so a wall-clock kill (or a cancel) keeps the finished nodes instead of losing everything."""
@@ -3801,10 +3863,11 @@ def aggregate_multiplicity_grid(ctx, evs, thresholds, resets, seed0, checkpoint=
     for ir, rst in enumerate(rst_arr):
         for it, thr in enumerate(thr_arr):
             res = aggregate_hits(ctx, evs, thr, rst, 1.0, seed0=seed0 + ir * 1000 + it)
-            q, tr, n = res["all"]; phq, phn = res["perhit"]
+            q, tr, n = res["all"]; phq, phn = res["perhit"]; ql = res.get("qlast", np.empty(0))
             q = np.asarray(q, float); n = np.asarray(n, np.int16)
             out.append((thr, rst, q, np.asarray(tr, bool), n,
-                        np.asarray(phq, float), np.asarray(phn, np.int16)))
+                        np.asarray(phq, float), np.asarray(phn, np.int16),
+                        np.asarray(ql, float)))
             print(f"    thr={thr:.0f} rst={rst:>5d}: {q.size} fired  "
                   f"(1h={int((n==1).sum())} 2h={int((n==2).sum())} 3+={int((n>=3).sum())})",
                   flush=True)
@@ -3897,6 +3960,7 @@ def save_mult_grid(spectra, path):
     kw["node_n"] = _obj_array([g[4] for g in grid])
     kw["node_phq"] = _obj_array([g[5] if len(g) > 5 else np.empty(0) for g in grid])       # per-hit Q
     kw["node_phn"] = _obj_array([g[6] if len(g) > 6 else np.empty(0, np.int16) for g in grid])
+    kw["node_ql"] = _obj_array([g[7] if len(g) > 7 else np.empty(0) for g in grid])        # per-pixel last-hit Q
     np.savez(path, **kw)
     print(f"  wrote multiplicity grid ({len(grid)} nodes) to {path}")
 
@@ -3908,10 +3972,12 @@ def load_mult_grid(path):
             for k in d.files if k.startswith("meta_")}
     thr, rst = d["node_thr"], d["node_rst"]
     has_ph = "node_phq" in d.files                    # per-hit only in newer files
+    has_ql = "node_ql" in d.files                     # per-pixel last-hit Q (newer still)
     grid = [(float(thr[i]), int(rst[i]), np.asarray(d["node_q"][i], float),
              np.asarray(d["node_tr"][i], bool), np.asarray(d["node_n"][i], np.int16),
              np.asarray(d["node_phq"][i], float) if has_ph else np.empty(0),
-             np.asarray(d["node_phn"][i], np.int16) if has_ph else np.empty(0, np.int16))
+             np.asarray(d["node_phn"][i], np.int16) if has_ph else np.empty(0, np.int16),
+             np.asarray(d["node_ql"][i], float) if has_ql else np.empty(0))
             for i in range(len(thr))]
     return dict(meta=meta, mult_grid=grid)
 
@@ -3929,19 +3995,21 @@ def merge_mult_grids(paths):
         for g in gd["mult_grid"]:
             key = (float(g[0]), int(g[1]))
             if key not in acc:
-                acc[key] = [[], [], [], [], []]; order.append(key)
+                acc[key] = [[], [], [], [], [], []]; order.append(key)
             cols = acc[key]
             cols[0].append(np.asarray(g[2], float))
             cols[1].append(np.asarray(g[3], bool))
             cols[2].append(np.asarray(g[4], np.int16))
             cols[3].append(np.asarray(g[5] if len(g) > 5 else np.empty(0), float))
             cols[4].append(np.asarray(g[6] if len(g) > 6 else np.empty(0), np.int16))
+            cols[5].append(np.asarray(g[7] if len(g) > 7 else np.empty(0), float))
     merged = [(k[0], k[1],
                np.concatenate(acc[k][0]) if acc[k][0] else np.empty(0),
                np.concatenate(acc[k][1]) if acc[k][1] else np.empty(0, bool),
                np.concatenate(acc[k][2]) if acc[k][2] else np.empty(0, np.int16),
                np.concatenate(acc[k][3]) if acc[k][3] else np.empty(0),
-               np.concatenate(acc[k][4]) if acc[k][4] else np.empty(0, np.int16))
+               np.concatenate(acc[k][4]) if acc[k][4] else np.empty(0, np.int16),
+               np.concatenate(acc[k][5]) if acc[k][5] else np.empty(0))
               for k in order]
     meta = dict(parts[0]["meta"]); meta["n_shower"] = nsh_total
     print(f"  merged {len(parts)} partials -> {nsh_total} showers, {len(merged)} nodes")
@@ -4053,6 +4121,7 @@ def analyze_mult_grid(spectra, outdir):
 
     analyze_multiplicity_spectrum(spectra, outdir)     # n_hits distribution vs threshold x reset
     analyze_shoulder_split(spectra, outdir)            # per-hit Q split: single- vs multi-hit pixels
+    analyze_mult_grid_kramer(spectra, outdir)          # fsdcube_hitq_datamc-style overlays (single/shower norm)
 
 
 def analyze_multiplicity_spectrum(spectra, outdir):
@@ -4157,6 +4226,118 @@ def analyze_shoulder_split(spectra, outdir):
         rt = "off" if rst < 0 else f"{rst} cyc"; rtag = "off" if rst < 0 else f"{rst}cyc"
         f.suptitle(f"FSD Cube {samp} — per-hit Q, single- vs multi-hit pixels (reset {rt})", fontsize=12)
         f.tight_layout(); _savefig(f, f"{outdir}/shoulder_qsplit_{rtag}.png")
+
+
+def analyze_mult_grid_kramer(spectra, outdir):
+    """Re-emit the (threshold x reset) FEE re-sweep in the STYLE of tests/fsdcube_hitq_datamc.py (the
+    'kramer' data/MC plots), so you can read straight off those plots how they would move at a different
+    DISCRIMINATION_THRESHOLD or PERIODIC_RESET -- with no re-simulation, because the FEE was already
+    swept on ONE cached pre-FEE current set. Same six observables: per-hit Q split into single- / two- /
+    3+- / all-hit pixels, the per-pixel hit-multiplicity distribution (axis to 20, no overflow), and the
+    per-pixel LAST-hit Q. Here each curve is a GRID NODE, not a dataset: the NOMINAL detector (base
+    threshold, base reset) is the solid black 'data-like' curve and the alternatives are dashed
+    DUNE-palette curves. Two scans -- threshold (at the base reset) and periodic reset (at the base
+    threshold) -- each under the two kramer normalizations: 'single' divides each node by its own
+    single-hit-pixel count (so the n==1 curves coincide and any residual elsewhere is a SHAPE change,
+    not a rate change), 'shower' divides by the event count (entries per event). Last-hit Q needs the
+    newer capture; it is skipped with a note on older grids while the other five still plot (no re-run).
+    Writes <outdir>/kramer/<observable>_<scan>_<scheme>.png. Runs from ti_mult_grid.npz, so --refit re-plots."""
+    import matplotlib.pyplot as plt
+    m = spectra["meta"]; grid = spectra["mult_grid"]; nsh = max(int(m["n_shower"]), 1)
+    samp = str(m.get("sample", "showers")); ev = "muon" if samp.startswith("muon") else "shower"
+    base_thr = float(m["base_threshold"]); base_rst = int(m["base_reset"])
+    node = {(float(g[0]), int(g[1])): g for g in grid}
+    thr_vals = sorted(set(float(g[0]) for g in grid))
+    rst_vals = sorted(set(int(g[1]) for g in grid), key=lambda r: (np.inf if r < 0 else r), reverse=True)
+    has_ph = any(len(g) > 6 and np.asarray(g[5]).size for g in grid)
+    has_ql = any(len(g) > 7 and np.asarray(g[7]).size for g in grid)
+    if not has_ph:
+        print("  (kramer overlays skipped: grid has no per-hit data -- re-run to capture it)")
+        return
+
+    DUNE = ["#000000", "#D55E00", "#56B4E9", "#E69F00", "#009E73", "#CC79A7", "#0072B2", "#F0E442"]
+    MCCOL = DUNE[1:]; GRID_C = "#b2b2b2"
+    QB = np.linspace(0, 50, 51); QC = 0.5 * (QB[1:] + QB[:-1])            # 50 bins, 0-50 ke- (kramer axis)
+    MM = 20; MB = np.arange(0.5, MM + 1.5); MCTR = np.arange(1, MM + 1)  # mult axis -> 20, no overflow
+    kdir = os.path.join(outdir, "kramer"); os.makedirs(kdir, exist_ok=True)
+
+    nsingle = lambda g: max(int((np.asarray(g[4], np.int16) == 1).sum()), 1)
+    wnode = lambda scheme, g: (1.0 / nsingle(g)) if scheme == "single" else (1.0 / nsh)
+    YL = {"single": "Entries / single-hit pixel", "shower": f"Entries / {ev}"}
+    NOTE = {"single": "norm: same # single-hit pixels", "shower": f"norm: per {ev}"}
+
+    def ph(g, which):                                   # per-hit Q [ke-] for a multiplicity slice
+        phq = np.asarray(g[5], float) / 1000.0; phn = np.asarray(g[6], np.int16)
+        if phq.size == 0:
+            return None
+        return (phq[phn == 1] if which == 1 else phq[phn == 2] if which == 2
+                else phq[phn >= 3] if which == 3 else phq)
+    pixmult = lambda g: np.asarray(g[4], np.int16).astype(float)         # n_hits>20 falls outside MB -> dropped
+    lasthit = lambda g: (np.asarray(g[7], float) / 1000.0
+                         if (len(g) > 7 and np.asarray(g[7]).size) else None)
+
+    OBS = [("hitq_split_mult1",     lambda g: ph(g, 1), QB, QC, R"Hit Q [ke$^-$]",
+            "single-hit pixels (n = 1)", (0, 50), None),
+           ("hitq_split_mult2",     lambda g: ph(g, 2), QB, QC, R"Hit Q [ke$^-$]",
+            "two-hit pixels (n = 2)", (0, 50), None),
+           ("hitq_split_mult3plus", lambda g: ph(g, 3), QB, QC, R"Hit Q [ke$^-$]",
+            "3+-hit pixels (n >= 3)", (0, 50), None),
+           ("hitq_split_multAll",   lambda g: ph(g, 0), QB, QC, R"Hit Q [ke$^-$]",
+            "all hits", (0, 50), None),
+           ("hitq_pixmult",         pixmult, MB, MCTR, "pixel hit multiplicity",
+            "pixel hit-multiplicity", (0.5, MM + 0.5), list(range(1, MM + 1)))]
+    if has_ql:
+        OBS.append(("hitq_lasthit", lasthit, QB, QC, R"last-hit Q [ke$^-$]",
+                    "per-pixel last-hit charge", (0, 50), None))
+    else:
+        print("  (kramer last-hit-Q skipped: grid predates the last-hit capture -- re-run to add it)")
+
+    # reference row/col: the nominal node if it is in the grid, else a sensible fallback so each scan
+    # still draws (longest-interval reset / middle threshold); 'nominal' black curve only when it matches.
+    ref_rst = base_rst if base_rst in rst_vals else (rst_vals[0] if rst_vals else base_rst)
+    ref_thr = base_thr if base_thr in thr_vals else (thr_vals[len(thr_vals) // 2] if thr_vals else base_thr)
+    base_key = (base_thr, base_rst)
+    thr_items = [((t, ref_rst), f"{t/1000:.2f} ke$^-$", (t, ref_rst) == base_key)
+                 for t in thr_vals if (t, ref_rst) in node]
+    rst_items = [((ref_thr, r), ("reset off" if r < 0 else f"{r} cyc"), (ref_thr, r) == base_key)
+                 for r in rst_vals if (ref_thr, r) in node]
+    SCANS = [("vsThr", thr_items,
+              f"vs threshold (reset {'off' if ref_rst < 0 else f'{ref_rst} cyc'})"),
+             ("vsReset", rst_items,
+              f"vs periodic reset (threshold {ref_thr/1000:.2f} ke$^-$)")]
+
+    def plot(items, scheme, vals_of, bins, ctr, xlabel, obs_title, xlim, xticks, scan_title, outpath):
+        f, ax = plt.subplots(figsize=(7.4, 4.8))
+        ci = 0
+        for key, lab, is_base in items:
+            v = vals_of(node[key])
+            if v is None:
+                continue
+            h, _ = np.histogram(v, bins=bins); y = h.astype(float) * wnode(scheme, node[key])
+            if is_base:
+                ax.step(ctr, y, where="mid", color="#000000", ls="-", lw=2.1, zorder=5,
+                        label=lab + "  (nominal)")
+            else:
+                ax.step(ctr, y, where="mid", color=MCCOL[ci % len(MCCOL)], ls="--", lw=1.7, label=lab)
+                ci += 1
+        ax.set_xlim(*xlim); ax.set_xlabel(xlabel); ax.set_ylabel(YL[scheme])
+        if xticks is not None:
+            ax.set_xticks(xticks)
+        ax.grid(alpha=.5, color=GRID_C, lw=0.6); ax.legend(fontsize=8)
+        f.suptitle(f"FSD Cube {samp} — {obs_title} — {scan_title}  [{NOTE[scheme]}]", fontsize=12)
+        f.tight_layout(); _savefig(f, outpath)
+
+    n_written = 0
+    for scan_tag, items, scan_title in SCANS:
+        if not items:
+            continue
+        for scheme in ("single", "shower"):
+            for obs_name, vals_of, bins, ctr, xlabel, obs_title, xlim, xticks in OBS:
+                plot(items, scheme, vals_of, bins, ctr, xlabel, obs_title, xlim, xticks,
+                     scan_title, f"{kdir}/{obs_name}_{scan_tag}_{scheme}.png")
+                n_written += 1
+    print(f"  wrote {n_written} kramer-style overlays to {kdir}/ "
+          f"(single + shower norm, {'with' if has_ql else 'no'} last-hit Q)")
 
 
 def produce_burst_only(ctx, args):
