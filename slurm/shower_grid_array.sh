@@ -36,8 +36,11 @@
 #SBATCH -o grid_part_%A_%a.log
 
 NSLICE="${NSLICE:-250}"
-THRESHOLDS="2500 3750 5000 6250 7500"
-RESETS="-1 1024 512 256 128 64"
+THRESHOLDS="${THRESHOLDS:-2500 3750 5000 6250 7500}"
+RESETS="${RESETS:--1 1024 512 256 128 64}"
+# OUTBASE lets an orchestrator point each run (e.g. per-prc) at its own grid dir; parts land in
+# $OUTBASE/part_<k> and merge_grids.sh (OUT=$OUTBASE) collapses them to $OUTBASE/ti_mult_grid.npz.
+OUTBASE="${OUTBASE:-$ND_WORK/tistudy_grid_full}"
 
 source ~/dune_sim.sh
 nd_conda
@@ -54,7 +57,7 @@ RECENTER="${RECENTER:-1}"
 [ "$RECENTER" = "0" ] && RECENTER_FLAG="" || RECENTER_FLAG="--recenter-showers"
 k="$SLURM_ARRAY_TASK_ID"
 OFFSET=$(( k * NSLICE ))
-OUT="$ND_WORK/tistudy_grid_full/part_${k}"
+OUT="$OUTBASE/part_${k}"
 mkdir -p "$OUT"
 echo "task $k: edep=$EDEP  recenter=$RECENTER  slice=[${OFFSET}:$(( OFFSET + NSLICE ))]  out=$OUT"
 
