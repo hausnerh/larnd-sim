@@ -466,6 +466,23 @@ def event_drift(ctx, tracks):
     if float(np.sum(drifted["n_electrons"])) <= 0:
         return None
     neigh, radius = vd.find_pixels(ctx, drifted)
+    # Real showers are far larger than this little cube, so many deposits land OUTSIDE the
+    # pixel plane: every neighbour of such a deposit comes back -1 and is dropped in
+    # sum_to_pixels -- but only AFTER induce_current has already allocated a full
+    # (n_neigh x n_ticks) signal + xoroshiro-RNG-state block for it. A thousand-segment
+    # shower with ~2/3 of its deposits out of volume then OOMs the GPU on the RNG alloc.
+    # Dropping the deposits that touch NO valid pixel is EXACT -- they contribute to no
+    # unique_pix and can be no collection pixel, so every downstream output is unchanged --
+    # and it bounds the induction allocation to the in-volume segment count. Fully
+    # contained events (parametric showers, muons) keep every segment, so this is a no-op
+    # there.
+    import cupy as cp
+    keep = cp.asnumpy((neigh != -1).any(axis=1))
+    if not keep.all():
+        if not keep.any():
+            return None
+        km = cp.asarray(keep)
+        drifted, neigh, radius = drifted[keep], neigh[km], radius[km]
     return drifted, neigh, radius
 
 

@@ -45,7 +45,15 @@ OUTBASE="${OUTBASE:-$ND_WORK/tistudy_grid_full}"
 source ~/dune_sim.sh
 nd_conda
 cd "$ND_SRC"
-GIT_TERMINAL_PROMPT=0 git pull --ff-only 2>&1 || echo "note: git pull skipped/failed -- running current checkout"
+# Name the branch explicitly: a bare `git pull --ff-only` here fails with "Cannot
+# fast-forward to multiple branches" and leaves a STALE checkout running silently.
+BR="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo HEAD)"
+if GIT_TERMINAL_PROMPT=0 git pull --ff-only origin "$BR" 2>&1; then
+  echo "run tree updated to $(git rev-parse --short HEAD) ($BR)"
+else
+  echo "!! git pull failed -- RUNNING STALE CHECKOUT $(git rev-parse --short HEAD) ($BR)."
+  echo "!! update $ND_SRC by hand (git fetch && git checkout $BR && git pull) and resubmit."
+fi
 
 EDEP="${EDEP:-$ND_WORK/fsdcube_induction.EDEPSIM.h5}"
 # EDEP may be a file, a glob, or a directory (Python-side expansion); accept any that resolves.
@@ -61,9 +69,17 @@ OUT="$OUTBASE/part_${k}"
 mkdir -p "$OUT"
 echo "task $k: edep=$EDEP  recenter=$RECENTER  slice=[${OFFSET}:$(( OFFSET + NSLICE ))]  out=$OUT"
 
-python -u tests/threshold_induction_study.py --config fsd_cube --mult-grid \
-  --edep-h5 "$EDEP" $RECENTER_FLAG --edep-offset "$OFFSET" --n-events "$NSLICE" \
-  --seed $(( 12345 + k )) --outdir "$OUT" \
-  --thresholds $THRESHOLDS --resets $RESETS
-
-echo "PART $k DONE -> $OUT/ti_mult_grid.npz"
+# A crash here MUST fail the task: this array feeds an `afterok` merge, and a merge that
+# fires on a missing/partial part silently produces a wrong grid. So gate the "DONE" on
+# BOTH a zero python exit AND a non-empty grid file, and propagate the failure otherwise.
+if python -u tests/threshold_induction_study.py --config fsd_cube --mult-grid \
+     --edep-h5 "$EDEP" $RECENTER_FLAG --edep-offset "$OFFSET" --n-events "$NSLICE" \
+     --seed $(( 12345 + k )) --outdir "$OUT" \
+     --thresholds $THRESHOLDS --resets $RESETS; then
+  [ -s "$OUT/ti_mult_grid.npz" ] || { echo "!! PART $k: python exited 0 but no $OUT/ti_mult_grid.npz" >&2; exit 2; }
+  echo "PART $k DONE -> $OUT/ti_mult_grid.npz"
+else
+  rc=$?
+  echo "!! PART $k FAILED (python exit $rc) -- no grid written; downstream merge will NOT run" >&2
+  exit "$rc"
+fi
