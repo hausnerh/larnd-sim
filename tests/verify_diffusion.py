@@ -510,6 +510,81 @@ def sum_to_pixels(ctx, signals, neigh, radius, tracks):
             num_backtrack, offset_backtrack)
 
 
+def induce_and_sum_chunked(ctx, drifted, neigh, radius, seed, mem_budget_gb=None):
+    """Induce current + sum to pixels in SEGMENT CHUNKS so peak GPU memory is bounded by
+    one chunk, not by the whole shower.
+
+    The single-batch induce_current allocates (n_seg x n_neigh x n_ticks) for the signals
+    AND an xoroshiro RNG-state array ~4x that, in one shot. Real edep showers have thousands
+    of segments, so that one allocation OOMs the GPU (this is the CUDA_ERROR_OUT_OF_MEMORY
+    in create_xoroshiro128p_states). Production larnd-sim avoids it by batching; this is the
+    same idea for the study's single-event path.
+
+    It is EXACT up to the RNG realisation: induced current is independent per (segment, pad,
+    tick), and sum_pixel_signals atomically ADDS each contribution onto an ABSOLUTE time grid
+    (column = track_t0[seg] + tick). So summing a subset of segments into one shared global
+    pixel buffer, chunk after chunk, yields the same pixels_signals as one batch -- provided
+    every chunk uses the SAME global window n_ticks and the SAME global grid length nt0, which
+    is why both are computed once from the full event here. Each chunk draws an independent RNG
+    stream (seed + chunk-offset), so the diffusion noise is a different draw than a single
+    batch would give, but the distribution -- hence every physics result -- is unchanged.
+
+    Backtracking is dropped (as event_induce does): a width-1 all-(-1) track_pixel_map makes
+    sum_pixel_signals' per-pixel track loop break immediately, so only pixels_signals is filled
+    and the large pixels_tracks_signals array is never allocated.
+
+    Returns (unique_pix_host, pixels_signals_host_f32, net_sp_host) or None if the event hits
+    no pixel. net_sp = signals.sum(axis=2) per (segment, pad), gathered chunk by chunk (it is
+    tiny: the tick axis is summed away) so the collection-truth backtrack can be rebuilt without
+    ever holding the full signals array.
+    """
+    import cupy as cp, os
+    det, detsim = ctx.detector, ctx.detsim
+    nseg = int(drifted.shape[0])
+    if nseg == 0:
+        return None
+    nt = natural_window_ticks(ctx, drifted)                     # GLOBAL window, computed once
+    unique_pix = cp.unique(neigh.reshape(-1))
+    unique_pix = unique_pix[unique_pix != -1].astype(cp.int32)
+    if unique_pix.shape[0] == 0:
+        return None
+    npix = int(unique_pix.shape[0])
+    nt0 = nt + ceil(float(np.max(drifted["t0"])) / det.TIME_SAMPLING)   # GLOBAL grid length
+    pixels_signals = cp.zeros((npix, nt0))
+    max_pix_val = int(cp.max(unique_pix)) + 1
+    lookup = cp.full((max_pix_val,), -1, dtype=cp.int32)
+    lookup[unique_pix] = cp.arange(npix, dtype=cp.int32)
+    # dropped backtracking: width-1 all-(-1) map -> the kernel's track loop breaks at once.
+    tpm = cp.full((npix, 1), -1, dtype=cp.int32)
+    nbk = cp.zeros(npix, dtype=cp.int64)
+    obk = cp.zeros(npix, dtype=cp.int64)
+    pts = cp.zeros(1)
+    ovf = cp.zeros(1)
+    if mem_budget_gb is None:
+        mem_budget_gb = float(os.environ.get("TI_INDUCE_MEM_GB", "4"))
+    # ~bytes held per segment in a chunk: signals (f4) + xoroshiro states (16 B) over its
+    # (n_neigh x n_ticks) grid; 20 B/elem is the signals+RNG sum.
+    per_seg = max(int(neigh.shape[1]) * int(nt) * 20, 1)
+    chunk = max(int(mem_budget_gb * (1024 ** 3) / per_seg), 64)
+    nets = []
+    for lo in range(0, nseg, chunk):
+        hi = min(lo + chunk, nseg)
+        sig = induce_current(ctx, drifted[lo:hi], neigh[lo:hi], seed=seed + lo, n_ticks=nt)
+        nets.append(cp.asnumpy(sig.sum(axis=2)))
+        pim = lookup[neigh[lo:hi]]
+        pim[neigh[lo:hi] == -1] = -1
+        track_t0 = cp.array(drifted["t0"][lo:hi] / det.TIME_SAMPLING, dtype=int)
+        tpb = (1, 1, 64)
+        bpg = (max(ceil(sig.shape[0] / tpb[0]), 1),
+               max(ceil(sig.shape[1] / tpb[1]), 1),
+               max(ceil(sig.shape[2] / tpb[2]), 1))
+        detsim.sum_pixel_signals[bpg, tpb](
+            pixels_signals, sig, track_t0, pim, tpm, pts, nbk, obk, ovf)
+        del sig, pim, track_t0
+    net_sp = np.concatenate(nets, axis=0) if nets else np.zeros((0, int(neigh.shape[1])))
+    return to_host(unique_pix), to_host(pixels_signals).astype(np.float32), net_sp
+
+
 def run_fee(ctx, pixels_signals, pixels_tracks_signals, num_backtrack,
             offset_backtrack, max_signal_time, seed=777):
     """get_adc_values + digitize -> (adc_list, adc_ticks) host arrays.

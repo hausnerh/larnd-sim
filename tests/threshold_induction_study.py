@@ -383,9 +383,24 @@ def collection_pixels_from_signals(signals, neigh, f_collect):
     import cupy as cp
     net_sp = cp.asnumpy(signals.sum(axis=2))          # (nseg, max_neigh) net per (seg,pad)
     neigh_h = cp.asnumpy(neigh)
+    collect_ids, landed = collection_from_net(net_sp, neigh_h, f_collect)
+    return collect_ids, landed, net_sp, neigh_h
+
+
+def collection_from_net(net_sp, neigh_h, f_collect):
+    """The collection backtrack from the per-(segment, pad) NET current
+    net_sp = signals.sum(tick) and the neighbour-pixel map neigh_h.
+
+    Factored out of collection_pixels_from_signals so the chunked inducer -- which sums the
+    tick axis away chunk by chunk and never holds the full signals array -- can build the exact
+    same (collect_ids, landed) truth from the cheap per-chunk nets. Returns (collect_ids,
+    landed): landed[s, j] is True iff (segment s, pad j) collected a real positive fraction
+    (> f_collect) of segment s's most-collecting pad; collect_ids = the unique pixel ids landed on."""
+    if net_sp.size == 0:
+        return np.empty(0, neigh_h.dtype), np.zeros(neigh_h.shape, bool)
     seg_peak = np.maximum(net_sp.max(axis=1), 0.0)    # per-segment peak collected net
     landed = (neigh_h >= 0) & (net_sp > 0) & (net_sp > f_collect * seg_peak[:, None])
-    return np.unique(neigh_h[landed]), landed, net_sp, neigh_h
+    return np.unique(neigh_h[landed]), landed
 
 
 def collected_charge_truth(landed, net_sp, neigh_h, unique_pix, t_arrival, ts):
@@ -491,21 +506,22 @@ def event_induce(ctx, drifted, neigh, radius, seed, collect_frac=0.15):
 
     The only induction-scale-DEPENDENT stage (callers vary ctx.response between calls).
     `is_collection[ip]` is the per-pixel TRUTH label from a backtrack
-    (collection_pixels_from_signals): True if drifting charge landed on pixel ip (a
-    shower/collection hit), False if it only ever saw induced current from a neighbour.
+    (collection_from_net): True if drifting charge landed on pixel ip (a shower/collection
+    hit), False if it only ever saw induced current from a neighbour.
     `truth_e[ip]` (net integrated charge) is kept only for the diagnostic seed-check.
+
+    Induction + pixel-summing runs through vd.induce_and_sum_chunked, which batches the event's
+    segments so a big (thousand-segment) shower no longer OOMs the GPU on one giant signal+RNG
+    allocation. The result is identical up to the (per-chunk) RNG realisation; see that function.
     """
-    signals = vd.induce_current(ctx, drifted, neigh, seed=seed)
-    collect_ids, landed, net_sp, neigh_h = collection_pixels_from_signals(
-        signals, neigh, collect_frac)
-    summed = vd.sum_to_pixels(ctx, signals, neigh, radius, drifted)
-    unique_pix, pixels_signals = summed[0], summed[1]
-    if pixels_signals is None:
+    res = vd.induce_and_sum_chunked(ctx, drifted, neigh, radius, seed=seed)
+    if res is None:
         return None
+    uph, ps_host, net_sp = res
     ts = ctx.detector.TIME_SAMPLING
-    ps_host = vd.to_host(pixels_signals).astype(np.float32)
-    uph = vd.to_host(unique_pix)
     npix = ps_host.shape[0]
+    neigh_h = vd.to_host(neigh)
+    collect_ids, landed = collection_from_net(net_sp, neigh_h, collect_frac)
     # pixel rows of pixels_signals align 1:1 with unique_pix, so the backtrack set
     # maps straight onto a per-pixel boolean collection/induction label.
     is_collection = np.isin(uph, collect_ids)
@@ -3936,6 +3952,27 @@ def produce_mult_grid(ctx, args):
         print(f"\nGenerating {args.n_events} parametric showers (E={args.shower_energy:.0f} MeV)...")
         raw = [build_shower_event(ctx, rng, energy_mev=args.shower_energy, n_dep=args.n_dep)
                for _ in range(args.n_events)]
+    if args.edep_h5 and len(raw) == 0:
+        # A job-array tail slice can sit PAST the end of the edep sample (NARRAY*NSLICE >
+        # the event count), so it legitimately loads nothing. That must NOT hard-fail: the
+        # slice contributes zero showers, but the downstream afterok merge still needs every
+        # part to succeed. Write a valid EMPTY grid (0 showers, empty per-node arrays, which
+        # merge_mult_grids concatenates away) and return cleanly.
+        off = int(getattr(args, "edep_offset", 0) or 0)
+        print(f"  no events at edep offset {off} (sample exhausted) -- writing an EMPTY grid "
+              f"so the merge still runs, exiting cleanly.")
+        thr_grid = sorted(set(float(t) for t in args.thresholds))
+        rst_grid = sorted(set(int(r) for r in args.resets))
+        det_name, _g, det_path = vd.detector_identity(ctx)
+        meta = dict(base_threshold=base_thr, base_reset=base_reset, ts=ts, noise_e=noise_e,
+                    n_shower=0, thresholds=np.asarray(thr_grid, float),
+                    resets=np.asarray(rst_grid, int), detector_name=str(det_name),
+                    detector_path=str(det_path), edep=str(args.edep_h5 or "parametric"),
+                    sample=("muons" if muon_mode else "showers"))
+        grid = [(t, r, np.empty(0), np.empty(0, bool), np.empty(0, np.int16),
+                 np.empty(0), np.empty(0, np.int16), np.empty(0))
+                for r in rst_grid for t in thr_grid]
+        return dict(meta=meta, mult_grid=grid)
     print("Computing drift + pixel geometry (cached, once)...")
     drift = [d for d in (event_drift(ctx, r) for r in raw) if d is not None]
     n_eff = len(drift)
