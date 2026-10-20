@@ -10,7 +10,9 @@
 # h5flow dependency), builds per-pixel hit lists PER EVENT, and histograms the per-hit charge
 # Q (50 bins, 0-50 ke-) -- then overlays data vs sim for prc2 | prc16, and
 # ADDS the split the notebook was missing: all hits / single-hit-pixel hits /
-# multi-hit-pixel hits, to see which population carries the mid-Q shoulder.
+# multi-hit-pixel hits, to see which population carries the mid-Q shoulder. It also writes
+# hitq_dt.png -- the time between consecutive hits on a pixel (the --dt-field gap between a
+# multi-hit pad's successive hits), data vs MC, which probes the FEE reset/re-fire timing.
 #
 # --norm picks the normalization (one plot set per scheme, under <outdir>/<scheme>/):
 #   single  -- divide each dataset by its # single-hit pixels (m==1): every dataset then has
@@ -63,6 +65,8 @@ TILE_X0, TILE_Y0, TILE_Z0 = 48.0675, 133.92, 23.808     # TILE_CENTER
 NX, NY = 128, 80
 QBINS, QMIN, QMAX = 50, 0, 50                            # ke-
 CUTS = dict(adc_min=0.2e6, adc_max=0.5e6)               # event-level cut on charge/events 'ADC'
+DT_UNIT = "ticks"                                        # axis label for the time-between-hits plot
+                                                        # (the Δt of --dt-field; t_drift is in ticks)
 
 # DUNE official plot-style palette (Okabe-Ito variant, from dune-plot-style's dune.mplstyle):
 # black is data (solid); the rest are the MC colors (dashed), cycled if several MC series.
@@ -119,9 +123,10 @@ def thr_lookup(pid, thr_dense, default):
 
 
 def accumulate_q(files, adc_min, adc_max, max_events=None, verbose=True,
-                 thr_dense=None, thr_default=5.0):
+                 thr_dense=None, thr_default=5.0, t_field="t_drift"):
     """Loop FLOW files/events with plain h5py (follow the charge/events -> calib_prompt_hits
-    references), apply the ADC event cut, and return (q, n, m, qlast, nev, thr_hit, thr_pix):
+    references), apply the ADC event cut, and return
+    (q, n, m, qlast, nev, thr_hit, thr_pix, dt, dt_thr):
     q and n are PER-HIT (hit charge ke-, and the hit-multiplicity of that hit's pixel within its
     event, so any Q population is a slice -- n==1 single-hit, n==2 two-hit, all hits, ...); m and
     qlast are PER-PIXEL (one entry per fired pixel) -- m = how many hits that pixel saw, qlast = the
@@ -133,13 +138,20 @@ def accumulate_q(files, adc_min, adc_max, max_events=None, verbose=True,
     OWN discriminator threshold (ke-) looked up from thr_dense via pixel2id_abs -- the lever for
     the per-pixel-threshold binning. Empty when thr_dense is None.
 
+    dt is PER-HIT-PAIR: for every pixel hit more than once in an event, the `t_field` gap between
+    its consecutive hits (sorted in time) -- i.e. how long after one hit the same pad fires again.
+    One entry per adjacent pair, so an m-hit pixel contributes m-1 entries; single-hit pixels
+    contribute none. dt_thr (aligned 1:1 with dt) is that pixel's own threshold (ke-), so the
+    time-between-hits plot can be split by --thr-bins too; empty when thr_dense is None.
+
     Reference layout (standard ndlar_flow): charge/events/ref/charge/calib_prompt_hits/ref is
     (n_links, 2) with col0 = event index, col1 = hit index; .../ref_region[e] = (start, stop) slices
-    that ref array for event e; hits live in charge/calib_prompt_hits/data (fields z, y, Q)."""
+    that ref array for event e; hits live in charge/calib_prompt_hits/data (fields z, y, Q, t_drift)."""
     import h5py
     REFG = "charge/events/ref/charge/calib_prompt_hits"
     qacc, nacc, macc, lacc = [], [], [], []   # per-hit Q, per-hit mult, per-pixel mult, per-pixel last-hit Q
     thacc, tpacc = [], []                      # per-hit threshold, per-pixel threshold (ke-)
+    dtacc, dtthacc = [], []                     # per-pair Δt-between-hits, and that pair's pixel threshold
     do_thr = thr_dense is not None
     nev = 0                                    # # selected showers (events with hits) -> per-shower norm
     for fi, path in enumerate(files):
@@ -163,7 +175,7 @@ def accumulate_q(files, adc_min, adc_max, max_events=None, verbose=True,
                 hit_of_ref = np.asarray(h[f"{REFG}/ref"][:, 1])        # ref col1 = hit index
                 hd = h["charge/calib_prompt_hits/data"]
                 z_all = np.asarray(hd["z"]); y_all = np.asarray(hd["y"])
-                q_all = np.asarray(hd["Q"]); t_all = np.asarray(hd["t_drift"])
+                q_all = np.asarray(hd["Q"]); t_all = np.asarray(hd[t_field])
                 for e in idx:
                     st, sp = int(r_start[e]), int(r_stop[e])
                     if sp <= st:
@@ -178,9 +190,17 @@ def accumulate_q(files, adc_min, adc_max, max_events=None, verbose=True,
                     nacc.append(counts[inv].astype(np.int16))    # each HIT's pixel multiplicity
                     macc.append(counts.astype(np.int16))         # each PIXEL's multiplicity (one entry/pixel)
                     # charge of each pixel's LAST hit = the hit with the largest drift time in this event
-                    o = np.lexsort((t, pid)); pid_s, q_s = pid[o], q[o]   # sort by pixel, then time
+                    o = np.lexsort((t, pid)); pid_s, q_s, t_s = pid[o], q[o], t[o]   # sort by pixel, then time
                     last = np.ones(pid_s.size, bool); last[:-1] = pid_s[:-1] != pid_s[1:]
                     lacc.append(q_s[last])                       # one entry per pixel = its max-t hit's Q
+                    # time between consecutive hits on the SAME pixel: adjacent sorted pairs that
+                    # stay on one pixel (one entry per pair, so m-hit pixel -> m-1 gaps, all >= 0).
+                    if pid_s.size > 1:
+                        sm = pid_s[1:] == pid_s[:-1]
+                        if sm.any():
+                            dtacc.append((t_s[1:] - t_s[:-1])[sm])
+                            if do_thr:
+                                dtthacc.append(thr_lookup(pid_s[1:][sm], thr_dense, thr_default))
                     if do_thr:
                         # per-HIT threshold aligns with q (look up each hit's pixel); per-PIXEL
                         # threshold aligns with macc(counts) AND lacc -- both are in np.unique(pid)
@@ -195,7 +215,7 @@ def accumulate_q(files, adc_min, adc_max, max_events=None, verbose=True,
                   f"all={sum(a.size for a in qacc)}", flush=True)
     cat = lambda L, dt=float: np.concatenate(L) if L else np.zeros(0, dt)
     return (cat(qacc), cat(nacc, np.int16), cat(macc, np.int16), cat(lacc), nev,
-            cat(thacc), cat(tpacc))
+            cat(thacc), cat(tpacc), cat(dtacc), cat(dtthacc))
 
 
 def sim_files(sim_base, prc, r, var=""):
@@ -229,6 +249,14 @@ def main():
                          "density = area-normalized, shape only (default: all three)")
     ap.add_argument("--mult-max", type=int, default=20,
                     help="cap the pixel hit-multiplicity x-axis at this value (default 20)")
+    ap.add_argument("--dt-field", default="t_drift",
+                    help="calib_prompt_hits field used as a hit's time, for the time-between-hits "
+                         "plot (default t_drift)")
+    ap.add_argument("--dt-max", type=float, default=None,
+                    help="upper x-limit (same units as --dt-field) for the time-between-hits plot "
+                         "(default: auto = 99th percentile of all Δt, shared across data/MC/prc)")
+    ap.add_argument("--dt-bins", type=int, default=50,
+                    help="number of bins for the time-between-hits plot (default 50)")
     ap.add_argument("--grid", nargs="+", default=None,
                     help="overlay a FEE threshold/reset re-sweep (a ti_mult_grid.npz from "
                          "tests/threshold_induction_study.py --mult-grid) ON TOP of the data/MC curves, "
@@ -277,13 +305,26 @@ def main():
         print(f"\nprc{prc}: {len(df)} data files")
         print(" data:")
         store[(prc, "data")] = accumulate_q(df, args.adc_min, args.adc_max, args.max_events,
-                                            thr_dense=thr_dense, thr_default=thr_def or 5.0)
+                                            thr_dense=thr_dense, thr_default=thr_def or 5.0,
+                                            t_field=args.dt_field)
         for r in args.sim_r:
             scfg, sf = sim_files(args.sim_base, prc, r, args.sim_var)
             sf = cap(sf)
             print(f" sim r{r} ({scfg}): {len(sf)} files")
             store[(prc, "sim", r)] = accumulate_q(sf, args.adc_min, args.adc_max, args.max_events,
-                                                  thr_dense=thr_dense, thr_default=thr_def or 5.0)
+                                                  thr_dense=thr_dense, thr_default=thr_def or 5.0,
+                                                  t_field=args.dt_field)
+
+    # time-between-hits x-axis: shared across data/MC/prc so the curves are comparable. Auto =
+    # 99th percentile of ALL Δt (robust to a long tail), overridable with --dt-max.
+    _alldt = [store[k][7] for k in store if store[k][7].size]
+    _alldt = np.concatenate(_alldt) if _alldt else np.zeros(0)
+    dt_hi = float(args.dt_max) if args.dt_max else (float(np.percentile(_alldt, 99)) if _alldt.size else 10.0)
+    dt_hi = max(dt_hi, 1e-9)
+    dtbins = np.linspace(0.0, dt_hi, args.dt_bins + 1)
+    dtctr = 0.5 * (dtbins[1:] + dtbins[:-1])
+    print(f"\ntime-between-hits: field={args.dt_field}, {int(_alldt.size)} pairs total, "
+          f"x-axis [0, {dt_hi:.3g}] {DT_UNIT} in {args.dt_bins} bins")
 
     # one plotting series per prc: data (solid black) + each sim radius (dashed, distinct DUNE colour)
     def series(prc):
@@ -500,6 +541,31 @@ def main():
         plt.close(fig)
         print(f"wrote {sdir}/hitq_lasthit.png")
 
+        # ---- time between consecutive hits on a pixel -- data vs MC ----
+        # For every pixel hit more than once in an event, the Δt (in --dt-field units) between its
+        # adjacent-in-time hits: how long after one hit the same pad fires again. Only multi-hit
+        # pixels contribute, so it is empty when no pixel fires twice. No sweep overlay here -- the
+        # ti_mult_grid carries per-hit CHARGE but no per-hit TIME, so there is nothing to draw.
+        fig, axes = plt.subplots(1, len(args.prc), figsize=(6.4 * len(args.prc), 4.6),
+                                 squeeze=False, sharey=True)
+        for ax, prc in zip(axes[0], args.prc):
+            for lbl, col, ls, tup0 in series(prc):
+                tup = sub(tup0)
+                hh, _ = np.histogram(tup[7], bins=dtbins); hh = hh.astype(float)
+                # density -> fraction of hit pairs; single/shower -> the per-dataset scalar
+                w = (1.0 / hh.sum() if hh.sum() else 0.0) if scheme == "density" \
+                    else weight(scheme, tup, hh.sum())
+                ax.step(dtctr, hh * w, where="mid", ls=ls, color=col, lw=1.8, label=lbl)
+            ax.set_title(f"prc{prc}"); ax.set_xlabel(f"Δt between hits on a pixel [{DT_UNIT}]")
+            ax.set_ylabel("Fraction of hit pairs" if scheme == "density" else YLAB[scheme])
+            ax.set_xlim(dtbins[0], dtbins[-1])
+            ax.legend(fontsize=LEG_FS); ax.grid(alpha=.5, color=GRID_COLOR, lw=0.6)
+        fig.suptitle(f"FSDCube time between consecutive hits on a pixel -- data vs sim  "
+                     f"[{NOTE[scheme]}]{tnote}", fontsize=13)
+        fig.tight_layout(); fig.savefig(f"{sdir}/hitq_dt.png", dpi=120)
+        plt.close(fig)
+        print(f"wrote {sdir}/hitq_dt.png")
+
     # ---- per-pixel-threshold bins (optional): 1-ke- windows centered on the scan values + under/over.
     # `sub` masks a dataset tuple to the pixels whose OWN threshold falls in [lo,hi): per-hit arrays
     # (q,n,thr_hit) by thr_hit[tup[5]], per-pixel arrays (m,qlast,thr_pix) by thr_pix[tup[6]]; nev (the
@@ -545,8 +611,10 @@ def main():
         def sub(tup):
             hm = (tup[5] >= lo) & (tup[5] < hi) if tup[5].size else np.zeros(tup[0].shape, bool)
             pm = (tup[6] >= lo) & (tup[6] < hi) if tup[6].size else np.zeros(tup[2].shape, bool)
+            dm = (tup[8] >= lo) & (tup[8] < hi) if tup[8].size else np.zeros(tup[7].shape, bool)
             return (tup[0][hm], tup[1][hm], tup[2][pm], tup[3][pm], tup[4],
-                    tup[5][hm] if tup[5].size else tup[5], tup[6][pm] if tup[6].size else tup[6])
+                    tup[5][hm] if tup[5].size else tup[5], tup[6][pm] if tup[6].size else tup[6],
+                    tup[7][dm], tup[8][dm] if tup[8].size else tup[8])
         return sub
 
     for scheme in args.norm:

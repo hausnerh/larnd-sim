@@ -28,6 +28,7 @@
 #   NORM        plot norm scheme(s)                                   (default "single shower density")
 #   THRBINS     1 = also make the per-pixel-threshold-binned plots    (default 0)
 #   SIM_R       MC readout radii to draw as dashed curves in plots    (default "3 4")
+#   DT_MAX/DT_BINS/DT_FIELD  time-between-hits (hitq_dt.png) axis knobs (default: auto/50/t_drift)
 #   PLOT_OUT    where the plots land                                  (default $OUTROOT/plots)
 #   PLOT_ENV_CMD env activation for the plot job if `nd_conda` lacks h5py (e.g. 'conda activate larnd')
 #   DRYRUN      1 = print the chain instead of submitting
@@ -96,6 +97,9 @@ done
 export PRCS SIM_R NORM THRBINS PLOT_OUT
 [ -n "${PLOT_ENV_CMD:-}" ] && export PLOT_ENV_CMD || true
 [ -n "${PLOT_EXTRA:-}" ] && export PLOT_EXTRA || true
+[ -n "${DT_MAX:-}" ] && export DT_MAX || true
+[ -n "${DT_BINS:-}" ] && export DT_BINS || true
+[ -n "${DT_FIELD:-}" ] && export DT_FIELD || true
 PLOT=$(submit "plot" --export=ALL -J datamc_plot -o "$LOGDIR/datamc_plot_%j.log" \
        --dependency="afterok:$MERGE_DEPS" "$HERE/datamc_plot.sh" "${GRID_TOKENS[@]}")
 echo "-- plot=$PLOT (afterok:$MERGE_DEPS)  ->  $PLOT_OUT"

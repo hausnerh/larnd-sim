@@ -12,6 +12,10 @@
 # The per-prc 'prc=path' grid tokens are the POSITIONAL args ($@) -> --grid.
 # fsdcube_hitq_datamc.py needs h5py; if `nd_conda` lacks it, set PLOT_ENV_CMD to the
 # activation that has it, e.g. PLOT_ENV_CMD='conda activate larnd'.
+#
+# Produces, per prc and norm scheme: the split Hit-Q plots, pixel hit-multiplicity,
+# per-pixel last-hit Q, AND the time-between-hits plot (hitq_dt.png = Δt between a pixel's
+# consecutive hits). Tune the Δt axis with DT_MAX / DT_BINS / DT_FIELD (all optional).
 # =============================================================================
 #SBATCH -A dune
 #SBATCH -C cpu
@@ -31,6 +35,12 @@ NORM="${NORM:-single shower density}"
 PLOT_OUT="${PLOT_OUT:-$ND_WORK/datamc_plots}"
 [ "${THRBINS:-0}" = "1" ] && THRBINS_FLAG="--thr-bins" || THRBINS_FLAG=""
 
+# optional time-between-hits axis knobs (hitq_dt.png); unset -> the script's own defaults
+DT_FLAG=""
+[ -n "${DT_FIELD:-}" ] && DT_FLAG="$DT_FLAG --dt-field $DT_FIELD"
+[ -n "${DT_MAX:-}" ]   && DT_FLAG="$DT_FLAG --dt-max $DT_MAX"
+[ -n "${DT_BINS:-}" ]  && DT_FLAG="$DT_FLAG --dt-bins $DT_BINS"
+
 if [ "$#" -eq 0 ]; then
   echo "!! no 'prc=path' grid tokens given as positional args -- plotting data/MC with NO sweep overlay"
   GRID_FLAG=""
@@ -40,8 +50,9 @@ fi
 
 echo "plotting: prc=[$PRCS] sim-r=[$SIM_R] norm=[$NORM] thrbins=${THRBINS:-0} out=$PLOT_OUT"
 echo "  grids: $*"
+echo "  dt-knobs:${DT_FLAG:- (defaults)}"
 python tests/fsdcube_hitq_datamc.py \
-  --prc $PRCS --sim-r $SIM_R --norm $NORM $THRBINS_FLAG $GRID_FLAG \
+  --prc $PRCS --sim-r $SIM_R --norm $NORM $THRBINS_FLAG $GRID_FLAG $DT_FLAG \
   --outdir "$PLOT_OUT" $PLOT_EXTRA
 
 echo "PLOTS -> $PLOT_OUT"
