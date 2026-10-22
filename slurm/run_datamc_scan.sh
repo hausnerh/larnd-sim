@@ -9,7 +9,7 @@
 #                    sweep on the real data / mkramer-MC kramer curves.
 #
 # Run it on a LOGIN NODE (it only submits; the work runs in the queued jobs):
-#   slurm/run_datamc_scan.sh                      # defaults: prc 2 16, mkramer's edep, 4x250 showers
+#   slurm/run_datamc_scan.sh                      # defaults: prc 2 16, mkramer's edep, 16x50 showers
 #   PRCS="2 16" NARRAY=8 NSLICE=250 THRBINS=1 NORM="single shower" slurm/run_datamc_scan.sh
 #   DRYRUN=1 slurm/run_datamc_scan.sh            # print the sbatch chain WITHOUT submitting
 #
@@ -19,8 +19,10 @@
 #   EDEP_R      readout-radius dir to pull segments from (r-indep.)  (default 3)
 #   EDEP_VAR    variant suffix in the dir name, e.g. _noFFE          (default none)
 #   EDEP_TMPL   full edep path template with {prc}                   (default from SIM_BASE/EDEP_R/VAR)
-#   NARRAY      array tasks per prc  (--array=0..NARRAY-1)           (default 4)
-#   NSLICE      showers per task                                     (default 250)
+#   NARRAY      array tasks per prc  (--array=0..NARRAY-1)           (default 16)
+#   NSLICE      showers per task (keep each task under WALL; real    (default 50)
+#               showers are ~seconds each to induce, so 50/task fits a 6 h GPU easily)
+#   WALL        per-array-task wall limit (sbatch -t)                (default 6:00:00)
 #   RECENTER    1 = recenter showers; 0 = keep mkramer's positions   (default 0, his files are in-frame)
 #   THRESHOLDS  override the sweep thresholds (e-, space list)        (default array-script's)
 #   RESETS      override the sweep resets (cycles, -1=off)            (default array-script's)
@@ -46,8 +48,9 @@ EDEP_VAR="${EDEP_VAR:-}"
 if [ -z "${EDEP_TMPL:-}" ]; then
   EDEP_TMPL="$SIM_BASE/prc{prc}_r${EDEP_R}${EDEP_VAR}_patch_noDrop/*.hdf5"
 fi
-NARRAY="${NARRAY:-4}"
-NSLICE="${NSLICE:-250}"
+NARRAY="${NARRAY:-16}"
+NSLICE="${NSLICE:-50}"
+WALL="${WALL:-6:00:00}"
 RECENTER="${RECENTER:-0}"
 OUTROOT="${OUTROOT:-${ND_WORK:-.}/tistudy_datamc}"
 LOGDIR="${LOGDIR:-$OUTROOT/logs}"
@@ -85,7 +88,7 @@ for P in $PRCS; do
   [ -n "${RESETS:-}" ] && export RESETS || true
   echo "-- prc$P: edep=$EDEP"
   ARR=$(submit "arr$P" --export=ALL -J "grid_prc$P" -o "$LOGDIR/grid_prc${P}_%A_%a.log" \
-        --array="0-$((NARRAY-1))" "$HERE/shower_grid_array.sh")
+        -t "$WALL" --array="0-$((NARRAY-1))" "$HERE/shower_grid_array.sh")
   export OUT="$OUTBASE"
   MRG=$(submit "mrg$P" --export=ALL -J "merge_prc$P" -o "$LOGDIR/merge_prc${P}_%j.log" \
         --dependency="afterok:$ARR" "$HERE/merge_grids.sh")

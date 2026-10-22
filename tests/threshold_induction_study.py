@@ -3979,11 +3979,25 @@ def produce_mult_grid(ctx, args):
     print(f"  {n_eff}/{args.n_events} events produced collectable charge")
     if n_eff == 0:
         sys.exit("No events produced any pixels -- check shower placement / config.")
-    print("Inducing nominal-induction pre-FEE signals (cached, once)...")
+    print(f"Inducing nominal-induction pre-FEE signals for {n_eff} events (cached, once)...")
     set_induction(ctx, 1.0); set_periodic_reset(ctx, base_reset)
-    evs = [e for e in (event_induce(ctx, d[0], d[1], d[2], seed=args.seed + 100 + i,
-                                    collect_frac=args.collect_frac)
-                       for i, d in enumerate(drift)) if e is not None]
+    # Real showers are expensive to induce (thousands of segments each), so report progress +
+    # a running rate/ETA: a silent loop looks identical whether it is 10% done or wall-stalled,
+    # and this is what lets you size --n-events (the array slice) to the job's wall limit.
+    import time as _time
+    _t0 = _time.time(); _step = max(1, n_eff // 50)
+    evs = []
+    for i, d in enumerate(drift):
+        e = event_induce(ctx, d[0], d[1], d[2], seed=args.seed + 100 + i,
+                         collect_frac=args.collect_frac)
+        if e is not None:
+            evs.append(e)
+        done = i + 1
+        if done % _step == 0 or done == n_eff:
+            el = _time.time() - _t0; rate = done / el if el > 0 else 0.0
+            eta = (n_eff - done) / rate if rate > 0 else float("inf")
+            print(f"  induced {done}/{n_eff}  (nseg={int(d[0].shape[0])}, {el:.0f}s elapsed, "
+                  f"{rate:.2f} ev/s, ETA {eta:.0f}s)", flush=True)
     print(f"  pre-signal cache: {_cache_mb(evs):.1f} MB "
           f"({_cache_mb(evs) / max(len(evs), 1):.2f} MB/event, MAX_RADIUS={ctx.detector.MAX_RADIUS} pix)")
     thr_grid = sorted(set(float(t) for t in args.thresholds))
