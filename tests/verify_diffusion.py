@@ -559,7 +559,14 @@ def induce_and_sum_chunked(ctx, drifted, neigh, radius, seed, mem_budget_gb=None
     nbk = cp.zeros(npix, dtype=cp.int64)
     obk = cp.zeros(npix, dtype=cp.int64)
     pts = cp.zeros(1)
-    ovf = cp.zeros(1)
+    # One overflow slot PER PIXEL, not one total: sum_pixel_signals does
+    # `overflow_flag[pixel_index] = 1` for every (seg, pad, tick) thread whose
+    # per-pixel backtrack loop leaves flag=1 -- and with backtracking disabled
+    # (width-1 all-(-1) tpm) that loop breaks immediately for EVERY pixel, so
+    # every thread writes here. A length-1 array makes that an out-of-bounds
+    # store for any pixel_index >= 1 (CUDA_ERROR_ILLEGAL_ADDRESS). Match
+    # sum_to_pixels, which sizes this to the pixel count.
+    ovf = cp.zeros(npix)
     if mem_budget_gb is None:
         mem_budget_gb = float(os.environ.get("TI_INDUCE_MEM_GB", "4"))
     # ~bytes held per segment in a chunk: signals (f4) + xoroshiro states (16 B) over its
