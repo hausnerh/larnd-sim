@@ -4092,7 +4092,7 @@ def analyze_mult_grid(spectra, outdir):
     hits) and, when the file carries it, per-HIT Q ('_perhit', one entry per ADC sample so a 2-hit
     pixel adds 2 entries). Panels share a y-axis. Runs from ti_mult_grid.npz, so it re-plots with --refit."""
     import matplotlib.pyplot as plt
-    m = spectra["meta"]; nsh = int(m["n_shower"]); grid = spectra["mult_grid"]
+    m = spectra["meta"]; nsh = max(int(m["n_shower"]), 1); grid = spectra["mult_grid"]  # guard /nsh on an empty tail slice
     samp = str(m.get("sample", "showers"))            # 'showers' or 'muons' (muon mult-grid sets it)
     ev = "muon" if samp.startswith("muon") else "shower"   # per-event noun for axis labels
     thr_vals = sorted(set(g[0] for g in grid))
@@ -4197,7 +4197,7 @@ def analyze_multiplicity_spectrum(spectra, outdir):
     the threshold x reset grid: panels-per-reset (thresholds overlaid) and the byreset transpose,
     per-shower and area-normalized. n_hits >= NMAX piles into the last bin."""
     import matplotlib.pyplot as plt
-    m = spectra["meta"]; nsh = int(m["n_shower"]); grid = spectra["mult_grid"]
+    m = spectra["meta"]; nsh = max(int(m["n_shower"]), 1); grid = spectra["mult_grid"]  # guard /nsh on an empty tail slice
     samp = str(m.get("sample", "showers"))
     ev = "muon" if samp.startswith("muon") else "shower"
     thr_vals = sorted(set(g[0] for g in grid))
