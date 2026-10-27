@@ -23,6 +23,12 @@
 #   NSLICE      showers per task (keep each task under WALL; real    (default 50)
 #               showers are ~seconds each to induce, so 50/task fits a 6 h GPU easily)
 #   WALL        per-array-task wall limit (sbatch -t)                (default 6:00:00)
+#   AGG_RESERVE_S  wall seconds held back from induction for the      (default 9000 = 2.5 h)
+#               aggregation+checkpoint phase (a few monster showers can eat a whole wall;
+#               the induction phase stops at WALL-AGG_RESERVE_S and writes a PARTIAL grid,
+#               which merge_mult_grids sums across tasks -- so nothing is lost, it's spread
+#               over more slices, and no task dies to a timeout writing nothing).
+#   TI_WALL_BUDGET_S  override the induction cap directly (seconds; default WALL-AGG_RESERVE_S)
 #   RECENTER    1 = recenter showers; 0 = keep mkramer's positions   (default 0, his files are in-frame)
 #   THRESHOLDS  override the sweep thresholds (e-, space list)        (default array-script's)
 #   RESETS      override the sweep resets (cycles, -1=off)            (default array-script's)
@@ -59,6 +65,33 @@ THRBINS="${THRBINS:-0}"
 SIM_R="${SIM_R:-3 4}"
 PLOT_OUT="${PLOT_OUT:-$OUTROOT/plots}"
 DRYRUN="${DRYRUN:-0}"
+
+# Induction is heavy-tailed (a few monster showers take ~1 h each), so instead of praying a slice
+# fits the wall we cap the INDUCTION phase and let each task write a PARTIAL grid for whatever it
+# finished -- merge_mult_grids sums n_shower across tasks, so nothing is lost, it's just spread over
+# more slices (a timed-out task writes NOTHING). TI_WALL_BUDGET_S (seconds) is that cap; by default
+# it's WALL minus AGG_RESERVE_S held back for the cheaper aggregation+checkpoint phase that follows.
+AGG_RESERVE_S="${AGG_RESERVE_S:-9000}"            # default 2.5 h reserved for aggregation
+wall_to_secs() {                                  # SLURM time -> seconds: [D-]H:M:S, M:S, or bare minutes
+  local t="$1" d=0 rest; case "$t" in *-*) d="${t%%-*}"; rest="${t#*-}";; *) rest="$t";; esac
+  local IFS=:; set -- $rest
+  case "$#" in
+    3) echo $(( d*86400 + 10#$1*3600 + 10#$2*60 + 10#$3 ));;
+    2) echo $(( d*86400 + 10#$1*60 + 10#$2 ));;
+    1) echo $(( d*86400 + 10#$1*60 ));;
+    *) echo 0;;
+  esac
+}
+if [ -z "${TI_WALL_BUDGET_S:-}" ]; then
+  _ws="$(wall_to_secs "$WALL")"
+  if [ "$_ws" -gt 0 ]; then
+    _b=$(( _ws - AGG_RESERVE_S )); _half=$(( _ws / 2 ))
+    [ "$_b" -lt "$_half" ] && _b="$_half"         # never give aggregation more than half the wall
+    TI_WALL_BUDGET_S="$_b"
+  fi
+fi
+export TI_WALL_BUDGET_S="${TI_WALL_BUDGET_S:-0}"
+
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 submit() {  # $1 = label (for the synthetic dry-run jobid); rest = sbatch args + script [+ script args]
@@ -73,6 +106,7 @@ submit() {  # $1 = label (for the synthetic dry-run jobid); rest = sbatch args +
 
 echo "=== FSDCube data/MC scan harness ==="
 echo "prc=[$PRCS]  array=0-$((NARRAY-1)) x $NSLICE showers  recenter=$RECENTER"
+echo "wall=$WALL  induction budget=${TI_WALL_BUDGET_S}s (then partial-grid; reserve ${AGG_RESERVE_S}s for aggregation)"
 echo "edep template: $EDEP_TMPL"
 echo "grids -> $OUTROOT/grid_prc<P>    plots -> $PLOT_OUT    logs -> $LOGDIR"
 [ "$DRYRUN" = "1" ] && echo "*** DRYRUN: printing the sbatch chain, submitting nothing ***"

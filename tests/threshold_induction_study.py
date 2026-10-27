@@ -3984,27 +3984,46 @@ def produce_mult_grid(ctx, args):
     # Real showers are expensive to induce (thousands of segments each), so report progress +
     # a running rate/ETA: a silent loop looks identical whether it is 10% done or wall-stalled,
     # and this is what lets you size --n-events (the array slice) to the job's wall limit.
+    #
+    # Induction cost is HEAVY-TAILED: most showers induce in a few hundred s, but a handful of
+    # monster showers (nseg up to ~2e4) take ~1 h each, so a slice that happens to draw several of
+    # them busts any fixed wall no matter how small NSLICE is. TI_WALL_BUDGET_S (the slurm harness
+    # derives it from WALL, leaving a margin for the cheaper aggregation phase that follows) caps
+    # just the induction phase: once elapsed exceeds it we stop pulling new showers and aggregate
+    # the ones already induced into a PARTIAL grid. merge_mult_grids sums n_shower across tasks, so
+    # stopping early doesn't lose those showers from the study -- it just spreads the sample over
+    # more slices than one timed-out task could ever deliver (a timeout writes nothing).
     import time as _time
+    budget = float(os.environ.get("TI_WALL_BUDGET_S", "0") or 0)
     _t0 = _time.time(); _step = max(1, n_eff // 50)
     evs = []
+    n_done = 0
     for i, d in enumerate(drift):
         e = event_induce(ctx, d[0], d[1], d[2], seed=args.seed + 100 + i,
                          collect_frac=args.collect_frac)
         if e is not None:
             evs.append(e)
-        done = i + 1
-        if done % _step == 0 or done == n_eff:
-            el = _time.time() - _t0; rate = done / el if el > 0 else 0.0
-            eta = (n_eff - done) / rate if rate > 0 else float("inf")
-            print(f"  induced {done}/{n_eff}  (nseg={int(d[0].shape[0])}, {el:.0f}s elapsed, "
+        n_done = i + 1
+        el = _time.time() - _t0
+        if n_done % _step == 0 or n_done == n_eff:
+            rate = n_done / el if el > 0 else 0.0
+            eta = (n_eff - n_done) / rate if rate > 0 else float("inf")
+            print(f"  induced {n_done}/{n_eff}  (nseg={int(d[0].shape[0])}, {el:.0f}s elapsed, "
                   f"{rate:.2f} ev/s, ETA {eta:.0f}s)", flush=True)
+        if budget > 0 and el > budget and n_done < n_eff:
+            print(f"  *** wall-time budget {budget:.0f}s reached after {n_done}/{n_eff} showers "
+                  f"({el:.0f}s elapsed) -- stopping induction here and writing a PARTIAL grid. "
+                  f"merge_mult_grids sums n_shower across tasks, so the remaining {n_eff - n_done} "
+                  f"showers in this slice are simply covered by other slices; raise TI_WALL_BUDGET_S "
+                  f"/ WALL or lower NSLICE to fit more showers per task.", flush=True)
+            break
     print(f"  pre-signal cache: {_cache_mb(evs):.1f} MB "
           f"({_cache_mb(evs) / max(len(evs), 1):.2f} MB/event, MAX_RADIUS={ctx.detector.MAX_RADIUS} pix)")
     thr_grid = sorted(set(float(t) for t in args.thresholds))
     rst_grid = sorted(set(int(r) for r in args.resets))
     det_name, _g, det_path = vd.detector_identity(ctx)
     meta = dict(base_threshold=base_thr, base_reset=base_reset, ts=ts, noise_e=noise_e,
-                n_shower=n_eff, thresholds=np.asarray(thr_grid, float),
+                n_shower=n_done, thresholds=np.asarray(thr_grid, float),   # showers actually induced (< n_eff if the wall budget tripped)
                 resets=np.asarray(rst_grid, int), detector_name=str(det_name),
                 detector_path=str(det_path), edep=str(args.edep_h5 or "parametric"),
                 sample=("muons" if muon_mode else "showers"))
