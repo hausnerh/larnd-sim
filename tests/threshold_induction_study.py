@@ -3289,6 +3289,11 @@ def parse_args():
     ap.add_argument("--resets", type=int, nargs="+",
                     default=[-1, 400, 200, 100, 66, 50],
                     help="PERIODIC_RESET_CYCLES (-1 = off)")
+    ap.add_argument("--base-reset", type=int, default=None,
+                    help="pin the NOMINAL reset (PERIODIC_RESET_CYCLES) for --mult-grid: the grid's "
+                         "base node sits here and this value is added to the swept --resets. Use it to "
+                         "read a sample out at its chip reset-register setting (e.g. the prc2 sample -> "
+                         "2 cycles, prc16 -> 16). Default: the loaded config's own PERIODIC_RESET_CYCLES.")
     ap.add_argument("--inductions", type=float, nargs="+",
                     default=[0.0, 0.5, 1.0, 1.5, 2.0, 3.0], help="response scale")
     ap.add_argument("--template-grid", choices=["cross", "full"], default="cross",
@@ -3599,9 +3604,16 @@ def recenter_events(events, ctx, rng, plane=0, margin=3.0):
 
 
 def base_config(ctx, args):
-    """Nominal operating point = the loaded config's own threshold + reset values."""
+    """Nominal operating point = the loaded config's own threshold + reset values.
+
+    --base-reset overrides the reset so the grid's NOMINAL node sits at a chosen chip
+    PERIODIC_RESET_CYCLES. The periodic reset is a readout (FEE) setting, applied downstream
+    of the shared edep deposits, so reading one shower set out at reset=2 vs reset=16 is how
+    the prc2/prc16 chip-register samples actually differ (the edep `segments` are identical;
+    only the reset the FEE applies changes). Without it the comparison is degenerate."""
     base_thr = float(np.atleast_1d(ctx.detector.DISCRIMINATION_THRESHOLD).ravel()[0])
-    base_reset = int(getattr(ctx.detector, "PERIODIC_RESET_CYCLES", -1))
+    br = getattr(args, "base_reset", None)
+    base_reset = int(br) if br is not None else int(getattr(ctx.detector, "PERIODIC_RESET_CYCLES", -1))
     return base_thr, base_reset
 
 
@@ -3962,7 +3974,7 @@ def produce_mult_grid(ctx, args):
         print(f"  no events at edep offset {off} (sample exhausted) -- writing an EMPTY grid "
               f"so the merge still runs, exiting cleanly.")
         thr_grid = sorted(set(float(t) for t in args.thresholds))
-        rst_grid = sorted(set(int(r) for r in args.resets))
+        rst_grid = sorted(set(int(r) for r in args.resets) | {int(base_reset)})
         det_name, _g, det_path = vd.detector_identity(ctx)
         meta = dict(base_threshold=base_thr, base_reset=base_reset, ts=ts, noise_e=noise_e,
                     n_shower=0, thresholds=np.asarray(thr_grid, float),
@@ -4020,7 +4032,7 @@ def produce_mult_grid(ctx, args):
     print(f"  pre-signal cache: {_cache_mb(evs):.1f} MB "
           f"({_cache_mb(evs) / max(len(evs), 1):.2f} MB/event, MAX_RADIUS={ctx.detector.MAX_RADIUS} pix)")
     thr_grid = sorted(set(float(t) for t in args.thresholds))
-    rst_grid = sorted(set(int(r) for r in args.resets))
+    rst_grid = sorted(set(int(r) for r in args.resets) | {int(base_reset)})
     det_name, _g, det_path = vd.detector_identity(ctx)
     meta = dict(base_threshold=base_thr, base_reset=base_reset, ts=ts, noise_e=noise_e,
                 n_shower=n_done, thresholds=np.asarray(thr_grid, float),   # showers actually induced (< n_eff if the wall budget tripped)
