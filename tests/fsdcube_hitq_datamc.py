@@ -257,6 +257,11 @@ def main():
                          "(default: auto = 99th percentile of all Δt, shared across data/MC/prc)")
     ap.add_argument("--dt-bins", type=int, default=50,
                     help="number of bins for the time-between-hits plot (default 50)")
+    ap.add_argument("--dt-zoom-max", type=float, default=100.0,
+                    help="upper x-limit for the ZOOMED companion plot hitq_dt_zoom.png, which shows "
+                         "the fine structure near Δt=0 at native resolution (default 100 ticks)")
+    ap.add_argument("--dt-zoom-binw", type=float, default=1.0,
+                    help="bin width for the zoomed time-between-hits plot (default 1 tick)")
     ap.add_argument("--grid", nargs="+", default=None,
                     help="overlay a FEE threshold/reset re-sweep (a ti_mult_grid.npz from "
                          "tests/threshold_induction_study.py --mult-grid) ON TOP of the data/MC curves, "
@@ -325,6 +330,24 @@ def main():
     dtctr = 0.5 * (dtbins[1:] + dtbins[:-1])
     print(f"\ntime-between-hits: field={args.dt_field}, {int(_alldt.size)} pairs total, "
           f"x-axis [0, {dt_hi:.3g}] {DT_UNIT} in {args.dt_bins} bins")
+    # zoomed companion (hitq_dt_zoom.png): the fine structure right at the floor, where the reset
+    # cadence lives, at native resolution -- default 0..100 ticks in 1-tick bins. Fixed (not
+    # percentile-driven) so data/MC are compared bin-for-bin, and density-normalized to each
+    # dataset's GLOBAL pair count so the y-value is the true fraction of pairs in that 1-tick bin.
+    dtz_w = max(float(args.dt_zoom_binw), 1e-9)
+    dtzbins = np.arange(0.0, float(args.dt_zoom_max) + dtz_w, dtz_w)
+    dtzctr = 0.5 * (dtzbins[1:] + dtzbins[:-1])
+    # directly answer "is the minimum Δt different data vs MC?": floor + low percentiles per dataset
+    print(f"  min / P0.1 / P1 / P5 Δt per dataset ({DT_UNIT}):")
+    for k in sorted(store, key=lambda kk: (kk[0], kk[1] != "data", kk)):
+        d = store[k][7]
+        tag = "data" if k[1] == "data" else f"sim r{k[2]}"
+        if d.size:
+            lo = np.percentile(d, [0.1, 1.0, 5.0])
+            print(f"    prc{k[0]} {tag:<8}: min={d.min():.3g}  P0.1={lo[0]:.3g}  "
+                  f"P1={lo[1]:.3g}  P5={lo[2]:.3g}   (n={d.size})")
+        else:
+            print(f"    prc{k[0]} {tag:<8}: (no multi-hit pixels)")
 
     # one plotting series per prc: data (solid black) + each sim radius (dashed, distinct DUNE colour)
     def series(prc):
@@ -546,25 +569,35 @@ def main():
         # adjacent-in-time hits: how long after one hit the same pad fires again. Only multi-hit
         # pixels contribute, so it is empty when no pixel fires twice. No sweep overlay here -- the
         # ti_mult_grid carries per-hit CHARGE but no per-hit TIME, so there is nothing to draw.
-        fig, axes = plt.subplots(1, len(args.prc), figsize=(6.4 * len(args.prc), 4.6),
-                                 squeeze=False, sharey=True)
-        for ax, prc in zip(axes[0], args.prc):
-            for lbl, col, ls, tup0 in series(prc):
-                tup = sub(tup0)
-                hh, _ = np.histogram(tup[7], bins=dtbins); hh = hh.astype(float)
-                # density -> fraction of hit pairs; single/shower -> the per-dataset scalar
-                w = (1.0 / hh.sum() if hh.sum() else 0.0) if scheme == "density" \
-                    else weight(scheme, tup, hh.sum())
-                ax.step(dtctr, hh * w, where="mid", ls=ls, color=col, lw=1.8, label=lbl)
-            ax.set_title(f"prc{prc}"); ax.set_xlabel(f"Δt between hits on a pixel [{DT_UNIT}]")
-            ax.set_ylabel("Fraction of hit pairs" if scheme == "density" else YLAB[scheme])
-            ax.set_xlim(dtbins[0], dtbins[-1])
-            ax.legend(fontsize=LEG_FS); ax.grid(alpha=.5, color=GRID_COLOR, lw=0.6)
-        fig.suptitle(f"FSDCube time between consecutive hits on a pixel -- data vs sim  "
-                     f"[{NOTE[scheme]}]{tnote}", fontsize=13)
-        fig.tight_layout(); fig.savefig(f"{sdir}/hitq_dt.png", dpi=120)
-        plt.close(fig)
-        print(f"wrote {sdir}/hitq_dt.png")
+        # Drawn twice: the full-range view, then a zoomed companion at the floor. The zoom's density
+        # is normalized to each dataset's GLOBAL pair count (not the in-window sum) so a 1-tick bin's
+        # height is the true fraction of all that dataset's pairs -- directly comparable data vs MC.
+        for _bins, _ctr, _fname, _zlab, _gnorm in (
+                (dtbins, dtctr, "hitq_dt.png", "", False),
+                (dtzbins, dtzctr, "hitq_dt_zoom.png",
+                 f"  (zoom 0-{args.dt_zoom_max:g} {DT_UNIT}, {args.dt_zoom_binw:g}-{DT_UNIT} bins)", True)):
+            fig, axes = plt.subplots(1, len(args.prc), figsize=(6.4 * len(args.prc), 4.6),
+                                     squeeze=False, sharey=True)
+            for ax, prc in zip(axes[0], args.prc):
+                for lbl, col, ls, tup0 in series(prc):
+                    tup = sub(tup0)
+                    hh, _ = np.histogram(tup[7], bins=_bins); hh = hh.astype(float)
+                    # density -> fraction of hit pairs; single/shower -> the per-dataset scalar
+                    if scheme == "density":
+                        _tot = (float(tup[7].size) if _gnorm else hh.sum())
+                        w = (1.0 / _tot) if _tot else 0.0
+                    else:
+                        w = weight(scheme, tup, hh.sum())
+                    ax.step(_ctr, hh * w, where="mid", ls=ls, color=col, lw=1.8, label=lbl)
+                ax.set_title(f"prc{prc}"); ax.set_xlabel(f"Δt between hits on a pixel [{DT_UNIT}]")
+                ax.set_ylabel("Fraction of hit pairs" if scheme == "density" else YLAB[scheme])
+                ax.set_xlim(_bins[0], _bins[-1])
+                ax.legend(fontsize=LEG_FS); ax.grid(alpha=.5, color=GRID_COLOR, lw=0.6)
+            fig.suptitle(f"FSDCube time between consecutive hits on a pixel -- data vs sim  "
+                         f"[{NOTE[scheme]}]{tnote}{_zlab}", fontsize=13)
+            fig.tight_layout(); fig.savefig(f"{sdir}/{_fname}", dpi=120)
+            plt.close(fig)
+            print(f"wrote {sdir}/{_fname}")
 
     # ---- per-pixel-threshold bins (optional): 1-ke- windows centered on the scan values + under/over.
     # `sub` masks a dataset tuple to the pixels whose OWN threshold falls in [lo,hi): per-hit arrays
