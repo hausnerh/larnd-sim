@@ -38,11 +38,6 @@
 NSLICE="${NSLICE:-250}"
 THRESHOLDS="${THRESHOLDS:-2500 3750 5000 6250 7500}"
 RESETS="${RESETS:--1 1024 512 256 128 64}"
-# BASE_RESET pins the grid's NOMINAL reset (PERIODIC_RESET_CYCLES) -> --base-reset. The periodic
-# reset is a readout (FEE) setting applied downstream of the shared edep deposits, so this is how a
-# sample is read out at its chip reset-register value (e.g. prc2 -> 2, prc16 -> 16). Empty = use the
-# loaded config's own default. The base value is always added to the grid's reset nodes.
-BASE_RESET="${BASE_RESET:-}"
 # OUTBASE lets an orchestrator point each run (e.g. per-prc) at its own grid dir; parts land in
 # $OUTBASE/part_<k> and merge_grids.sh (OUT=$OUTBASE) collapses them to $OUTBASE/ti_mult_grid.npz.
 OUTBASE="${OUTBASE:-$ND_WORK/tistudy_grid_full}"
@@ -73,7 +68,6 @@ OFFSET=$(( k * NSLICE ))
 OUT="$OUTBASE/part_${k}"
 mkdir -p "$OUT"
 echo "task $k: edep=$EDEP  recenter=$RECENTER  slice=[${OFFSET}:$(( OFFSET + NSLICE ))]  out=$OUT"
-echo "        thresholds=[$THRESHOLDS]  resets=[$RESETS]  base_reset=${BASE_RESET:-config-default}"
 
 # A crash here MUST fail the task: this array feeds an `afterok` merge, and a merge that
 # fires on a missing/partial part silently produces a wrong grid. So gate the "DONE" on
@@ -81,7 +75,7 @@ echo "        thresholds=[$THRESHOLDS]  resets=[$RESETS]  base_reset=${BASE_RESE
 if python -u tests/threshold_induction_study.py --config fsd_cube --mult-grid \
      --edep-h5 "$EDEP" $RECENTER_FLAG --edep-offset "$OFFSET" --n-events "$NSLICE" \
      --seed $(( 12345 + k )) --outdir "$OUT" \
-     --thresholds $THRESHOLDS --resets $RESETS ${BASE_RESET:+--base-reset $BASE_RESET}; then
+     --thresholds $THRESHOLDS --resets $RESETS; then
   [ -s "$OUT/ti_mult_grid.npz" ] || { echo "!! PART $k: python exited 0 but no $OUT/ti_mult_grid.npz" >&2; exit 2; }
   echo "PART $k DONE -> $OUT/ti_mult_grid.npz"
 else

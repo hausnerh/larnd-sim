@@ -14,19 +14,11 @@
 #   DRYRUN=1 slurm/run_datamc_scan.sh            # print the sbatch chain WITHOUT submitting
 #
 # Knobs (all env, all optional):
-#   PRCS        chip reset-register values to run (prc<P> = PERIODIC_   (default "2 16")
-#               RESET_CYCLES = P), one grid + panel each. prc is a READOUT setting applied
-#               downstream of the deposits, NOT an input selector: every prc reads the SAME
-#               shared showers (SHOWER_EDEP) and differs ONLY by the reset it is read out at,
-#               so grid_prc2 vs grid_prc16 is a clean controlled reset-rate comparison.
-#               (mkramer's prc* output dirs all carry the identical input 'segments'.)
+#   PRCS        parity configs to run, one grid + panel each        (default "2 16")
 #   SIM_BASE    mkramer's larnd-sim OUTPUT base (carries 'segments') (default his segFFE3 skim_more)
 #   EDEP_R      readout-radius dir to pull segments from (r-indep.)  (default 3)
 #   EDEP_VAR    variant suffix in the dir name, e.g. _noFFE          (default none)
 #   EDEP_TMPL   full edep path template with {prc}                   (default from SIM_BASE/EDEP_R/VAR)
-#   SHOWER_PRC  which prc* dir to pull the (shared) showers from      (default 2; any works --
-#               they carry the same segments)
-#   SHOWER_EDEP the one shared shower source glob for ALL prc         (default EDEP_TMPL@SHOWER_PRC)
 #   NARRAY      array tasks per prc  (--array=0..NARRAY-1)           (default 16)
 #   NSLICE      showers per task (keep each task under WALL; real    (default 50)
 #               showers are ~seconds each to induce, so 50/task fits a 6 h GPU easily)
@@ -39,8 +31,7 @@
 #   TI_WALL_BUDGET_S  override the induction cap directly (seconds; default WALL-AGG_RESERVE_S)
 #   RECENTER    1 = recenter showers; 0 = keep mkramer's positions   (default 0, his files are in-frame)
 #   THRESHOLDS  override the sweep thresholds (e-, space list)        (default array-script's)
-#   RESETS      per-prc reset nodes are set from PRCS (prc<P> -> reset P); this knob is no longer
-#               used by this harness (drive a custom reset sweep via shower_grid_array.sh directly)
+#   RESETS      override the sweep resets (cycles, -1=off)            (default array-script's)
 #   OUTROOT     per-prc grids under $OUTROOT/grid_prc<P>             (default $ND_WORK/tistudy_datamc)
 #   NORM        plot norm scheme(s)                                   (default "single shower density")
 #   THRBINS     1 = also make the per-pixel-threshold-binned plots    (default 0)
@@ -63,12 +54,6 @@ EDEP_VAR="${EDEP_VAR:-}"
 if [ -z "${EDEP_TMPL:-}" ]; then
   EDEP_TMPL="$SIM_BASE/prc{prc}_r${EDEP_R}${EDEP_VAR}_patch_noDrop/*.hdf5"
 fi
-# prc = the chip PERIODIC_RESET_CYCLES the showers are read out at (prc2 -> 2, prc16 -> 16), a READOUT
-# setting the sweep applies downstream of the deposits. mkramer's prc* output dirs all carry the SAME
-# input 'segments', so every prc reads ONE shared shower source and differs ONLY by the reset -- a
-# controlled comparison. (Reading per-prc dirs instead would compare the same showers to themselves.)
-SHOWER_PRC="${SHOWER_PRC:-2}"
-SHOWER_EDEP="${SHOWER_EDEP:-${EDEP_TMPL//\{prc\}/$SHOWER_PRC}}"
 NARRAY="${NARRAY:-16}"
 NSLICE="${NSLICE:-50}"
 WALL="${WALL:-6:00:00}"
@@ -120,9 +105,9 @@ submit() {  # $1 = label (for the synthetic dry-run jobid); rest = sbatch args +
 }
 
 echo "=== FSDCube data/MC scan harness ==="
-echo "prc=[$PRCS] (= PERIODIC_RESET_CYCLES per grid)  array=0-$((NARRAY-1)) x $NSLICE showers  recenter=$RECENTER"
+echo "prc=[$PRCS]  array=0-$((NARRAY-1)) x $NSLICE showers  recenter=$RECENTER"
 echo "wall=$WALL  induction budget=${TI_WALL_BUDGET_S}s (then partial-grid; reserve ${AGG_RESERVE_S}s for aggregation)"
-echo "shared shower source (all prc): $SHOWER_EDEP"
+echo "edep template: $EDEP_TMPL"
 echo "grids -> $OUTROOT/grid_prc<P>    plots -> $PLOT_OUT    logs -> $LOGDIR"
 [ "$DRYRUN" = "1" ] && echo "*** DRYRUN: printing the sbatch chain, submitting nothing ***"
 [ "$DRYRUN" = "1" ] || mkdir -p "$OUTROOT" "$LOGDIR" "$PLOT_OUT"
@@ -130,13 +115,12 @@ echo "grids -> $OUTROOT/grid_prc<P>    plots -> $PLOT_OUT    logs -> $LOGDIR"
 MERGE_DEPS=""
 GRID_TOKENS=()
 for P in $PRCS; do
-  EDEP="$SHOWER_EDEP"                 # shared shower source for EVERY prc (same deposits)
+  EDEP="${EDEP_TMPL//\{prc\}/$P}"
   OUTBASE="$OUTROOT/grid_prc$P"
-  RESETS="$P"                         # prc = PERIODIC_RESET_CYCLES: read these showers out at reset P
-  BASE_RESET="$P"                     # ... and make it the grid's nominal node
-  export EDEP OUTBASE NSLICE RECENTER RESETS BASE_RESET
+  export EDEP OUTBASE NSLICE RECENTER
   [ -n "${THRESHOLDS:-}" ] && export THRESHOLDS || true
-  echo "-- prc$P: reset=$P cyc  edep=$EDEP"
+  [ -n "${RESETS:-}" ] && export RESETS || true
+  echo "-- prc$P: edep=$EDEP"
   ARR=$(submit "arr$P" --export=ALL -J "grid_prc$P" -o "$LOGDIR/grid_prc${P}_%A_%a.log" \
         -t "$WALL" --array="0-$((NARRAY-1))" "$HERE/shower_grid_array.sh")
   export OUT="$OUTBASE"
