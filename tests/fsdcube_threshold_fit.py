@@ -10,7 +10,9 @@
 #   basis        f_T(Q): the single-hit-pixel charge density the sim produces when EVERY pixel has
 #                threshold T. The grid carries it at T in {2.5, 3.75, 5, 6.25, 7.5} ke- (base reset),
 #                and its peak tracks T (a clean threshold turn-on), so it is a good mixing basis.
-#   interpolate  f_T(Q) linearly (per Q-bin) in T, so ANY threshold in [T_lo, T_hi] has a shape.
+#   interpolate  f_T(Q) linearly (per Q-bin) in T, so ANY threshold in [T_lo, T_hi] has a shape; with
+#                --extrapolate the end slopes are CONTINUED (a linear spline) so thresholds below/above
+#                the grid also get a shape, letting the basis span the full 1-11 ke- map from 5 nodes.
 #   predict      P_known(Q) = < f_{T_pix}(Q) > over the REAL per-pixel threshold map
 #                (larndsim/bin/thresholds_fsdcube.npz) -- "what we expect given the known thresholds".
 #                Compare to the nominal uniform-threshold sim (should be close) and to the data.
@@ -98,12 +100,35 @@ def load_basis(path, observable="single", prc=None, prc_step_us=6.4, reset_per_p
     return np.array(Ts) / 1000.0, np.vstack(F), np.array(Y), base_T, use_rst
 
 
-def interp_basis(T, F, Tq):
-    """linear per-Q-bin interpolation of the density rows F(T) to query thresholds Tq (clipped to
-    [T_lo, T_hi]; the ~14% of pixels above the top grid threshold are modelled by the top shape --
-    extend the grid's THRESHOLDS to cover them exactly). Each output row is renormalized to area 1."""
-    Tq = np.clip(np.asarray(Tq, float), T.min(), T.max())
-    G = np.column_stack([np.interp(Tq, T, F[:, b]) for b in range(F.shape[1])])  # (nq, QBINS)
+def _lin_extrap(T, y, Tq):
+    """piecewise-linear interpolation of y(T) at Tq with LINEAR EXTRAPOLATION beyond the end knots:
+    np.interp clamps the ends flat, so here the first/last segment slope is continued instead (a
+    linear spline). Vectorized over Tq."""
+    T = np.asarray(T, float); y = np.asarray(y, float); Tq = np.asarray(Tq, float)
+    out = np.interp(Tq, T, y)
+    lo = Tq < T[0]
+    if lo.any():
+        out = np.where(lo, y[0] + (y[1] - y[0]) / (T[1] - T[0]) * (Tq - T[0]), out)
+    hi = Tq > T[-1]
+    if hi.any():
+        out = np.where(hi, y[-1] + (y[-1] - y[-2]) / (T[-1] - T[-2]) * (Tq - T[-1]), out)
+    return out
+
+
+def interp_basis(T, F, Tq, extrap=False):
+    """per-Q-bin interpolation of the density rows F(T) to query thresholds Tq. extrap=False clips Tq
+    to [T_lo, T_hi] (np.interp's flat clamp). extrap=True LINEARLY EXTRAPOLATES each Q-bin's density
+    past the grid's end thresholds (a linear spline), so thresholds below T_lo / above T_hi get an
+    extrapolated turn-on rather than the edge shape -- this is what lets the basis span the full
+    1-11 ke- threshold range from 5 grid nodes at [2.5, 7.5]. A linear-extrapolated density bin can
+    dip < 0, so rows are floored at 0 and each output row is renormalized to area 1."""
+    T = np.asarray(T, float); Tq = np.asarray(Tq, float)
+    if extrap:
+        G = np.column_stack([_lin_extrap(T, F[:, b], Tq) for b in range(F.shape[1])])  # (nq, QBINS)
+    else:
+        Tqc = np.clip(Tq, T.min(), T.max())
+        G = np.column_stack([np.interp(Tqc, T, F[:, b]) for b in range(F.shape[1])])
+    G = np.clip(G, 0.0, None)                         # extrapolation may push a density bin slightly < 0
     a = (G * BINW).sum(1, keepdims=True); a[a == 0] = 1.0
     return G / a
 
@@ -117,12 +142,15 @@ def map_thresholds(thr_map_path):
     return dense
 
 
-def fine_grid(T, F, n_fine):
-    """A fine threshold axis spanning the basis range + the interpolated density rows on it.
-    Fitting on this (not the few native nodes) is what gives a BROAD threshold distribution rather
-    than weight piling up on the discrete grid thresholds."""
-    Tf = np.linspace(float(T.min()), float(T.max()), int(n_fine))
-    return Tf, interp_basis(T, F, Tf)
+def fine_grid(T, F, n_fine, lo=None, hi=None, extrap=False):
+    """A fine threshold axis [lo, hi] (default the basis range [T_lo, T_hi]) + the interpolated density
+    rows on it. Fitting on this (not the few native nodes) is what gives a BROAD threshold distribution
+    rather than weight piling up on the discrete grid thresholds; with extrap=True and lo/hi beyond the
+    grid the wings are linearly extrapolated so the fit spans the full map range."""
+    lo = float(T.min()) if lo is None else float(lo)
+    hi = float(T.max()) if hi is None else float(hi)
+    Tf = np.linspace(lo, hi, int(n_fine))
+    return Tf, interp_basis(T, F, Tf, extrap=extrap)
 
 
 def moments(T, w):
@@ -134,12 +162,26 @@ def moments(T, w):
     return m, float(max((w * (T - m) ** 2).sum() / s, 0.0)) ** 0.5
 
 
-def predict_known(T, F, vals):
-    """P_known(Q): pixel-weighted mean of the interpolated per-pixel shapes f_{T_pix}(Q), area 1."""
-    G = interp_basis(T, F, vals)         # (n_pix, QBINS)
+def predict_known(T, F, vals, extrap=False):
+    """P_known(Q): pixel-weighted mean of the interpolated per-pixel shapes f_{T_pix}(Q), area 1.
+    extrap=True lets the low-/high-threshold pixels outside the grid contribute their extrapolated
+    shape instead of being clamped to the edge node."""
+    G = interp_basis(T, F, vals, extrap=extrap)         # (n_pix, QBINS)
     p = G.mean(0)
     s = (p * BINW).sum()
     return p / s if s else p
+
+
+def seed_from_map(Tf, vals):
+    """Seed weights on the fine grid Tf from the known per-pixel threshold map -- i.e. START the fit at
+    the SIMULATED threshold distribution. Each pixel is binned to its nearest fine node (pixels outside
+    [Tf[0], Tf[-1]] fold into the end node) and the counts are normalized onto the simplex."""
+    Tf = np.asarray(Tf, float); vals = np.asarray(vals, float)
+    edges = 0.5 * (Tf[1:] + Tf[:-1])                    # midpoints between adjacent fine nodes
+    idx = np.clip(np.searchsorted(edges, vals), 0, Tf.size - 1)
+    w = np.bincount(idx, minlength=Tf.size).astype(float)
+    s = w.sum()
+    return w / s if s else np.full(Tf.size, 1.0 / Tf.size)
 
 
 # ---------------------------------------------------------------------------
@@ -158,10 +200,16 @@ def project_simplex(v):
     return np.maximum(v - theta, 0.0)
 
 
-def fit_weights(F, d, reg=0.0, iters=20000):
+def fit_weights(F, d, reg=0.0, iters=20000, w0=None, prior=0.0):
     """mixture weights w (one per basis row of F) whose density F^T w best matches target density d,
     constrained to the simplex (w>=0, sum=1 -> F^T w is itself a density). `reg` adds a 2nd-difference
-    smoothness penalty (useful on a fine threshold grid). Projected gradient; returns w."""
+    smoothness penalty (useful on a fine threshold grid). `w0` SEEDS the iteration (projected onto the
+    simplex; default uniform): because the interpolated basis is low-rank (5 shapes spread over many
+    fine nodes) the problem is weakly constrained along smooth re-distributions of weight, so within a
+    finite iteration budget w0 shapes which near-equivalent solution is reached -- seeding at the sim
+    map yields 'the sim distribution deformed as little as the data allows'. `prior` > 0 makes that a
+    PRINCIPLED pull rather than just an initial condition: it adds (prior/2)||w - w0||^2 to the loss,
+    so the fit stays near the sim unless the data demands otherwise. Projected gradient; returns w."""
     A = np.asarray(F, float).T               # (QBINS, nT): columns are basis densities
     d = np.asarray(d, float)
     nT = A.shape[1]
@@ -170,9 +218,12 @@ def fit_weights(F, d, reg=0.0, iters=20000):
         D2 = (np.diag(np.ones(nT)) * -2.0
               + np.diag(np.ones(nT - 1), 1) + np.diag(np.ones(nT - 1), -1))[1:-1]
         AtA = AtA + reg * (D2.T @ D2)
+    if prior > 0 and w0 is not None:         # (prior/2)||w - w0||^2 -> AtA += prior I, Atd += prior w0
+        AtA = AtA + prior * np.eye(nT)
+        Atd = Atd + prior * np.asarray(w0, float)
     L = float(np.linalg.eigvalsh(AtA)[-1]) or 1.0
     lr = 1.0 / L
-    w = np.full(nT, 1.0 / nT)
+    w = project_simplex(np.asarray(w0, float)) if w0 is not None else np.full(nT, 1.0 / nT)
     for _ in range(iters):
         w = project_simplex(w - lr * (AtA @ w - Atd))
     return w
@@ -204,7 +255,7 @@ def data_density_from_flow(args, prc):
 # ---------------------------------------------------------------------------
 # plots
 # ---------------------------------------------------------------------------
-def plot_basis(T, F, base_T, vals, outpath, observable, use_rst):
+def plot_basis(T, F, base_T, vals, outpath, observable, use_rst, extrap=False):
     """the mono-threshold basis family + the known-map prediction vs the nominal uniform sim."""
     f, ax = plt.subplots(1, 2, figsize=(12, 4.4))
     cmap = plt.get_cmap("plasma")
@@ -217,7 +268,7 @@ def plot_basis(T, F, base_T, vals, outpath, observable, use_rst):
     ax[0].grid(alpha=0.25, lw=0.6); ax[0].set_xlim(0, 30)
 
     jn = int(np.argmin(np.abs(T - base_T)))
-    pk = predict_known(T, F, vals)
+    pk = predict_known(T, F, vals, extrap=extrap)
     ax[1].step(CTR, F[jn], where="mid", lw=2.0, color=MC_COLORS[0],
                label=f"nominal uniform {T[jn]:.2f} ke$^-$ sim")
     ax[1].step(CTR, pk, where="mid", lw=2.0, color="#0072B2",
@@ -229,14 +280,15 @@ def plot_basis(T, F, base_T, vals, outpath, observable, use_rst):
     print(f"  wrote {outpath}")
 
 
-def plot_fit(T, F, Tf, w_fit, d, vals, prc, use_rst, outpath, observable, dlabel="data"):
+def plot_fit(T, F, Tf, w_fit, d, vals, prc, use_rst, outpath, observable, dlabel="data", extrap=False):
     """LEFT: target density vs nominal / known-map / best-fit mixtures. RIGHT: the per-pixel threshold
     distribution as density STEP histograms -- the real map (broad, all pixels) vs the best fit on a
-    fine threshold grid (so the fit is a continuous distribution, not weight on discrete nodes)."""
+    fine threshold grid spanning the FULL range (so the fit is a continuous distribution, not weight on
+    discrete nodes). The grid-backed sub-range [T_lo, T_hi] is shaded; the wings are extrapolated."""
     f, ax = plt.subplots(1, 2, figsize=(12, 4.4))
     nom = F[int(np.argmin(np.abs(T - 5.0)))]
-    pk = predict_known(T, F, vals)
-    mfit = mixture(interp_basis(T, F, Tf), w_fit)
+    pk = predict_known(T, F, vals, extrap=extrap)
+    mfit = mixture(interp_basis(T, F, Tf, extrap=extrap), w_fit)
     kind = "single-hit" if observable == "single" else "hit"
     ax[0].step(CTR, d, where="mid", lw=2.2, color=DATA_COLOR, label=dlabel)
     ax[0].step(CTR, nom, where="mid", lw=1.5, ls=":", color=MC_COLORS[0], label="nominal 5 ke$^-$ sim")
@@ -246,23 +298,25 @@ def plot_fit(T, F, Tf, w_fit, d, vals, prc, use_rst, outpath, observable, dlabel
     ax[0].set_xlabel("hit Q [ke$^-$]"); ax[0].set_ylabel("density"); ax[0].legend(fontsize=9)
     ax[0].grid(alpha=0.25, lw=0.6); ax[0].set_xlim(0, 30)
 
-    # RIGHT: threshold distribution, density step histograms (broad, not pile-ups on discrete nodes)
+    # RIGHT: threshold distribution over the FULL fit range, density step histograms
     dTf = float(Tf[1] - Tf[0])
-    tlo, thi = max(0.0, np.floor(T.min() - 1.0)), float(np.ceil(T.max() + 3.0))
-    tb = np.arange(tlo, thi + 0.25, 0.25); tc = 0.5 * (tb[1:] + tb[:-1])
-    hk, _ = np.histogram(vals, bins=tb, density=True)
-    ax[1].axvspan(float(T.min()), float(T.max()), color="0.85", alpha=0.5, zorder=0, label="basis range")
+    tlo, thi = float(Tf.min()), float(Tf.max())
+    tb = np.arange(np.floor(tlo), np.ceil(thi) + 0.25, 0.25); tc = 0.5 * (tb[1:] + tb[:-1])
+    inr = vals[(vals >= tlo) & (vals <= thi)]           # map pixels inside the modelled range
+    hk, _ = np.histogram(inr, bins=tb, density=True)
+    ax[1].axvspan(float(T.min()), float(T.max()), color="0.85", alpha=0.5, zorder=0,
+                  label="grid-backed (interp)")
     ax[1].step(tc, hk, where="mid", lw=2.0, color="#0072B2", label="known map (all pixels)")
     ax[1].step(Tf, w_fit / dTf, where="mid", lw=2.0, color="#D55E00", label=f"best fit to {dlabel}")
-    inr = vals[(vals >= T.min()) & (vals <= T.max())]
     fit_m, fit_s = moments(Tf, w_fit)
+    frac_extrap = float(((vals < T.min()) | (vals > T.max())).mean())
     ax[1].set_title(f"prc{prc}: threshold distribution")
     ax[1].set_xlabel("threshold [ke$^-$]"); ax[1].set_ylabel("pixel density [1/ke$^-$]")
-    ax[1].set_xlim(tlo, thi); ax[1].legend(fontsize=8); ax[1].grid(alpha=0.25, lw=0.6)
-    ax[1].annotate(f"map (in range): {inr.mean():.2f} $\\pm$ {inr.std():.2f} ke$^-$\n"
+    ax[1].set_xlim(tlo, thi); ax[1].legend(loc="upper right", fontsize=8); ax[1].grid(alpha=0.25, lw=0.6)
+    ax[1].annotate(f"map: {inr.mean():.2f} $\\pm$ {inr.std():.2f} ke$^-$\n"
                    f"best fit: {fit_m:.2f} $\\pm$ {fit_s:.2f} ke$^-$\n"
-                   f"{100 * inr.size / max(vals.size, 1):.0f}% of pixels in basis range",
-                   xy=(0.97, 0.97), xycoords="axes fraction", ha="right", va="top", fontsize=8,
+                   f"{100 * frac_extrap:.0f}% of pixels extrapolated (outside grid)",
+                   xy=(0.03, 0.97), xycoords="axes fraction", ha="left", va="top", fontsize=8,
                    bbox=dict(boxstyle="round", fc="white", ec="0.7", alpha=0.85))
     f.tight_layout(); f.savefig(outpath, dpi=130); plt.close(f)
     print(f"  wrote {outpath}")
@@ -295,11 +349,26 @@ def main():
                          "grid base. prc is a reset window, so this is what makes prc2 and prc16 differ.")
     ap.add_argument("--prc-step-us", type=float, default=6.4,
                     help="microseconds per prc step for --reset-per-prc (default 6.4; prc8 = 51.2 us base)")
-    ap.add_argument("--n-fine", type=int, default=41,
-                    help="number of fine threshold nodes spanned across the basis range for the fit, so the "
-                         "fitted threshold distribution is continuous/broad (default 41)")
+    ap.add_argument("--n-fine", type=int, default=81,
+                    help="number of fine threshold nodes spanned across [--thr-lo, --thr-hi] for the fit, so "
+                         "the fitted threshold distribution is continuous/broad (default 81 -> ~0.125 ke step)")
+    ap.add_argument("--thr-lo", type=float, default=1.0,
+                    help="low edge of the fit's threshold range in ke- (default 1.0; the map's floor)")
+    ap.add_argument("--thr-hi", type=float, default=11.0,
+                    help="high edge of the fit's threshold range in ke- (default 11.0 -> covers ~99%% of the "
+                         "map; the thin tail to 20 ke- folds into the top node)")
+    ap.add_argument("--no-extrapolate", dest="extrapolate", action="store_false",
+                    help="disable the linear-spline extrapolation and clamp thresholds outside the grid "
+                         "[2.5,7.5] to the edge shape (default: extrapolate so the basis spans the full range)")
+    ap.add_argument("--no-seed-map", dest="seed_map", action="store_false",
+                    help="start the fit from a uniform threshold distribution instead of seeding it at the "
+                         "known per-pixel map (the simulated distribution)")
+    ap.add_argument("--prior", type=float, default=0.0,
+                    help="strength of a (prior/2)||w-seed||^2 pull toward the sim seed (default 0 = seed is "
+                         "only the initial condition; >0 makes the fit stay near the sim unless data demands)")
     ap.add_argument("--reg", type=float, default=1e-3,
                     help="2nd-difference smoothness penalty for the fine-grid fit (default 1e-3)")
+    ap.set_defaults(extrapolate=True, seed_map=True)
     ap.add_argument("--thr-map", default=THR_MAP_DEF, help="per-pixel threshold npz (keys/values/default)")
     ap.add_argument("--outdir", default="tfit")
     ap.add_argument("--self-test", action="store_true",
@@ -325,12 +394,17 @@ def main():
             print(f"prc{prc}: no --grid basis, skipping"); continue
         T, F, Y, base_T, use_rst = load_basis(grids[prc], args.observable, prc=prc,
                                               prc_step_us=args.prc_step_us, reset_per_prc=args.reset_per_prc)
-        Tf, Ff = fine_grid(T, F, args.n_fine)
+        Tf, Ff = fine_grid(T, F, args.n_fine, args.thr_lo, args.thr_hi, extrap=args.extrapolate)
+        w0 = seed_from_map(Tf, vals_all) if args.seed_map else None
         frac_in = float(((vals_all >= T.min()) & (vals_all <= T.max())).mean())
+        frac_fit = float(((vals_all >= args.thr_lo) & (vals_all <= args.thr_hi)).mean())
         print(f"\nprc{prc}: basis T={T} ke- (base {base_T:.2f}), reset {use_rst} cyc, "
-              f"yield/shower={np.round(Y,1)}, {100*frac_in:.1f}% of pixels inside basis range")
-        plot_basis(T, F, base_T, vals_all,
-                   os.path.join(args.outdir, f"thrfit_basis_prc{prc}.png"), args.observable, use_rst)
+              f"yield/shower={np.round(Y,1)}; fit range [{args.thr_lo:.1f},{args.thr_hi:.1f}] ke- "
+              f"({'extrap' if args.extrapolate else 'clamped'}, seed={'sim-map' if args.seed_map else 'uniform'}"
+              f"{', prior '+str(args.prior) if args.prior>0 else ''}); {100*frac_in:.1f}% of pixels in grid "
+              f"[{T.min():.2f},{T.max():.2f}], {100*frac_fit:.1f}% in fit range")
+        plot_basis(T, F, base_T, vals_all, os.path.join(args.outdir, f"thrfit_basis_prc{prc}.png"),
+                   args.observable, use_rst, extrap=args.extrapolate)
 
         if args.self_test:
             # (1) delta recovery: pseudo-data = the nominal node -> weights should concentrate there.
@@ -345,13 +419,13 @@ def main():
                   f"(max abs err {np.max(np.abs(w_true-w_rec)):.3f})")
             # (3) the physics closure: fit the known-map prediction on the fine grid -> should recover
             #     the real in-range threshold spread (mean/sd), continuous (not spiked on nodes).
-            pk = predict_known(T, F, vals_all)
-            w_k = fit_weights(Ff, pk, reg=args.reg)
+            pk = predict_known(T, F, vals_all, extrap=args.extrapolate)
+            w_k = fit_weights(Ff, pk, reg=args.reg, w0=w0, prior=args.prior)
             plot_fit(T, F, Tf, w_k, pk, vals_all, prc, use_rst,
                      os.path.join(args.outdir, f"thrfit_selftest_prc{prc}.png"),
-                     args.observable, dlabel="known-map mixture (pseudo-data)")
-            inr = vals_all[(vals_all >= T.min()) & (vals_all <= T.max())]
-            print(f"  closure: map in-range {inr.mean():.2f}+/-{inr.std():.2f} ke- vs "
+                     args.observable, dlabel="known-map mixture (pseudo-data)", extrap=args.extrapolate)
+            inr = vals_all[(vals_all >= args.thr_lo) & (vals_all <= args.thr_hi)]
+            print(f"  closure: map in fit range {inr.mean():.2f}+/-{inr.std():.2f} ke- vs "
                   f"fit-of-known {moments(Tf, w_k)[0]:.2f}+/-{moments(Tf, w_k)[1]:.2f} ke-")
             continue
 
@@ -366,10 +440,10 @@ def main():
             d, ndat = data_density_from_flow(args, prc)
             np.savez(os.path.join(args.outdir, f"data_density_prc{prc}.npz"),
                      ctr=CTR, density=d, n=ndat, observable=args.observable, reset=use_rst)
-        w_fit = fit_weights(Ff, d, reg=args.reg)
+        w_fit = fit_weights(Ff, d, reg=args.reg, w0=w0, prior=args.prior)
         plot_fit(T, F, Tf, w_fit, d, vals_all, prc, use_rst,
-                 os.path.join(args.outdir, f"thrfit_prc{prc}.png"), args.observable)
-        inr = vals_all[(vals_all >= T.min()) & (vals_all <= T.max())]
+                 os.path.join(args.outdir, f"thrfit_prc{prc}.png"), args.observable, extrap=args.extrapolate)
+        inr = vals_all[(vals_all >= args.thr_lo) & (vals_all <= args.thr_hi)]
         print(f"  prc{prc} (reset {use_rst} cyc): best-fit thresholds {moments(Tf, w_fit)[0]:.2f}"
               f"+/-{moments(Tf, w_fit)[1]:.2f} ke- vs known map {inr.mean():.2f}+/-{inr.std():.2f} "
               f"(n_data={ndat})")
