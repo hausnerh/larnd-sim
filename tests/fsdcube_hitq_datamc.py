@@ -497,7 +497,6 @@ def main():
     # family, with only the colour varying by scanned value (the nominal is still tagged in the
     # legend label, not by a heavier line) -- keeps the data/kramer-sim styling untouched.
     gstyle = lambda gn: dict(ls=":", lw=1.6, color=gn["color"], alpha=0.95, zorder=3)
-    GSUF = "  (+ sim scan)" if all_grid_nodes else ""
     LEG_FS = 7 if all_grid_nodes else 8
 
     # pixel hit-multiplicity x-axis: run out to the data (and overlaid sim) max, capped at --mult-max
@@ -511,8 +510,8 @@ def main():
     # The whole plot set for one normalization scheme, with every data/MC series passed through `sub`
     # (identity for the full sample; a per-pixel-threshold mask for a threshold bin). The dotted mono
     # sweep stays the FULL family in every panel so a threshold-bin's data/MC can be read against the
-    # mono node at that same threshold. `tag` -> a subdir; `tnote` -> appended to each suptitle.
-    def emit_plots(scheme, sub, tag="", tnote=""):
+    # mono node at that same threshold. `tag` -> a subdir (the threshold-bin window, kept off-plot).
+    def emit_plots(scheme, sub, tag=""):
         sdir = os.path.join(args.outdir, scheme, tag) if tag else os.path.join(args.outdir, scheme)
         os.makedirs(sdir, exist_ok=True)
 
@@ -535,8 +534,6 @@ def main():
                 ax.set_title(f"prc{prc}"); ax.set_xlabel(R"Hit Q [ke$^-$]")
                 ax.set_ylabel(YLAB[scheme]); ax.set_xlim(QMIN, QMAX)
                 ax.legend(fontsize=LEG_FS); ax.grid(alpha=.5, color=GRID_COLOR, lw=0.6)
-            fig.suptitle(f"FSDCube Hit Q -- {title} -- data vs sim  [{NOTE[scheme]}]{GSUF}{tnote}",
-                         fontsize=13)
             fig.tight_layout(); fig.savefig(f"{sdir}/hitq_split_{slug}.png", dpi=120)
             plt.close(fig)
             print(f"wrote {sdir}/hitq_split_{slug}.png")
@@ -560,8 +557,6 @@ def main():
             ax.set_ylabel("Fraction of fired pixels" if scheme == "density" else YLAB[scheme])
             ax.set_xlim(0.5, NM + 0.5); ax.set_xticks(xticks)
             ax.legend(fontsize=LEG_FS); ax.grid(alpha=.5, color=GRID_COLOR, lw=0.6)
-        fig.suptitle(f"FSDCube pixel hit-multiplicity -- data vs sim  [{NOTE[scheme]}]{GSUF}{tnote}",
-                     fontsize=13)
         fig.tight_layout(); fig.savefig(f"{sdir}/hitq_pixmult.png", dpi=120)
         plt.close(fig)
         print(f"wrote {sdir}/hitq_pixmult.png")
@@ -584,8 +579,6 @@ def main():
             ax.set_title(f"prc{prc}"); ax.set_xlabel(R"last-hit Q [ke$^-$]")
             ax.set_ylabel(YLAB[scheme]); ax.set_xlim(QMIN, QMAX)
             ax.legend(fontsize=LEG_FS); ax.grid(alpha=.5, color=GRID_COLOR, lw=0.6)
-        fig.suptitle(f"FSDCube per-pixel last-hit charge -- data vs sim  [{NOTE[scheme]}]{GSUF}{tnote}",
-                     fontsize=13)
         fig.tight_layout(); fig.savefig(f"{sdir}/hitq_lasthit.png", dpi=120)
         plt.close(fig)
         print(f"wrote {sdir}/hitq_lasthit.png")
@@ -619,8 +612,6 @@ def main():
                 ax.set_ylabel("Fraction of hit pairs" if scheme == "density" else YLAB[scheme])
                 ax.set_xlim(_bins[0], _bins[-1])
                 ax.legend(fontsize=LEG_FS); ax.grid(alpha=.5, color=GRID_COLOR, lw=0.6)
-            fig.suptitle(f"FSDCube time between consecutive hits on a pixel -- data vs sim  "
-                         f"[{NOTE[scheme]}]{tnote}{_zlab}", fontsize=13)
             fig.tight_layout(); fig.savefig(f"{sdir}/{_fname}", dpi=120)
             plt.close(fig)
             print(f"wrote {sdir}/{_fname}")
@@ -679,7 +670,7 @@ def main():
     for scheme in args.norm:
         emit_plots(scheme, lambda t: t)                     # full sample (all pixels)
         for tag, lo, hi, note in thr_bins:                  # per-pixel-threshold bins (if --thr-bins)
-            emit_plots(scheme, bin_sub(lo, hi), tag=f"thrbin_{tag}", tnote=f"  [{note}]")
+            emit_plots(scheme, bin_sub(lo, hi), tag=f"thrbin_{tag}")
 
 
 if __name__ == "__main__":

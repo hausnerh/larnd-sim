@@ -46,6 +46,9 @@ DT_FLAG=""
 # already carries those nodes, so no rerun is needed. GRID_RESET_PER_PRC=0 reverts to the grid base.
 [ "${GRID_RESET_PER_PRC:-1}" = "1" ] && GRID_RESET_FLAG="--grid-reset-per-prc" || GRID_RESET_FLAG=""
 [ -n "${PRC_STEP_US:-}" ] && GRID_RESET_FLAG="$GRID_RESET_FLAG --prc-step-us $PRC_STEP_US"
+# the threshold-mixture fit (fsdcube_threshold_fit.py) takes the SAME per-prc reset node:
+[ "${GRID_RESET_PER_PRC:-1}" = "1" ] && TFIT_RESET_FLAG="--reset-per-prc" || TFIT_RESET_FLAG=""
+[ -n "${PRC_STEP_US:-}" ] && TFIT_RESET_FLAG="$TFIT_RESET_FLAG --prc-step-us $PRC_STEP_US"
 
 if [ "$#" -eq 0 ]; then
   echo "!! no 'prc=path' grid tokens given as positional args -- plotting data/MC with NO sweep overlay"
@@ -61,5 +64,16 @@ echo "  grid-reset:${GRID_RESET_FLAG:- grid-base (GRID_RESET_PER_PRC=0)}"
 python tests/fsdcube_hitq_datamc.py \
   --prc $PRCS --sim-r $SIM_R --norm $NORM $THRBINS_FLAG $GRID_FLAG $DT_FLAG $GRID_RESET_FLAG \
   --outdir "$PLOT_OUT" $PLOT_EXTRA
+
+# ALSO the threshold-mixture fit of the DATA hit-Q spectrum (models it as a mixture over per-pixel
+# thresholds built from the mono-threshold sim; reads FLOW itself). Same grid + prc + per-prc reset
+# as the overlay. THRFIT=0 to skip; THRFIT_EXTRA for extra flags (e.g. --observable hit). Non-fatal:
+# a fit failure must not lose the main plots that already wrote above.
+if [ "${THRFIT:-1}" = "1" ] && [ "$#" -gt 0 ]; then
+  echo "threshold-mixture fit -> $PLOT_OUT/thrfit  (reset:${TFIT_RESET_FLAG:- grid-base})"
+  python tests/fsdcube_threshold_fit.py \
+    --prc $PRCS --grid "$@" --outdir "$PLOT_OUT/thrfit" $TFIT_RESET_FLAG ${THRFIT_EXTRA:-} \
+    || echo "!! threshold fit failed (non-fatal) -- the main plots in $PLOT_OUT are already written"
+fi
 
 echo "PLOTS -> $PLOT_OUT"

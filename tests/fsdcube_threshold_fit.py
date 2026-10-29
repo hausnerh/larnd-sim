@@ -63,8 +63,13 @@ def density(x):
 # ---------------------------------------------------------------------------
 # basis: mono-threshold sim densities from the grid
 # ---------------------------------------------------------------------------
-def load_basis(path, observable="single"):
-    """ti_mult_grid.npz -> (T[ke- sorted], F[nT, QBINS] density rows, Y[nT] entries/shower, base_T).
+def load_basis(path, observable="single", prc=None, prc_step_us=6.4, reset_per_prc=False):
+    """ti_mult_grid.npz -> (T[ke- sorted], F[nT, QBINS] density rows, Y[nT] entries/shower, base_T, rst).
+
+    The basis rows are taken at ONE reset node. By default that is the grid's base reset; with
+    reset_per_prc the reset is the one MATCHING this prc (a reset window: cycles = round(prc *
+    prc_step_us / ts), e.g. prc2 -> 128 cyc, prc16 -> 1024), so each prc's basis is the sim read out
+    at its own reset -- which actually differ. `rst` (the reset used, cycles) is returned for labels.
 
     observable:
       'single' -- single-hit-pixel charge (node_q where node_n==1). For a single-hit pixel the
@@ -75,20 +80,22 @@ def load_basis(path, observable="single"):
     g = np.load(path, allow_pickle=True)
     thr = np.asarray(g["node_thr"], float); rst = np.asarray(g["node_rst"], int)
     base_rst = int(g["meta_base_reset"]); base_T = float(g["meta_base_threshold"]) / 1000.0
+    ts = float(g["meta_ts"]) if "meta_ts" in g.files else 0.1
+    use_rst = int(round(prc * prc_step_us / ts)) if (reset_per_prc and prc is not None) else base_rst
     nsh = max(int(g["meta_n_shower"]), 1)
-    Ts = sorted(set(thr.tolist()))
+    Ts = sorted({t for t, r in zip(thr.tolist(), rst.tolist()) if r == use_rst})
+    if not Ts:
+        raise SystemExit(f"{path}: no nodes at reset {use_rst} cyc (resets present: "
+                         f"{sorted(set(int(r) for r in rst))}); check --prc-step-us / --reset-per-prc")
     F, Y = [], []
     for T in Ts:
-        hits = [k for k in range(len(thr)) if thr[k] == T and rst[k] == base_rst]
-        if not hits:
-            raise SystemExit(f"{path}: no node at threshold {T} e-, reset {base_rst}")
-        i = hits[0]
+        i = next(k for k in range(len(thr)) if thr[k] == T and rst[k] == use_rst)
         q = np.asarray(g["node_q"][i], float) / 1000.0
         n = np.asarray(g["node_n"][i], np.int16)
         phq = np.asarray(g["node_phq"][i], float) / 1000.0
         x = q[n == 1] if observable == "single" else phq
         F.append(density(x)); Y.append(x.size / nsh)
-    return np.array(Ts) / 1000.0, np.vstack(F), np.array(Y), base_T
+    return np.array(Ts) / 1000.0, np.vstack(F), np.array(Y), base_T, use_rst
 
 
 def interp_basis(T, F, Tq):
@@ -110,12 +117,21 @@ def map_thresholds(thr_map_path):
     return dense
 
 
-def coarse_pdf(vals, T):
-    """pixel-weighted pdf of thresholds `vals` onto the coarse basis grid T (nearest-threshold bins)."""
-    edges = np.r_[-np.inf, 0.5 * (T[1:] + T[:-1]), np.inf]
-    w, _ = np.histogram(np.asarray(vals, float), bins=edges)
-    s = w.sum()
-    return w / s if s else w.astype(float)
+def fine_grid(T, F, n_fine):
+    """A fine threshold axis spanning the basis range + the interpolated density rows on it.
+    Fitting on this (not the few native nodes) is what gives a BROAD threshold distribution rather
+    than weight piling up on the discrete grid thresholds."""
+    Tf = np.linspace(float(T.min()), float(T.max()), int(n_fine))
+    return Tf, interp_basis(T, F, Tf)
+
+
+def moments(T, w):
+    """(mean, sd) in ke- of a threshold weight vector w over nodes T (w need not be normalized)."""
+    w = np.asarray(w, float); s = w.sum()
+    if s <= 0:
+        return float("nan"), float("nan")
+    m = float((w * T).sum() / s)
+    return m, float(max((w * (T - m) ** 2).sum() / s, 0.0)) ** 0.5
 
 
 def predict_known(T, F, vals):
@@ -188,7 +204,7 @@ def data_density_from_flow(args, prc):
 # ---------------------------------------------------------------------------
 # plots
 # ---------------------------------------------------------------------------
-def plot_basis(T, F, base_T, vals, outpath, observable):
+def plot_basis(T, F, base_T, vals, outpath, observable, use_rst):
     """the mono-threshold basis family + the known-map prediction vs the nominal uniform sim."""
     f, ax = plt.subplots(1, 2, figsize=(12, 4.4))
     cmap = plt.get_cmap("plasma")
@@ -196,7 +212,7 @@ def plot_basis(T, F, base_T, vals, outpath, observable):
         ax[0].step(CTR, F[j], where="mid", lw=1.6,
                    color=cmap(0.06 + 0.82 * j / max(len(T) - 1, 1)),
                    label=f"{Tj:.2f} ke$^-$" + (" (nom)" if abs(Tj - base_T) < 1e-6 else ""))
-    ax[0].set_title(f"mono-threshold basis  f$_T$(Q)   [{observable}]")
+    ax[0].set_title(f"mono-threshold basis  f$_T$(Q)   [{observable}, reset {use_rst} cyc]")
     ax[0].set_xlabel("hit Q [ke$^-$]"); ax[0].set_ylabel("density"); ax[0].legend(fontsize=8)
     ax[0].grid(alpha=0.25, lw=0.6); ax[0].set_xlim(0, 30)
 
@@ -206,35 +222,48 @@ def plot_basis(T, F, base_T, vals, outpath, observable):
                label=f"nominal uniform {T[jn]:.2f} ke$^-$ sim")
     ax[1].step(CTR, pk, where="mid", lw=2.0, color="#0072B2",
                label="known-map mixture (real per-pixel thr)")
-    ax[1].set_title("what the known threshold SPREAD predicts")
+    ax[1].set_title("known-map prediction vs nominal")
     ax[1].set_xlabel("hit Q [ke$^-$]"); ax[1].set_ylabel("density"); ax[1].legend(fontsize=9)
     ax[1].grid(alpha=0.25, lw=0.6); ax[1].set_xlim(0, 30)
     f.tight_layout(); f.savefig(outpath, dpi=130); plt.close(f)
     print(f"  wrote {outpath}")
 
 
-def plot_fit(T, F, d, w_fit, vals, prc, outpath, observable, dlabel="data"):
-    """target density vs nominal / known-map / best-fit mixtures, and the fitted threshold pdf vs map."""
+def plot_fit(T, F, Tf, w_fit, d, vals, prc, use_rst, outpath, observable, dlabel="data"):
+    """LEFT: target density vs nominal / known-map / best-fit mixtures. RIGHT: the per-pixel threshold
+    distribution as density STEP histograms -- the real map (broad, all pixels) vs the best fit on a
+    fine threshold grid (so the fit is a continuous distribution, not weight on discrete nodes)."""
     f, ax = plt.subplots(1, 2, figsize=(12, 4.4))
-    jn = int(np.argmin(np.abs(T - np.mean(T))))
     nom = F[int(np.argmin(np.abs(T - 5.0)))]
     pk = predict_known(T, F, vals)
-    mfit = mixture(F, w_fit)
+    mfit = mixture(interp_basis(T, F, Tf), w_fit)
+    kind = "single-hit" if observable == "single" else "hit"
     ax[0].step(CTR, d, where="mid", lw=2.2, color=DATA_COLOR, label=dlabel)
     ax[0].step(CTR, nom, where="mid", lw=1.5, ls=":", color=MC_COLORS[0], label="nominal 5 ke$^-$ sim")
     ax[0].step(CTR, pk, where="mid", lw=1.6, ls="--", color="#0072B2", label="known-map mixture")
     ax[0].step(CTR, mfit, where="mid", lw=2.0, color="#D55E00", label="best-fit mixture")
-    ax[0].set_title(f"prc{prc}: hit-Q density [{observable}]")
+    ax[0].set_title(f"prc{prc}: {kind} Q density [reset {use_rst} cyc]")
     ax[0].set_xlabel("hit Q [ke$^-$]"); ax[0].set_ylabel("density"); ax[0].legend(fontsize=9)
     ax[0].grid(alpha=0.25, lw=0.6); ax[0].set_xlim(0, 30)
 
-    wmap = coarse_pdf(vals, T)
-    width = 0.38 * (T[1] - T[0])
-    ax[1].bar(T - width / 2, wmap, width, color="#0072B2", alpha=0.8, label="known map")
-    ax[1].bar(T + width / 2, w_fit, width, color="#D55E00", alpha=0.8, label="best fit to " + dlabel)
+    # RIGHT: threshold distribution, density step histograms (broad, not pile-ups on discrete nodes)
+    dTf = float(Tf[1] - Tf[0])
+    tlo, thi = max(0.0, np.floor(T.min() - 1.0)), float(np.ceil(T.max() + 3.0))
+    tb = np.arange(tlo, thi + 0.25, 0.25); tc = 0.5 * (tb[1:] + tb[:-1])
+    hk, _ = np.histogram(vals, bins=tb, density=True)
+    ax[1].axvspan(float(T.min()), float(T.max()), color="0.85", alpha=0.5, zorder=0, label="basis range")
+    ax[1].step(tc, hk, where="mid", lw=2.0, color="#0072B2", label="known map (all pixels)")
+    ax[1].step(Tf, w_fit / dTf, where="mid", lw=2.0, color="#D55E00", label=f"best fit to {dlabel}")
+    inr = vals[(vals >= T.min()) & (vals <= T.max())]
+    fit_m, fit_s = moments(Tf, w_fit)
     ax[1].set_title(f"prc{prc}: threshold distribution")
-    ax[1].set_xlabel("threshold [ke$^-$]"); ax[1].set_ylabel("fraction of pixels"); ax[1].legend(fontsize=9)
-    ax[1].grid(alpha=0.25, lw=0.6)
+    ax[1].set_xlabel("threshold [ke$^-$]"); ax[1].set_ylabel("pixel density [1/ke$^-$]")
+    ax[1].set_xlim(tlo, thi); ax[1].legend(fontsize=8); ax[1].grid(alpha=0.25, lw=0.6)
+    ax[1].annotate(f"map (in range): {inr.mean():.2f} $\\pm$ {inr.std():.2f} ke$^-$\n"
+                   f"best fit: {fit_m:.2f} $\\pm$ {fit_s:.2f} ke$^-$\n"
+                   f"{100 * inr.size / max(vals.size, 1):.0f}% of pixels in basis range",
+                   xy=(0.97, 0.97), xycoords="axes fraction", ha="right", va="top", fontsize=8,
+                   bbox=dict(boxstyle="round", fc="white", ec="0.7", alpha=0.85))
     f.tight_layout(); f.savefig(outpath, dpi=130); plt.close(f)
     print(f"  wrote {outpath}")
 
@@ -260,6 +289,17 @@ def main():
     ap.add_argument("--prc", type=int, nargs="+", default=[2, 16])
     ap.add_argument("--observable", choices=["single", "hit"], default="single",
                     help="single = single-hit-pixel Q (default, sharpest turn-on); hit = every hit's Q")
+    ap.add_argument("--reset-per-prc", action="store_true",
+                    help="take each prc's basis at the reset node MATCHING its reset window (cycles = "
+                         "round(prc * --prc-step-us / grid ts); prc2 -> 128, prc16 -> 1024) instead of the "
+                         "grid base. prc is a reset window, so this is what makes prc2 and prc16 differ.")
+    ap.add_argument("--prc-step-us", type=float, default=6.4,
+                    help="microseconds per prc step for --reset-per-prc (default 6.4; prc8 = 51.2 us base)")
+    ap.add_argument("--n-fine", type=int, default=41,
+                    help="number of fine threshold nodes spanned across the basis range for the fit, so the "
+                         "fitted threshold distribution is continuous/broad (default 41)")
+    ap.add_argument("--reg", type=float, default=1e-3,
+                    help="2nd-difference smoothness penalty for the fine-grid fit (default 1e-3)")
     ap.add_argument("--thr-map", default=THR_MAP_DEF, help="per-pixel threshold npz (keys/values/default)")
     ap.add_argument("--outdir", default="tfit")
     ap.add_argument("--self-test", action="store_true",
@@ -283,12 +323,14 @@ def main():
     for prc in args.prc:
         if prc not in grids:
             print(f"prc{prc}: no --grid basis, skipping"); continue
-        T, F, Y, base_T = load_basis(grids[prc], args.observable)
+        T, F, Y, base_T, use_rst = load_basis(grids[prc], args.observable, prc=prc,
+                                              prc_step_us=args.prc_step_us, reset_per_prc=args.reset_per_prc)
+        Tf, Ff = fine_grid(T, F, args.n_fine)
         frac_in = float(((vals_all >= T.min()) & (vals_all <= T.max())).mean())
-        print(f"\nprc{prc}: basis T={T} ke- (base {base_T:.2f}), single-hit yield/shower={np.round(Y,1)}, "
-              f"{100*frac_in:.1f}% of pixels inside basis range")
+        print(f"\nprc{prc}: basis T={T} ke- (base {base_T:.2f}), reset {use_rst} cyc, "
+              f"yield/shower={np.round(Y,1)}, {100*frac_in:.1f}% of pixels inside basis range")
         plot_basis(T, F, base_T, vals_all,
-                   os.path.join(args.outdir, f"thrfit_basis_prc{prc}.png"), args.observable)
+                   os.path.join(args.outdir, f"thrfit_basis_prc{prc}.png"), args.observable, use_rst)
 
         if args.self_test:
             # (1) delta recovery: pseudo-data = the nominal node -> weights should concentrate there.
@@ -301,14 +343,16 @@ def main():
             w_rec = fit_weights(F, mixture(F, w_true))
             print(f"  self-test mixture: true {np.round(w_true,3)} -> recovered {np.round(w_rec,3)}  "
                   f"(max abs err {np.max(np.abs(w_true-w_rec)):.3f})")
-            # (3) the physics closure: fit the known-map prediction -> should resemble the map's pdf.
+            # (3) the physics closure: fit the known-map prediction on the fine grid -> should recover
+            #     the real in-range threshold spread (mean/sd), continuous (not spiked on nodes).
             pk = predict_known(T, F, vals_all)
-            w_k = fit_weights(F, pk)
-            plot_fit(T, F, pk, w_k, vals_all, prc,
+            w_k = fit_weights(Ff, pk, reg=args.reg)
+            plot_fit(T, F, Tf, w_k, pk, vals_all, prc, use_rst,
                      os.path.join(args.outdir, f"thrfit_selftest_prc{prc}.png"),
                      args.observable, dlabel="known-map mixture (pseudo-data)")
-            print(f"  known-map coarse pdf = {np.round(coarse_pdf(vals_all,T),3)}  "
-                  f"fit-of-known      = {np.round(w_k,3)}")
+            inr = vals_all[(vals_all >= T.min()) & (vals_all <= T.max())]
+            print(f"  closure: map in-range {inr.mean():.2f}+/-{inr.std():.2f} ke- vs "
+                  f"fit-of-known {moments(Tf, w_k)[0]:.2f}+/-{moments(Tf, w_k)[1]:.2f} ke-")
             continue
 
         # real target density: saved npz, or read from FLOW
@@ -321,12 +365,14 @@ def main():
                 args.data_base = DATA_BASE_DEF
             d, ndat = data_density_from_flow(args, prc)
             np.savez(os.path.join(args.outdir, f"data_density_prc{prc}.npz"),
-                     ctr=CTR, density=d, n=ndat, observable=args.observable)
-        w_fit = fit_weights(F, d)
-        plot_fit(T, F, d, w_fit, vals_all, prc,
+                     ctr=CTR, density=d, n=ndat, observable=args.observable, reset=use_rst)
+        w_fit = fit_weights(Ff, d, reg=args.reg)
+        plot_fit(T, F, Tf, w_fit, d, vals_all, prc, use_rst,
                  os.path.join(args.outdir, f"thrfit_prc{prc}.png"), args.observable)
-        print(f"  prc{prc}: known-map coarse pdf = {np.round(coarse_pdf(vals_all,T),3)}")
-        print(f"  prc{prc}: best-fit-to-data     = {np.round(w_fit,3)}  (n_data={ndat})")
+        inr = vals_all[(vals_all >= T.min()) & (vals_all <= T.max())]
+        print(f"  prc{prc} (reset {use_rst} cyc): best-fit thresholds {moments(Tf, w_fit)[0]:.2f}"
+              f"+/-{moments(Tf, w_fit)[1]:.2f} ke- vs known map {inr.mean():.2f}+/-{inr.std():.2f} "
+              f"(n_data={ndat})")
 
     print(f"\nwrote plots -> {args.outdir}/")
 
