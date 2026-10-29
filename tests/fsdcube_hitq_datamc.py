@@ -275,6 +275,16 @@ def main():
     ap.add_argument("--grid-fixed", type=float, default=None,
                     help="value to hold the OTHER grid axis at (default: the grid's base threshold/reset). "
                          "threshold scan -> fixes reset; reset scan -> fixes threshold.")
+    ap.add_argument("--grid-reset-per-prc", action="store_true",
+                    help="threshold scan only: fix the overlaid sim reset to the node MATCHING each data "
+                         "prc. prc is a periodic-reset WINDOW, so cycles = round(prc * --prc-step-us / grid "
+                         "ts) -> prc2 = 128 cyc (12.8 us), prc16 = 1024 cyc (102.4 us), prc8 = 512 (nominal). "
+                         "Each panel is then compared to the sim read out at ITS own reset instead of the "
+                         "grid's base, which is the whole point of the prc comparison. Overrides --grid-fixed. "
+                         "Lets one shared grid serve every prc: --grid one.npz (drawn on all panels).")
+    ap.add_argument("--prc-step-us", type=float, default=6.4,
+                    help="microseconds per prc step for --grid-reset-per-prc (default 6.4; prc8 = 51.2 us = "
+                         "the nominal fsd_cube reset = 512 cycles at ts=0.1 us).")
     ap.add_argument("--grid-max-curves", type=int, default=6,
                     help="cap how many scan nodes are overlaid, evenly subsampled with endpoints kept "
                          "(default 6)")
@@ -393,20 +403,34 @@ def main():
     # curve's n==1 area to 1, so the sim scan is shape-comparable to the real curves despite being a
     # completely different sample + pipeline. node_phq/phn = per-hit, node_n = per-pixel mult, node_ql =
     # per-pixel last-hit Q (newer grids only). Charges are electrons in the grid -> /1000 to ke-.
-    def build_grid_nodes(path):
-        """Load ONE ti_mult_grid.npz -> the list of overlay node dicts for the selected scan."""
+    def build_grid_nodes(path, prc=None):
+        """Load ONE ti_mult_grid.npz -> the list of overlay node dicts for the selected scan.
+
+        With --grid-reset-per-prc, a threshold scan fixes the reset to the node matching this panel's
+        `prc` (a reset window: cycles = round(prc * --prc-step-us / grid ts)), so each data prc is
+        compared to the sim read out at its OWN reset rather than the grid's base."""
         nodes = []
         g = np.load(path, allow_pickle=True)
         g_thr = np.asarray(g["node_thr"], float); g_rst = np.asarray(g["node_rst"], int)
         base_thr = float(g["meta_base_threshold"]); base_rst = int(g["meta_base_reset"])
+        ts_meta = float(g["meta_ts"]) if "meta_ts" in g.files else 0.1
         nsh_grid = max(int(g["meta_n_shower"]), 1)
         samp = str(g["meta_sample"].item()) if "meta_sample" in g.files else "showers"
         has_ql = "node_ql" in g.files
         if args.grid_scan == "threshold":
-            fixed = int(args.grid_fixed) if args.grid_fixed is not None else base_rst
+            if args.grid_reset_per_prc and prc is not None:
+                fixed = int(round(prc * args.prc_step_us / ts_meta))   # prc window -> reset cycles
+            elif args.grid_fixed is not None:
+                fixed = int(args.grid_fixed)
+            else:
+                fixed = base_rst
             idx = sorted((i for i in range(len(g_thr)) if g_rst[i] == fixed), key=lambda i: g_thr[i])
             labof = lambda i: f"sim {g_thr[i]/1000:.2f} ke$^-$" + (" (nom)" if g_thr[i] == base_thr else "")
-            fixnote = f"reset {'off' if fixed < 0 else f'{fixed} cyc'}"
+            fixnote = (f"reset {'off' if fixed < 0 else f'{fixed} cyc = {fixed*ts_meta:.1f} us'}"
+                       + (f" (prc{prc})" if args.grid_reset_per_prc and prc is not None else ""))
+            if not idx and args.grid_reset_per_prc and prc is not None:
+                print(f"  !! --grid-reset-per-prc: grid has no node at reset {fixed} cyc for prc{prc} "
+                      f"(resets present: {sorted(set(int(r) for r in g_rst))}) -> this panel gets NO overlay")
         else:
             fixed = float(args.grid_fixed) if args.grid_fixed is not None else base_thr
             idx = sorted((i for i in range(len(g_thr)) if g_thr[i] == fixed),
@@ -456,8 +480,10 @@ def main():
                          f"or 'prc=path' tokens.")
 
     grid_by_prc = parse_grid_arg(args.grid, args.prc)
-    grid_cache = {p: build_grid_nodes(p) for p in dict.fromkeys(grid_by_prc.values())}  # load each once
-    grid_nodes_by_prc = {prc: grid_cache[path] for prc, path in grid_by_prc.items()}
+    # Build per prc (not cached by path): with --grid-reset-per-prc the selected reset node depends on
+    # the prc, so one shared grid yields a DIFFERENT overlay per panel (prc2 -> reset 128, prc16 -> 1024).
+    grid_nodes_by_prc = {prc: build_grid_nodes(grid_by_prc[prc], prc)
+                         for prc in args.prc if prc in grid_by_prc}
     all_grid_nodes = [gn for prc in args.prc for gn in grid_nodes_by_prc.get(prc, [])]
 
     def grid_weight(scheme, gn, hsum):               # mirrors weight(), for a grid node
