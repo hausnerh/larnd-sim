@@ -10,9 +10,10 @@
 #   basis        f_T(Q): the single-hit-pixel charge density the sim produces when EVERY pixel has
 #                threshold T. The grid carries it at T in {2.5, 3.75, 5, 6.25, 7.5} ke- (base reset),
 #                and its peak tracks T (a clean threshold turn-on), so it is a good mixing basis.
-#   interpolate  f_T(Q) linearly (per Q-bin) in T, so ANY threshold in [T_lo, T_hi] has a shape; with
-#                --extrapolate the end slopes are CONTINUED (a linear spline) so thresholds below/above
-#                the grid also get a shape, letting the basis span the full 1-11 ke- map from 5 nodes.
+#   interpolate  f_T(Q) linearly (per Q-bin) in T, so ANY threshold between grid nodes has a shape. The
+#                grid SHOULD be simulated across the per-pixel map range (THRESHOLDS 1.25..11.25 ke- in
+#                shower_grid_array.sh); --extrapolate then CONTINUES the end slopes (a linear spline) only
+#                to fill the small residual of pixels below/above the simulated node range.
 #   predict      P_known(Q) = < f_{T_pix}(Q) > over the REAL per-pixel threshold map
 #                (larndsim/bin/thresholds_fsdcube.npz) -- "what we expect given the known thresholds".
 #                Compare to the nominal uniform-threshold sim (should be close) and to the data.
@@ -119,9 +120,10 @@ def interp_basis(T, F, Tq, extrap=False):
     """per-Q-bin interpolation of the density rows F(T) to query thresholds Tq. extrap=False clips Tq
     to [T_lo, T_hi] (np.interp's flat clamp). extrap=True LINEARLY EXTRAPOLATES each Q-bin's density
     past the grid's end thresholds (a linear spline), so thresholds below T_lo / above T_hi get an
-    extrapolated turn-on rather than the edge shape -- this is what lets the basis span the full
-    1-11 ke- threshold range from 5 grid nodes at [2.5, 7.5]. A linear-extrapolated density bin can
-    dip < 0, so rows are floored at 0 and each output row is renormalized to area 1."""
+    extrapolated turn-on rather than the edge shape. This is meant to fill only the SMALL residual
+    outside the simulated node range -- the bulk should be covered by actual grid nodes (grow the
+    grid's THRESHOLDS to [1.25, 11.25] ke-), with extrapolation just catching the thin tails. A
+    linear-extrapolated density bin can dip < 0, so rows are floored at 0 and each row renormalized."""
     T = np.asarray(T, float); Tq = np.asarray(Tq, float)
     if extrap:
         G = np.column_stack([_lin_extrap(T, F[:, b], Tq) for b in range(F.shape[1])])  # (nq, QBINS)
@@ -352,14 +354,16 @@ def main():
     ap.add_argument("--n-fine", type=int, default=81,
                     help="number of fine threshold nodes spanned across [--thr-lo, --thr-hi] for the fit, so "
                          "the fitted threshold distribution is continuous/broad (default 81 -> ~0.125 ke step)")
-    ap.add_argument("--thr-lo", type=float, default=1.0,
-                    help="low edge of the fit's threshold range in ke- (default 1.0; the map's floor)")
-    ap.add_argument("--thr-hi", type=float, default=11.0,
-                    help="high edge of the fit's threshold range in ke- (default 11.0 -> covers ~99%% of the "
-                         "map; the thin tail to 20 ke- folds into the top node)")
+    ap.add_argument("--thr-lo", type=float, default=1.25,
+                    help="low edge of the fit's threshold range in ke- (default 1.25 = the bottom SIMULATED "
+                         "grid node once the basis is grown to span [1.25,11.25])")
+    ap.add_argument("--thr-hi", type=float, default=11.25,
+                    help="high edge of the fit's threshold range in ke- (default 11.25 = the top simulated "
+                         "node; covers ~99%% of the map, the thin tail to 20 ke- folds into the top node)")
     ap.add_argument("--no-extrapolate", dest="extrapolate", action="store_false",
-                    help="disable the linear-spline extrapolation and clamp thresholds outside the grid "
-                         "[2.5,7.5] to the edge shape (default: extrapolate so the basis spans the full range)")
+                    help="disable the linear-spline extrapolation and clamp thresholds outside the simulated "
+                         "node range to the edge shape. With a basis grown to [1.25,11.25] the fit range is "
+                         "all interpolation, so extrapolation then only fills the small <lo / >hi residual.")
     ap.add_argument("--no-seed-map", dest="seed_map", action="store_false",
                     help="start the fit from a uniform threshold distribution instead of seeding it at the "
                          "known per-pixel map (the simulated distribution)")
