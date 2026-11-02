@@ -49,6 +49,16 @@ DT_FLAG=""
 # the threshold-mixture fit (fsdcube_threshold_fit.py) takes the SAME per-prc reset node:
 [ "${GRID_RESET_PER_PRC:-1}" = "1" ] && TFIT_RESET_FLAG="--reset-per-prc" || TFIT_RESET_FLAG=""
 [ -n "${PRC_STEP_US:-}" ] && TFIT_RESET_FLAG="$TFIT_RESET_FLAG --prc-step-us $PRC_STEP_US"
+# the thrfit ALSO overlays mkramer's FULL MC (the 'Kramer sim') of the nominal thresholds, read at ONE
+# readout radius (the first of SIM_R) and saved into the data npz so the extended re-fit reuses it.
+# THRFIT_SIM=0 skips it; SIM_BASE / SIM_VAR override the sim location/variant (plotter defaults else).
+if [ "${THRFIT_SIM:-1}" = "1" ]; then
+  TFIT_SIM_FLAG="--sim-r ${SIM_R%% *}"
+  [ -n "${SIM_BASE:-}" ] && TFIT_SIM_FLAG="$TFIT_SIM_FLAG --sim-base $SIM_BASE"
+  [ -n "${SIM_VAR:-}" ]  && TFIT_SIM_FLAG="$TFIT_SIM_FLAG --sim-var $SIM_VAR"
+else
+  TFIT_SIM_FLAG="--no-sim"
+fi
 
 if [ "$#" -eq 0 ]; then
   echo "!! no 'prc=path' grid tokens given as positional args -- plotting data/MC with NO sweep overlay"
@@ -70,9 +80,9 @@ python tests/fsdcube_hitq_datamc.py \
 # as the overlay. THRFIT=0 to skip; THRFIT_EXTRA for extra flags (e.g. --observable hit). Non-fatal:
 # a fit failure must not lose the main plots that already wrote above.
 if [ "${THRFIT:-1}" = "1" ] && [ "$#" -gt 0 ]; then
-  echo "threshold-mixture fit -> $PLOT_OUT/thrfit  (reset:${TFIT_RESET_FLAG:- grid-base})"
+  echo "threshold-mixture fit -> $PLOT_OUT/thrfit  (reset:${TFIT_RESET_FLAG:- grid-base}, sim:${TFIT_SIM_FLAG})"
   python tests/fsdcube_threshold_fit.py \
-    --prc $PRCS --grid "$@" --outdir "$PLOT_OUT/thrfit" $TFIT_RESET_FLAG ${THRFIT_EXTRA:-} \
+    --prc $PRCS --grid "$@" --outdir "$PLOT_OUT/thrfit" $TFIT_RESET_FLAG $TFIT_SIM_FLAG ${THRFIT_EXTRA:-} \
     || echo "!! threshold fit failed (non-fatal) -- the main plots in $PLOT_OUT are already written"
   # SECOND set: extend the fit range UPWARD (--thr-hi, default 20 ke- = the map's max) so the fit has
   # headroom above the top simulated node instead of piling threshold weight at the 11.25 edge. Reuses
