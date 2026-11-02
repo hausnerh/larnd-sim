@@ -438,14 +438,16 @@ def write_summary(path, args, collected, joint, vals):
 
 # ---------------------------------------------------------------------------
 def parse_grid(tokens, prcs):
-    """'prc=path' tokens (or bare paths aligned with --prc) -> {prc: path}."""
+    """'prc=path' tokens (or bare paths aligned with --prc) -> {prc: path}. Paths are expanduser'd so a
+    'prc=~/...' token works even though the shell does not expand a mid-word ~ (only a leading one)."""
+    exp = os.path.expanduser
     if all("=" in t and t.split("=", 1)[0].strip().lstrip("-").isdigit() for t in tokens):
-        m = {int(t.split("=", 1)[0]): t.split("=", 1)[1] for t in tokens}
+        m = {int(t.split("=", 1)[0]): exp(t.split("=", 1)[1]) for t in tokens}
         return {p: m[p] for p in prcs if p in m}
     if len(tokens) == 1:
-        return {p: tokens[0] for p in prcs}
+        return {p: exp(tokens[0]) for p in prcs}
     if len(tokens) == len(prcs):
-        return {p: tokens[i] for i, p in enumerate(prcs)}
+        return {p: exp(tokens[i]) for i, p in enumerate(prcs)}
     raise SystemExit(f"--grid: {len(tokens)} paths for {len(prcs)} prc; pass 1, {len(prcs)}, or 'prc=path'.")
 
 
@@ -502,6 +504,9 @@ def main():
     ap.add_argument("--max-files", type=int, default=None)
     ap.add_argument("--max-events", type=int, default=None)
     args = ap.parse_args()
+    args.outdir = os.path.expanduser(args.outdir)            # tolerate a leading ~ the shell may not expand
+    if args.data_npz:
+        args.data_npz = os.path.expanduser(args.data_npz)
     os.makedirs(args.outdir, exist_ok=True)
     grids = parse_grid(args.grid, args.prc)
     vals_all = map_thresholds(args.thr_map)
