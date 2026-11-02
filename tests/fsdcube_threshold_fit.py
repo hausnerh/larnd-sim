@@ -238,6 +238,25 @@ def mixture(F, w):
     return p / s if s else p
 
 
+def fit_joint(Ff_list, d_list, reg=0.0, w0=None, prior=0.0):
+    """one SHARED w(T) fit to several (fine-basis, data) pairs at once: stack the per-prc Q-axes and
+    solve the SAME simplex NNLS. The per-pixel thresholds are fixed hardware (only the reset window
+    differs between prc2 and prc16), so a single threshold distribution must explain both spectra --
+    that joint constraint is the added leverage (it breaks degeneracies either spectrum alone allows)."""
+    return fit_weights(np.hstack(Ff_list), np.concatenate(d_list), reg=reg, w0=w0, prior=prior)
+
+
+def fit_stats(T, Tf, Ff, d, w, vals, thr_lo, thr_hi):
+    """numbers for the summary text file (these USED to be annotated on the plot). All are mean/width
+    of distributions, not peaks: map m/s over the fit range, fitted-w(T) m/s, and the data residual."""
+    inr = vals[(vals >= thr_lo) & (vals <= thr_hi)]
+    fm, fs = moments(Tf, w)
+    return dict(map_m=float(inr.mean()), map_s=float(inr.std()), fit_m=float(fm), fit_s=float(fs),
+                resid=float(np.sqrt(((mixture(Ff, w) - d) ** 2).sum()) * BINW),
+                grid_lo=float(T.min()), grid_hi=float(T.max()),
+                frac_extrap=float(((vals < T.min()) | (vals > T.max())).mean()), n_inr=int(inr.size))
+
+
 # ---------------------------------------------------------------------------
 # target density (data): from FLOW on NERSC, from a saved npz, or self-test pseudo-data
 # ---------------------------------------------------------------------------
@@ -282,46 +301,139 @@ def plot_basis(T, F, base_T, vals, outpath, observable, use_rst, extrap=False):
     print(f"  wrote {outpath}")
 
 
-def plot_fit(T, F, Tf, w_fit, d, vals, prc, use_rst, outpath, observable, dlabel="data", extrap=False):
-    """LEFT: target density vs nominal / known-map / best-fit mixtures. RIGHT: the per-pixel threshold
-    distribution as density STEP histograms -- the real map (broad, all pixels) vs the best fit on a
-    fine threshold grid spanning the FULL range (so the fit is a continuous distribution, not weight on
-    discrete nodes). The grid-backed sub-range [T_lo, T_hi] is shaded; the wings are extrapolated."""
+def _q_panel(ax, d, pk, mfit, title):
+    """shared LEFT-panel style: data vs the two MC mixtures (nominal per-pixel map, and the fit)."""
+    ax.step(CTR, d, where="mid", lw=2.2, color=DATA_COLOR, label="data")
+    ax.step(CTR, pk, where="mid", lw=1.8, ls="--", color="#0072B2", label="MC - Nominal Map")
+    ax.step(CTR, mfit, where="mid", lw=2.0, color="#D55E00", label="MC - Threshold Fit")
+    ax.set_title(title)
+    ax.set_xlabel("hit Q [ke$^-$]"); ax.set_ylabel("density"); ax.legend(fontsize=9)
+    ax.grid(alpha=0.25, lw=0.6); ax.set_xlim(0, 30)
+
+
+def _thr_panel(ax, Tf, w, vals):
+    """shared 'Threshold Distributions' panel: the real per-pixel map vs the fitted w(T) as density
+    step histograms. No band/extrapolation shading (the basis spans the whole plotted range) and no
+    on-plot stats -- those move to the summary text file."""
+    dTf = float(Tf[1] - Tf[0]); tlo, thi = float(Tf.min()), float(Tf.max())
+    tb = np.arange(np.floor(tlo), np.ceil(thi) + 0.25, 0.25); tc = 0.5 * (tb[1:] + tb[:-1])
+    inr = vals[(vals >= tlo) & (vals <= thi)]
+    hk, _ = np.histogram(inr, bins=tb, density=True)
+    ax.step(tc, hk, where="mid", lw=2.0, color="#0072B2", label="Nominal Map")
+    ax.step(Tf, w / dTf, where="mid", lw=2.0, color="#D55E00", label="Threshold Fit")
+    ax.set_title("Threshold Distributions")
+    ax.set_xlabel("threshold [ke$^-$]"); ax.set_ylabel("pixel density [1/ke$^-$]")
+    ax.set_xlim(tlo, thi); ax.legend(loc="upper right", fontsize=9); ax.grid(alpha=0.25, lw=0.6)
+
+
+def plot_fit(T, F, Tf, w_fit, d, vals, prc, outpath, extrap=False):
+    """per-prc 2-panel fit plot: LEFT 'prc<P>' (data vs the nominal-map & threshold-fit mixtures),
+    RIGHT 'Threshold Distributions' (real per-pixel map vs fitted w(T)). Numbers -> summary txt."""
     f, ax = plt.subplots(1, 2, figsize=(12, 4.4))
-    nom = F[int(np.argmin(np.abs(T - 5.0)))]
     pk = predict_known(T, F, vals, extrap=extrap)
     mfit = mixture(interp_basis(T, F, Tf, extrap=extrap), w_fit)
-    kind = "single-hit" if observable == "single" else "hit"
-    ax[0].step(CTR, d, where="mid", lw=2.2, color=DATA_COLOR, label=dlabel)
-    ax[0].step(CTR, nom, where="mid", lw=1.5, ls=":", color=MC_COLORS[0], label="nominal 5 ke$^-$ sim")
-    ax[0].step(CTR, pk, where="mid", lw=1.6, ls="--", color="#0072B2", label="known-map mixture")
-    ax[0].step(CTR, mfit, where="mid", lw=2.0, color="#D55E00", label="best-fit mixture")
-    ax[0].set_title(f"prc{prc}: {kind} Q density [reset {use_rst} cyc]")
-    ax[0].set_xlabel("hit Q [ke$^-$]"); ax[0].set_ylabel("density"); ax[0].legend(fontsize=9)
-    ax[0].grid(alpha=0.25, lw=0.6); ax[0].set_xlim(0, 30)
-
-    # RIGHT: threshold distribution over the FULL fit range, density step histograms
-    dTf = float(Tf[1] - Tf[0])
-    tlo, thi = float(Tf.min()), float(Tf.max())
-    tb = np.arange(np.floor(tlo), np.ceil(thi) + 0.25, 0.25); tc = 0.5 * (tb[1:] + tb[:-1])
-    inr = vals[(vals >= tlo) & (vals <= thi)]           # map pixels inside the modelled range
-    hk, _ = np.histogram(inr, bins=tb, density=True)
-    ax[1].axvspan(float(T.min()), float(T.max()), color="0.85", alpha=0.5, zorder=0,
-                  label="grid-backed (interp)")
-    ax[1].step(tc, hk, where="mid", lw=2.0, color="#0072B2", label="known map (all pixels)")
-    ax[1].step(Tf, w_fit / dTf, where="mid", lw=2.0, color="#D55E00", label=f"best fit to {dlabel}")
-    fit_m, fit_s = moments(Tf, w_fit)
-    frac_extrap = float(((vals < T.min()) | (vals > T.max())).mean())
-    ax[1].set_title(f"prc{prc}: threshold distribution")
-    ax[1].set_xlabel("threshold [ke$^-$]"); ax[1].set_ylabel("pixel density [1/ke$^-$]")
-    ax[1].set_xlim(tlo, thi); ax[1].legend(loc="upper right", fontsize=8); ax[1].grid(alpha=0.25, lw=0.6)
-    ax[1].annotate(f"map: {inr.mean():.2f} $\\pm$ {inr.std():.2f} ke$^-$\n"
-                   f"best fit: {fit_m:.2f} $\\pm$ {fit_s:.2f} ke$^-$\n"
-                   f"{100 * frac_extrap:.0f}% of pixels extrapolated (outside grid)",
-                   xy=(0.03, 0.97), xycoords="axes fraction", ha="left", va="top", fontsize=8,
-                   bbox=dict(boxstyle="round", fc="white", ec="0.7", alpha=0.85))
+    _q_panel(ax[0], d, pk, mfit, f"prc{prc}")
+    _thr_panel(ax[1], Tf, w_fit, vals)
     f.tight_layout(); f.savefig(outpath, dpi=130); plt.close(f)
     print(f"  wrote {outpath}")
+
+
+def plot_joint(collected, Tf, vals, w_joint, outpath, extrap=False):
+    """joint-fit plot: one 'prc<P>' Q-density panel per prc (data vs nominal map & the SHARED
+    threshold-fit mixture), then a final 'Threshold Distributions' panel with the one shared w(T)."""
+    prcs = list(collected.keys()); n = len(prcs)
+    f, ax = plt.subplots(1, n + 1, figsize=(6.0 * (n + 1), 4.4))
+    for i, prc in enumerate(prcs):
+        c = collected[prc]
+        pk = predict_known(c["T"], c["F"], vals, extrap=extrap)
+        mfit = mixture(c["Ff"], w_joint)
+        _q_panel(ax[i], c["d"], pk, mfit, f"prc{prc}")
+    _thr_panel(ax[n], Tf, w_joint, vals)
+    f.tight_layout(); f.savefig(outpath, dpi=130); plt.close(f)
+    print(f"  wrote {outpath}")
+
+
+def write_summary(path, args, collected, joint, vals):
+    """the method explanation + the per-fit numbers that used to be annotated on the plots."""
+    prcs = list(collected.keys()); L = []
+    def A(s=""): L.append(s)
+    A("FSDCube threshold-mixture fit -- method and results")
+    A("=" * 52); A()
+    A("WHAT THE FIT DOES")
+    A("  The data single-hit-pixel charge spectrum D(Q) is modeled as a mixture over the per-pixel")
+    A("  discriminator thresholds:  D(Q) = sum_T w(T) f_T(Q).  f_T(Q) is the single-hit charge")
+    A("  density the simulation produces when every pixel has threshold T (its turn-on edge sits at")
+    A("  ~T). w(T) >= 0, sum_T w(T) = 1 is the distribution of thresholds across pixels that the data")
+    A("  imply. Everything is shape only (area-normalized to 1): this is about the spectrum SHAPE,")
+    A("  not absolute rates.")
+    A()
+    A("BASIS  f_T(Q)")
+    A("  Taken from the simulation grid (tests/threshold_induction_study.py --mult-grid) at the reset")
+    A("  node matching each prc (prc2 -> 128 cyc, prc16 -> 1024 cyc; prc is a periodic-reset window,")
+    A("  which is why the two spectra differ). The grid simulates thresholds at 1.25 ke- spacing;")
+    A(f"  intermediate thresholds are linearly interpolated per Q-bin, and the thin residual of pixels")
+    A(f"  outside [{args.thr_lo:.2f}, {args.thr_hi:.2f}] ke- (the real map runs to ~20 ke-) is "
+      + ("linearly extrapolated." if args.extrapolate else "clamped (extrapolation off)."))
+    A()
+    A("FITTING TECHNIQUE")
+    A("  Non-negative least squares on the probability simplex:")
+    A("      argmin_w  || sum_T w(T) f_T(Q) - D(Q) ||^2"
+      + ("  +  reg * || 2nd-difference of w ||^2" if args.reg > 0 else ""))
+    A("      subject to  w(T) >= 0,  sum_T w(T) = 1.")
+    A(f"  Solved by projected-gradient descent -- a gradient step then Euclidean projection onto the")
+    A(f"  simplex (Duchi et al. 2008) -- on a fine grid of {args.n_fine} thresholds over "
+      f"[{args.thr_lo:.2f}, {args.thr_hi:.2f}] ke-.")
+    A("  The simplex constraint makes sum_T w(T) f_T(Q) itself a normalized density. Pure numpy (no")
+    A("  scipy, no GPU); the fit is a few ms and runs locally from the saved data_density_prc*.npz.")
+    if args.reg > 0:
+        A(f"  A 2nd-difference penalty (reg={args.reg:g}) lightly smooths w(T).")
+    else:
+        A("  NO smoothness penalty is applied (reg=0): the real per-pixel map is DAC-quantized and not")
+        A("  smooth, so smoothing would fight real structure. Without it the fine-grid fit is under-")
+        A("  determined (the few simulated shapes are blended linearly), so the data fix w(T) only")
+        A("  where they have leverage; elsewhere w(T) stays at the seed.")
+    if args.seed_map:
+        A("  The iteration is SEEDED at the known per-pixel threshold map (the simulated distribution),")
+        A("  so with no smoothness the fit = the sim map deformed only as much as the data require.")
+        if args.prior > 0:
+            A(f"  --prior={args.prior:g} additionally adds (prior/2)||w-seed||^2, a real pull toward the sim.")
+    else:
+        A("  Seeding from the sim map is DISABLED (uniform start).")
+    A()
+    A("WHAT THE NUMBERS MEAN  (mean +/- standard deviation of a distribution, NOT its peak/mode)")
+    A("  Nominal Map  m +/- s : mean and width of the REAL per-pixel threshold map")
+    A("                         (larndsim/bin/thresholds_fsdcube.npz) over the fit range -- the")
+    A("                         threshold distribution the simulation actually used.")
+    A("  Threshold Fit m +/- s: mean and width of the FITTED distribution w(T) -- what the data prefer.")
+    A("  data residual        : L2 norm of (fit mixture - data) over the Q axis; smaller = the mixture")
+    A("                         reproduces the measured spectrum better.")
+    A()
+    A("RESULTS -- independent per-prc fits")
+    A("-" * 36)
+    for p in prcs:
+        c = collected[p]; s = c["stats"]
+        A(f"  prc{p}  (reset {c['use_rst']} cyc, n_data={c['ndat']}):")
+        A(f"      Nominal Map   : {s['map_m']:.2f} +/- {s['map_s']:.2f} ke-")
+        A(f"      Threshold Fit : {s['fit_m']:.2f} +/- {s['fit_s']:.2f} ke-")
+        A(f"      data residual : {s['resid']:.3e}")
+        A(f"      pixels outside the simulated nodes [{s['grid_lo']:.2f},{s['grid_hi']:.2f}] "
+          f"(extrapolated): {100*s['frac_extrap']:.1f}%")
+    A()
+    if joint:
+        A("RESULTS -- joint fit (ONE shared threshold distribution for all prc)")
+        A("-" * 36)
+        A("  The per-pixel thresholds are fixed hardware; only the reset window changes between prc2 and")
+        A("  prc16. So a SINGLE w(T) should explain both spectra. The joint fit stacks the prc Q-axes and")
+        A("  solves  argmin_w sum_prc || sum_T w(T) f_T^prc(Q) - D_prc(Q) ||^2  on the same simplex.")
+        A("  Requiring one threshold distribution to match both reset conditions adds leverage and breaks")
+        A("  degeneracies that either spectrum alone would allow.")
+        A(f"      Threshold Fit (joint) : {joint['fit_m']:.2f} +/- {joint['fit_s']:.2f} ke-")
+        for p in joint["prcs"]:
+            A(f"      data residual prc{p}  : {joint['resids'][p]:.3e}")
+        A()
+    with open(path, "w") as fh:
+        fh.write("\n".join(L) + "\n")
+    print(f"  wrote {path}")
 
 
 # ---------------------------------------------------------------------------
@@ -370,8 +482,9 @@ def main():
     ap.add_argument("--prior", type=float, default=0.0,
                     help="strength of a (prior/2)||w-seed||^2 pull toward the sim seed (default 0 = seed is "
                          "only the initial condition; >0 makes the fit stay near the sim unless data demands)")
-    ap.add_argument("--reg", type=float, default=1e-3,
-                    help="2nd-difference smoothness penalty for the fine-grid fit (default 1e-3)")
+    ap.add_argument("--reg", type=float, default=0.0,
+                    help="2nd-difference smoothness penalty on w(T) (default 0 = OFF: the real per-pixel "
+                         "map is DAC-quantized / not smooth, so smoothing would fight real structure)")
     ap.set_defaults(extrapolate=True, seed_map=True)
     ap.add_argument("--thr-map", default=THR_MAP_DEF, help="per-pixel threshold npz (keys/values/default)")
     ap.add_argument("--outdir", default="tfit")
@@ -379,7 +492,9 @@ def main():
                     help="no data: validate the machinery (delta + known-mixture recovery) and plot the "
                          "known-map prediction, using each grid as its own basis")
     ap.add_argument("--data-npz", default=None,
-                    help="re-fit a saved data density (CTR + density arrays) instead of reading FLOW")
+                    help="re-fit saved data densities instead of reading FLOW. A FILE is used for the single "
+                         "prc; a DIRECTORY is searched for data_density_prc<P>.npz per prc (so the joint fit "
+                         "gets all prcs). These are written by a FLOW run, so you can re-fit fully locally.")
     # FLOW reader knobs (NERSC data path), mirrored from fsdcube_hitq_datamc.py
     ap.add_argument("--data-base", default=None)
     ap.add_argument("--adc-min", type=float, default=0.2e6)
@@ -393,6 +508,7 @@ def main():
     print(f"threshold map: {vals_all.size} pixels, median {np.median(vals_all):.2f} ke-, "
           f"in-basis-range fraction set per prc below")
 
+    collected = {}  # prc -> arrays + single-prc fit, for the joint fit and the summary
     for prc in args.prc:
         if prc not in grids:
             print(f"prc{prc}: no --grid basis, skipping"); continue
@@ -404,55 +520,68 @@ def main():
         frac_fit = float(((vals_all >= args.thr_lo) & (vals_all <= args.thr_hi)).mean())
         print(f"\nprc{prc}: basis T={T} ke- (base {base_T:.2f}), reset {use_rst} cyc, "
               f"yield/shower={np.round(Y,1)}; fit range [{args.thr_lo:.1f},{args.thr_hi:.1f}] ke- "
-              f"({'extrap' if args.extrapolate else 'clamped'}, seed={'sim-map' if args.seed_map else 'uniform'}"
-              f"{', prior '+str(args.prior) if args.prior>0 else ''}); {100*frac_in:.1f}% of pixels in grid "
-              f"[{T.min():.2f},{T.max():.2f}], {100*frac_fit:.1f}% in fit range")
+              f"({'extrap' if args.extrapolate else 'clamped'}, seed={'sim-map' if args.seed_map else 'uniform'}, "
+              f"reg={args.reg:g}{', prior '+str(args.prior) if args.prior>0 else ''}); "
+              f"{100*frac_in:.1f}% of pixels in grid [{T.min():.2f},{T.max():.2f}], {100*frac_fit:.1f}% in fit range")
         plot_basis(T, F, base_T, vals_all, os.path.join(args.outdir, f"thrfit_basis_prc{prc}.png"),
                    args.observable, use_rst, extrap=args.extrapolate)
 
         if args.self_test:
-            # (1) delta recovery: pseudo-data = the nominal node -> weights should concentrate there.
+            # machinery checks on the NATIVE basis: delta recovery + hand-set-mixture recovery.
             jn = int(np.argmin(np.abs(T - base_T)))
             w = fit_weights(F, F[jn])
             print(f"  self-test delta @ {T[jn]:.2f} ke-: recovered weights = {np.round(w, 3)}  "
                   f"(argmax {T[int(np.argmax(w))]:.2f} ke-)")
-            # (2) known-mixture recovery: pseudo-data = a hand-set mixture -> recover its weights.
-            w_true = np.array([0.1, 0.2, 0.4, 0.2, 0.1])[:len(T)]; w_true = w_true / w_true.sum()
+            k = np.arange(len(T)); w_true = np.exp(-0.5 * ((k - k.mean()) / max(len(T) / 4.0, 1.0)) ** 2)
+            w_true = w_true / w_true.sum()                      # a smooth bump over however many nodes
             w_rec = fit_weights(F, mixture(F, w_true))
             print(f"  self-test mixture: true {np.round(w_true,3)} -> recovered {np.round(w_rec,3)}  "
                   f"(max abs err {np.max(np.abs(w_true-w_rec)):.3f})")
-            # (3) the physics closure: fit the known-map prediction on the fine grid -> should recover
-            #     the real in-range threshold spread (mean/sd), continuous (not spiked on nodes).
-            pk = predict_known(T, F, vals_all, extrap=args.extrapolate)
-            w_k = fit_weights(Ff, pk, reg=args.reg, w0=w0, prior=args.prior)
-            plot_fit(T, F, Tf, w_k, pk, vals_all, prc, use_rst,
-                     os.path.join(args.outdir, f"thrfit_selftest_prc{prc}.png"),
-                     args.observable, dlabel="known-map mixture (pseudo-data)", extrap=args.extrapolate)
-            inr = vals_all[(vals_all >= args.thr_lo) & (vals_all <= args.thr_hi)]
-            print(f"  closure: map in fit range {inr.mean():.2f}+/-{inr.std():.2f} ke- vs "
-                  f"fit-of-known {moments(Tf, w_k)[0]:.2f}+/-{moments(Tf, w_k)[1]:.2f} ke-")
-            continue
-
-        # real target density: saved npz, or read from FLOW
-        if args.data_npz:
-            dd = np.load(args.data_npz); d = np.asarray(dd["density"], float); ndat = int(dd.get("n", 0))
-            print(f"  loaded data density from {args.data_npz} (n={ndat})")
+            d = predict_known(T, F, vals_all, extrap=args.extrapolate)   # physics-closure pseudo-data
+            ndat = 0; out_png = f"thrfit_selftest_prc{prc}.png"
         else:
-            if not args.data_base:
-                from fsdcube_hitq_datamc import DATA_BASE_DEF
-                args.data_base = DATA_BASE_DEF
-            d, ndat = data_density_from_flow(args, prc)
-            np.savez(os.path.join(args.outdir, f"data_density_prc{prc}.npz"),
-                     ctr=CTR, density=d, n=ndat, observable=args.observable, reset=use_rst)
-        w_fit = fit_weights(Ff, d, reg=args.reg, w0=w0, prior=args.prior)
-        plot_fit(T, F, Tf, w_fit, d, vals_all, prc, use_rst,
-                 os.path.join(args.outdir, f"thrfit_prc{prc}.png"), args.observable, extrap=args.extrapolate)
-        inr = vals_all[(vals_all >= args.thr_lo) & (vals_all <= args.thr_hi)]
-        print(f"  prc{prc} (reset {use_rst} cyc): best-fit thresholds {moments(Tf, w_fit)[0]:.2f}"
-              f"+/-{moments(Tf, w_fit)[1]:.2f} ke- vs known map {inr.mean():.2f}+/-{inr.std():.2f} "
-              f"(n_data={ndat})")
+            if args.data_npz:
+                npz = (os.path.join(args.data_npz, f"data_density_prc{prc}.npz")
+                       if os.path.isdir(args.data_npz) else args.data_npz)
+                dd = np.load(npz); d = np.asarray(dd["density"], float); ndat = int(dd.get("n", 0))
+                print(f"  loaded data density from {npz} (n={ndat})")
+            else:
+                if not args.data_base:
+                    from fsdcube_hitq_datamc import DATA_BASE_DEF
+                    args.data_base = DATA_BASE_DEF
+                d, ndat = data_density_from_flow(args, prc)
+                np.savez(os.path.join(args.outdir, f"data_density_prc{prc}.npz"),
+                         ctr=CTR, density=d, n=ndat, observable=args.observable, reset=use_rst)
+            out_png = f"thrfit_prc{prc}.png"
 
-    print(f"\nwrote plots -> {args.outdir}/")
+        w_fit = fit_weights(Ff, d, reg=args.reg, w0=w0, prior=args.prior)
+        plot_fit(T, F, Tf, w_fit, d, vals_all, prc,
+                 os.path.join(args.outdir, out_png), extrap=args.extrapolate)
+        st = fit_stats(T, Tf, Ff, d, w_fit, vals_all, args.thr_lo, args.thr_hi)
+        print(f"  prc{prc} (reset {use_rst} cyc): fit {st['fit_m']:.2f}+/-{st['fit_s']:.2f} ke- vs "
+              f"map {st['map_m']:.2f}+/-{st['map_s']:.2f} (resid {st['resid']:.2e}, n_data={ndat})")
+        collected[prc] = dict(T=T, F=F, Tf=Tf, Ff=Ff, d=d, w_fit=w_fit, use_rst=use_rst,
+                              ndat=ndat, stats=st)
+
+    # JOINT fit: one shared w(T) for all collected prc (shared hardware thresholds, differing reset).
+    joint = None
+    if len(collected) >= 2:
+        prcs = list(collected.keys()); Tf = collected[prcs[0]]["Tf"]
+        w0 = seed_from_map(Tf, vals_all) if args.seed_map else None
+        w_j = fit_joint([collected[p]["Ff"] for p in prcs], [collected[p]["d"] for p in prcs],
+                        reg=args.reg, w0=w0, prior=args.prior)
+        tag = "thrfit_joint_selftest.png" if args.self_test else "thrfit_joint.png"
+        plot_joint(collected, Tf, vals_all, w_j, os.path.join(args.outdir, tag), extrap=args.extrapolate)
+        jm, js = moments(Tf, w_j)
+        resids = {p: float(np.sqrt(((mixture(collected[p]["Ff"], w_j) - collected[p]["d"]) ** 2).sum()) * BINW)
+                  for p in prcs}
+        joint = dict(prcs=prcs, w=w_j, fit_m=float(jm), fit_s=float(js), resids=resids)
+        print(f"  joint fit ({'+'.join('prc'+str(p) for p in prcs)}): shared thresholds "
+              f"{jm:.2f}+/-{js:.2f} ke- (resid " + ", ".join(f"prc{p} {resids[p]:.2e}" for p in prcs) + ")")
+
+    if collected:
+        write_summary(os.path.join(args.outdir, "thrfit_summary.txt"), args, collected, joint, vals_all)
+    print(f"\nwrote outputs -> {args.outdir}/")
 
 
 if __name__ == "__main__":
