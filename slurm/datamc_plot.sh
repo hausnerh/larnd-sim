@@ -74,6 +74,17 @@ if [ "${THRFIT:-1}" = "1" ] && [ "$#" -gt 0 ]; then
   python tests/fsdcube_threshold_fit.py \
     --prc $PRCS --grid "$@" --outdir "$PLOT_OUT/thrfit" $TFIT_RESET_FLAG ${THRFIT_EXTRA:-} \
     || echo "!! threshold fit failed (non-fatal) -- the main plots in $PLOT_OUT are already written"
+  # SECOND set: extend the fit range UPWARD (--thr-hi, default 20 ke- = the map's max) so the fit has
+  # headroom above the top simulated node instead of piling threshold weight at the 11.25 edge. Reuses
+  # the data densities the first run just saved (--data-npz), so NO second FLOW read. THRFIT_EXT=0 to
+  # skip; THRFIT_EXT_HI to set the top edge. Figures are identical in style (the dir name says which).
+  if [ "${THRFIT_EXT:-1}" = "1" ]; then
+    echo "threshold-mixture fit [extended --thr-hi ${THRFIT_EXT_HI:-20}] -> $PLOT_OUT/thrfit_ext"
+    python tests/fsdcube_threshold_fit.py \
+      --prc $PRCS --grid "$@" --outdir "$PLOT_OUT/thrfit_ext" $TFIT_RESET_FLAG \
+      --thr-hi "${THRFIT_EXT_HI:-20}" --data-npz "$PLOT_OUT/thrfit" ${THRFIT_EXTRA:-} \
+      || echo "!! extended threshold fit failed (non-fatal)"
+  fi
 fi
 
 echo "PLOTS -> $PLOT_OUT"

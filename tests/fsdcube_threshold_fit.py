@@ -313,13 +313,14 @@ def _q_panel(ax, d, pk, mfit, title):
 
 def _thr_panel(ax, Tf, w, vals):
     """shared 'Threshold Distributions' panel: the real per-pixel map vs the fitted w(T) as density
-    step histograms. No band/extrapolation shading (the basis spans the whole plotted range) and no
-    on-plot stats -- those move to the summary text file."""
+    step histograms on the SAME binning -- the map is histogrammed into bins CENTERED ON THE FIT NODES
+    Tf (width dTf), so both curves use identical bins (apples-to-apples). No band/extrapolation shading
+    (the basis spans the whole plotted range) and no on-plot stats -- those move to the summary txt."""
     dTf = float(Tf[1] - Tf[0]); tlo, thi = float(Tf.min()), float(Tf.max())
-    tb = np.arange(np.floor(tlo), np.ceil(thi) + 0.25, 0.25); tc = 0.5 * (tb[1:] + tb[:-1])
-    inr = vals[(vals >= tlo) & (vals <= thi)]
-    hk, _ = np.histogram(inr, bins=tb, density=True)
-    ax.step(tc, hk, where="mid", lw=2.0, color="#0072B2", label="Nominal Map")
+    edges = np.concatenate([Tf - dTf / 2.0, [Tf[-1] + dTf / 2.0]])   # bins centered on the fit nodes
+    inr = vals[(vals >= edges[0]) & (vals <= edges[-1])]
+    hk, _ = np.histogram(inr, bins=edges, density=True)
+    ax.step(Tf, hk, where="mid", lw=2.0, color="#0072B2", label="Nominal Map")
     ax.step(Tf, w / dTf, where="mid", lw=2.0, color="#D55E00", label="Threshold Fit")
     ax.set_title("Threshold Distributions")
     ax.set_xlabel("threshold [ke$^-$]"); ax.set_ylabel("pixel density [1/ke$^-$]")
@@ -356,6 +357,7 @@ def plot_joint(collected, Tf, vals, w_joint, outpath, extrap=False):
 def write_summary(path, args, collected, joint, vals):
     """the method explanation + the per-fit numbers that used to be annotated on the plots."""
     prcs = list(collected.keys()); L = []
+    Tf0 = collected[prcs[0]]["Tf"]; n_fit = len(Tf0); binw_fit = float(Tf0[1] - Tf0[0])
     def A(s=""): L.append(s)
     A("FSDCube threshold-mixture fit -- method and results")
     A("=" * 52); A()
@@ -381,8 +383,9 @@ def write_summary(path, args, collected, joint, vals):
       + ("  +  reg * || 2nd-difference of w ||^2" if args.reg > 0 else ""))
     A("      subject to  w(T) >= 0,  sum_T w(T) = 1.")
     A(f"  Solved by projected-gradient descent -- a gradient step then Euclidean projection onto the")
-    A(f"  simplex (Duchi et al. 2008) -- on a fine grid of {args.n_fine} thresholds over "
-      f"[{args.thr_lo:.2f}, {args.thr_hi:.2f}] ke-.")
+    A(f"  simplex (Duchi et al. 2008) -- on a grid of {n_fit} threshold nodes ({binw_fit:.3f} ke- apart)")
+    A(f"  over [{args.thr_lo:.2f}, {args.thr_hi:.2f}] ke-. The nominal-map histogram uses this SAME binning, so")
+    A(f"  the two threshold distributions on the plot are directly comparable.")
     A("  The simplex constraint makes sum_T w(T) f_T(Q) itself a normalized density. Pure numpy (no")
     A("  scipy, no GPU); the fit is a few ms and runs locally from the saved data_density_prc*.npz.")
     if args.reg > 0:
@@ -465,9 +468,12 @@ def main():
                          "grid base. prc is a reset window, so this is what makes prc2 and prc16 differ.")
     ap.add_argument("--prc-step-us", type=float, default=6.4,
                     help="microseconds per prc step for --reset-per-prc (default 6.4; prc8 = 51.2 us base)")
-    ap.add_argument("--n-fine", type=int, default=81,
-                    help="number of fine threshold nodes spanned across [--thr-lo, --thr-hi] for the fit, so "
-                         "the fitted threshold distribution is continuous/broad (default 81 -> ~0.125 ke step)")
+    ap.add_argument("--thr-binw", type=float, default=0.25,
+                    help="threshold bin width in ke- for BOTH the fit grid and the nominal-map histogram "
+                         "(same binning -> apples-to-apples; default 0.25). Sets the fit node spacing.")
+    ap.add_argument("--n-fine", type=int, default=None,
+                    help="override: use exactly this many fit nodes across [--thr-lo,--thr-hi] instead of "
+                         "deriving the count from --thr-binw")
     ap.add_argument("--thr-lo", type=float, default=1.25,
                     help="low edge of the fit's threshold range in ke- (default 1.25 = the bottom SIMULATED "
                          "grid node once the basis is grown to span [1.25,11.25])")
@@ -507,6 +513,8 @@ def main():
     args.outdir = os.path.expanduser(args.outdir)            # tolerate a leading ~ the shell may not expand
     if args.data_npz:
         args.data_npz = os.path.expanduser(args.data_npz)
+    # fit node count: explicit --n-fine, else derived from the bin width so map & fit share one binning.
+    n_fine = args.n_fine or max(int(round((args.thr_hi - args.thr_lo) / args.thr_binw)) + 1, 2)
     os.makedirs(args.outdir, exist_ok=True)
     grids = parse_grid(args.grid, args.prc)
     vals_all = map_thresholds(args.thr_map)
@@ -519,7 +527,7 @@ def main():
             print(f"prc{prc}: no --grid basis, skipping"); continue
         T, F, Y, base_T, use_rst = load_basis(grids[prc], args.observable, prc=prc,
                                               prc_step_us=args.prc_step_us, reset_per_prc=args.reset_per_prc)
-        Tf, Ff = fine_grid(T, F, args.n_fine, args.thr_lo, args.thr_hi, extrap=args.extrapolate)
+        Tf, Ff = fine_grid(T, F, n_fine, args.thr_lo, args.thr_hi, extrap=args.extrapolate)
         w0 = seed_from_map(Tf, vals_all) if args.seed_map else None
         frac_in = float(((vals_all >= T.min()) & (vals_all <= T.max())).mean())
         frac_fit = float(((vals_all >= args.thr_lo) & (vals_all <= args.thr_hi)).mean())
