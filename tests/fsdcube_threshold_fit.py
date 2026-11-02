@@ -259,9 +259,19 @@ def fit_stats(T, Tf, Ff, d, w, vals, thr_lo, thr_hi):
 
 # ---------------------------------------------------------------------------
 # target density (data): from FLOW on NERSC, from a saved npz, or self-test pseudo-data
+#
+# Densities are computed for a LIST of observables from one FLOW read, so the joint fit can later be
+# posed over the whole SUITE of Q populations at once (single-hit, all-hit, ... -- one shared w(T)),
+# not just one. For now --observable defaults to a single population; passing several opts them all in.
 # ---------------------------------------------------------------------------
-def data_density_from_flow(args, prc):
-    """DATA single-hit (or all-hit) charge density, read from FLOW exactly like the plotter."""
+def _obs_select(q, n, observable):
+    """the hit-charge sample for one observable: 'single' = single-hit-pixel Q (n==1), 'hit' = all hits.
+    New populations (two-hit n==2, ...) slot in here and everything downstream follows."""
+    return q[n == 1] if observable == "single" else q
+
+
+def data_densities_from_flow(args, prc, observables):
+    """DATA charge density per observable, from ONE FLOW read (the plotter's reader). {obs: (density,n)}."""
     from fsdcube_hitq_datamc import accumulate_q, data_files
     files = list(data_files(args.data_base, prc))
     if args.max_files:
@@ -269,30 +279,63 @@ def data_density_from_flow(args, prc):
     print(f"prc{prc}: reading {len(files)} data files ...")
     tup = accumulate_q(files, args.adc_min, args.adc_max, args.max_events)
     q, n = np.asarray(tup[0], float), np.asarray(tup[1])
-    x = q[n == 1] if args.observable == "single" else q
-    return density(x), int(x.size)
+    out = {}
+    for obs in observables:
+        x = _obs_select(q, n, obs); out[obs] = (density(x), int(x.size))
+    return out
 
 
-def mc_density_from_flow(args, prc):
-    """mkramer's MC single-hit (or all-hit) charge density -- the 'Kramer sim': the FULL larnd-sim
-    output at this prc, which already carries the real per-pixel threshold map (the fsd_cube config
-    loads PIXEL_THRESHOLDS_FILE). So this is the END-TO-END simulation of the nominal thresholds, as
-    opposed to predict_known(), which RECONSTRUCTS that same nominal map from our mono-threshold basis
-    by interpolation. Showing both tests whether the basis+interpolation reproduces the full sim. Read
-    with the plotter's sim reader at ONE readout radius (--sim-r). Returns (density, n) or (None, 0)
-    when no sim files are found, so a missing MC is non-fatal (the overlay is just dropped)."""
+def mc_densities_from_flow(args, prc, observables):
+    """mkramer's FULL larnd-sim MC charge density per observable -- the 'sim r<R> prc<P>' overlay: the
+    end-to-end sim at this prc, already run with the real per-pixel threshold map loaded (the fsd_cube
+    config loads PIXEL_THRESHOLDS_FILE). Contrast predict_known(), which RECONSTRUCTS that same nominal
+    map from our mono-threshold basis by interpolation; agreement of the two is a basis-closure check.
+    Read at ONE readout radius (--sim-r). {obs: density or None}; None when no sim files (non-fatal)."""
     from fsdcube_hitq_datamc import accumulate_q, sim_files
     cfg, files = sim_files(args.sim_base, prc, args.sim_r, args.sim_var)
     if args.max_files:
         files = files[:args.max_files]
     if not files:
-        print(f"  prc{prc}: no MC (Kramer sim) files under '{cfg}' in {args.sim_base}; sim overlay skipped")
-        return None, 0
-    print(f"  prc{prc}: reading {len(files)} MC files ({cfg}) for the Kramer-sim overlay ...")
+        print(f"  prc{prc}: no MC files under '{cfg}' in {args.sim_base}; sim r{args.sim_r} overlay skipped")
+        return {obs: None for obs in observables}
+    print(f"  prc{prc}: reading {len(files)} MC files ({cfg}) for the sim r{args.sim_r} overlay ...")
     tup = accumulate_q(files, args.adc_min, args.adc_max, args.max_events)
     q, n = np.asarray(tup[0], float), np.asarray(tup[1])
-    x = q[n == 1] if args.observable == "single" else q
-    return (density(x), int(x.size)) if x.size else (None, 0)
+    out = {}
+    for obs in observables:
+        x = _obs_select(q, n, obs); out[obs] = density(x) if x.size else None
+    return out
+
+
+def save_densities(path, dens, mc, observables, primary, reset):
+    """persist per-observable DATA (+ Kramer-sim MC) densities so a later run re-fits fully locally. The
+    primary observable is ALSO written under the legacy keys density/n/mc_density (back-compat)."""
+    dprim, nprim = dens[primary]
+    kw = dict(ctr=CTR, observable=primary, reset=reset, density=dprim, n=nprim,
+              mc_density=(np.zeros(0) if mc.get(primary) is None else mc[primary]))
+    for obs in observables:
+        d, nd = dens[obs]
+        kw[f"density_{obs}"] = d; kw[f"n_{obs}"] = nd
+        kw[f"mc_density_{obs}"] = (np.zeros(0) if mc.get(obs) is None else mc[obs])
+    np.savez(path, **kw)
+
+
+def load_densities(dd, observables, primary):
+    """inverse of save_densities, tolerant of older npz that carry only the primary (legacy bare keys).
+    The legacy fallback is used only when the npz's stored observable actually matches, so a single-hit
+    npz is never silently re-served as a different observable."""
+    stored = str(dd["observable"]) if "observable" in dd.files else None
+    dens, mc = {}, {}
+    for obs in observables:
+        if f"density_{obs}" in dd.files:
+            d = np.asarray(dd[f"density_{obs}"], float); nd = int(dd[f"n_{obs}"]); ma = dd.get(f"mc_density_{obs}")
+        elif obs == primary and stored in (None, obs):   # legacy npz: primary only, under the bare keys
+            d = np.asarray(dd["density"], float); nd = int(dd.get("n", 0)); ma = dd.get("mc_density")
+        else:
+            print(f"    !! observable '{obs}' not in this npz (older file); skipping it"); continue
+        dens[obs] = (d, nd)
+        mc[obs] = (np.asarray(ma, float) if ma is not None and np.asarray(ma).size == CTR.size else None)
+    return dens, mc
 
 
 # ---------------------------------------------------------------------------
@@ -308,7 +351,7 @@ def plot_basis(T, F, base_T, vals, outpath, observable, use_rst, extrap=False):
                    label=f"{Tj:.2f} ke$^-$" + (" (nom)" if abs(Tj - base_T) < 1e-6 else ""))
     ax[0].set_title(f"mono-threshold basis  f$_T$(Q)   [{observable}, reset {use_rst} cyc]")
     ax[0].set_xlabel("hit Q [ke$^-$]"); ax[0].set_ylabel("density"); ax[0].legend(fontsize=8)
-    ax[0].grid(alpha=0.25, lw=0.6); ax[0].set_xlim(0, 30)
+    ax[0].grid(alpha=0.25, lw=0.6); ax[0].set_xlim(0, 50)
 
     jn = int(np.argmin(np.abs(T - base_T)))
     pk = predict_known(T, F, vals, extrap=extrap)
@@ -318,24 +361,26 @@ def plot_basis(T, F, base_T, vals, outpath, observable, use_rst, extrap=False):
                label="known-map mixture (real per-pixel thr)")
     ax[1].set_title("known-map prediction vs nominal")
     ax[1].set_xlabel("hit Q [ke$^-$]"); ax[1].set_ylabel("density"); ax[1].legend(fontsize=9)
-    ax[1].grid(alpha=0.25, lw=0.6); ax[1].set_xlim(0, 30)
+    ax[1].grid(alpha=0.25, lw=0.6); ax[1].set_xlim(0, 50)
     f.tight_layout(); f.savefig(outpath, dpi=130); plt.close(f)
     print(f"  wrote {outpath}")
 
 
-def _q_panel(ax, d, pk, mfit, title, pk_sim=None):
+def _q_panel(ax, d, pk, mfit, title, pk_sim=None, sim_r=None, prc=None):
     """shared LEFT-panel style: data vs the MC curves. Two of them are the SAME nominal thresholds
-    produced two ways -- pk_sim (optional) is mkramer's FULL larnd-sim MC, the 'Kramer sim' run with
-    the real per-pixel map; pk is our mono-threshold basis interpolated+mixed by that same map
-    (predict_known). Their agreement is a basis-closure check. mfit is the fitted threshold mixture."""
+    produced two ways -- pk_sim (optional) is mkramer's FULL larnd-sim MC, labeled by its sim config
+    'sim r<R> prc<P>' (consistent with the other Q plots); pk is our mono-threshold basis interpolated
+    +mixed by that same map (predict_known). Their agreement is a basis-closure check. mfit = the fit.
+    The Q axis spans the full [0,50] ke- used by the other Q plots (fsdcube_hitq_datamc.py)."""
     ax.step(CTR, d, where="mid", lw=2.2, color=DATA_COLOR, label="data")
     if pk_sim is not None:
-        ax.step(CTR, pk_sim, where="mid", lw=1.8, color="#009E73", label="MC - Kramer sim")
+        lab = "MC - sim" + (f" r{sim_r}" if sim_r is not None else "") + (f" prc{prc}" if prc is not None else "")
+        ax.step(CTR, pk_sim, where="mid", lw=1.8, color="#009E73", label=lab)
     ax.step(CTR, pk, where="mid", lw=1.8, ls="--", color="#0072B2", label="MC - Nominal Map (interp)")
     ax.step(CTR, mfit, where="mid", lw=2.0, color="#D55E00", label="MC - Threshold Fit")
     ax.set_title(title)
     ax.set_xlabel("hit Q [ke$^-$]"); ax.set_ylabel("density"); ax.legend(fontsize=9)
-    ax.grid(alpha=0.25, lw=0.6); ax.set_xlim(0, 30)
+    ax.grid(alpha=0.25, lw=0.6); ax.set_xlim(0, 50)
 
 
 def _thr_panel(ax, Tf, w, vals):
@@ -354,37 +399,43 @@ def _thr_panel(ax, Tf, w, vals):
     ax.set_xlim(tlo, thi); ax.legend(loc="upper right", fontsize=9); ax.grid(alpha=0.25, lw=0.6)
 
 
-def plot_fit(T, F, Tf, w_fit, d, vals, prc, outpath, extrap=False, mc_d=None):
-    """per-prc 2-panel fit plot: LEFT 'prc<P>' (data vs the Kramer-sim, nominal-map & threshold-fit
+def plot_fit(T, F, Tf, w_fit, d, vals, prc, outpath, extrap=False, mc_d=None, sim_r=None):
+    """per-prc 2-panel fit plot: LEFT 'prc<P>' (data vs the full-sim, nominal-map & threshold-fit
     curves), RIGHT 'Threshold Distributions' (real per-pixel map vs fitted w(T)). Numbers -> summary."""
     f, ax = plt.subplots(1, 2, figsize=(12, 4.4))
     pk = predict_known(T, F, vals, extrap=extrap)
     mfit = mixture(interp_basis(T, F, Tf, extrap=extrap), w_fit)
-    _q_panel(ax[0], d, pk, mfit, f"prc{prc}", pk_sim=mc_d)
+    _q_panel(ax[0], d, pk, mfit, f"prc{prc}", pk_sim=mc_d, sim_r=sim_r, prc=prc)
     _thr_panel(ax[1], Tf, w_fit, vals)
     f.tight_layout(); f.savefig(outpath, dpi=130); plt.close(f)
     print(f"  wrote {outpath}")
 
 
-def plot_joint(collected, Tf, vals, w_joint, outpath, extrap=False):
-    """joint-fit plot: one 'prc<P>' Q-density panel per prc (data vs nominal map & the SHARED
-    threshold-fit mixture), then a final 'Threshold Distributions' panel with the one shared w(T)."""
-    prcs = list(collected.keys()); n = len(prcs)
+def plot_joint(specs, Tf, vals, w_joint, outpath, extrap=False):
+    """joint-fit plot: one Q-density panel per fitted spectrum (data vs nominal map & the SHARED
+    threshold-fit mixture), then a final 'Threshold Distributions' panel with the one shared w(T). The
+    spectra are whatever the joint fit spanned -- one per prc today, one per (prc x observable) once the
+    whole Q-plot suite is opted in -- so this panel row grows with the suite automatically."""
+    n = len(specs)
     f, ax = plt.subplots(1, n + 1, figsize=(6.0 * (n + 1), 4.4))
-    for i, prc in enumerate(prcs):
-        c = collected[prc]
+    if n == 0:
+        ax = [ax]
+    for i, c in enumerate(specs):
         pk = predict_known(c["T"], c["F"], vals, extrap=extrap)
         mfit = mixture(c["Ff"], w_joint)
-        _q_panel(ax[i], c["d"], pk, mfit, f"prc{prc}", pk_sim=c.get("mc_d"))
+        _q_panel(ax[i], c["d"], pk, mfit, c["label"], pk_sim=c.get("mc_d"),
+                 sim_r=c.get("sim_r"), prc=c.get("prc"))
     _thr_panel(ax[n], Tf, w_joint, vals)
     f.tight_layout(); f.savefig(outpath, dpi=130); plt.close(f)
     print(f"  wrote {outpath}")
 
 
-def write_summary(path, args, collected, joint, vals):
-    """the method explanation + the per-fit numbers that used to be annotated on the plots."""
-    prcs = list(collected.keys()); L = []
-    Tf0 = collected[prcs[0]]["Tf"]; n_fit = len(Tf0); binw_fit = float(Tf0[1] - Tf0[0])
+def write_summary(path, args, specs, joint, vals):
+    """the method explanation + the per-fit numbers that used to be annotated on the plots. `specs` is
+    the list of fitted spectra (one per prc today; one per prc x observable once the suite is opted in)."""
+    L = []
+    Tf0 = specs[0]["Tf"]; n_fit = len(Tf0); binw_fit = float(Tf0[1] - Tf0[0])
+    obs_list = list(dict.fromkeys(c["obs"] for c in specs))
     def A(s=""): L.append(s)
     A("FSDCube threshold-mixture fit -- method and results")
     A("=" * 52); A()
@@ -431,15 +482,15 @@ def write_summary(path, args, collected, joint, vals):
         A("  Seeding from the sim map is DISABLED (uniform start).")
     A()
     A("THE MC CURVES ON THE Q PANEL  (two of them are the SAME nominal thresholds, produced two ways)")
-    A("  MC - Kramer sim          : mkramer's FULL larnd-sim MC at this prc, which already runs with the")
-    A("                             real per-pixel threshold map loaded. End-to-end simulation of the")
-    A("                             nominal thresholds (induction, FEE, reset) -- the ground truth MC.")
+    A(f"  MC - sim r{args.sim_r} prc<P>    : mkramer's FULL larnd-sim MC at this prc and readout radius r{args.sim_r},")
+    A("                             which already runs with the real per-pixel threshold map loaded.")
+    A("                             End-to-end sim of the nominal thresholds -- the ground-truth MC.")
     A("  MC - Nominal Map (interp): the SAME real per-pixel map, but RECONSTRUCTED from our mono-threshold")
     A("                             basis: predict_known(Q) = < f_{T_pix}(Q) > with f_T interpolated in T.")
-    A("                             If this matches the Kramer sim, the basis + interpolation faithfully")
-    A("                             represent the full sim (a basis-closure check) -- so the fit's")
-    A("                             departure from them is a real preference of the DATA, not a basis")
-    A("                             artifact. (The self-test has no MC, so only this curve is drawn.)")
+    A("                             If this matches the full sim, the basis + interpolation faithfully")
+    A("                             represent it (a basis-closure check) -- so the fit's departure from")
+    A("                             them is a real preference of the DATA, not a basis artifact. (The")
+    A("                             self-test has no MC, so only this curve is drawn.)")
     A("  MC - Threshold Fit       : the fitted threshold mixture sum_T w(T) f_T(Q) -- what the data prefer.")
     A()
     A("WHAT THE NUMBERS MEAN  (mean +/- standard deviation of a distribution, NOT its peak/mode)")
@@ -450,31 +501,33 @@ def write_summary(path, args, collected, joint, vals):
     A("  data residual        : L2 norm of (fit mixture - data) over the Q axis; smaller = the mixture")
     A("                         reproduces the measured spectrum better.")
     A()
-    A("RESULTS -- independent per-prc fits")
+    A(f"RESULTS -- independent per-spectrum fits  (observable(s): {', '.join(obs_list)})")
     A("-" * 36)
-    for p in prcs:
-        c = collected[p]; s = c["stats"]
-        A(f"  prc{p}  (reset {c['use_rst']} cyc, n_data={c['ndat']}):")
+    for c in specs:
+        s = c["stats"]
+        A(f"  {c['label']}  (reset {c['use_rst']} cyc, n_data={c['ndat']}):")
         A(f"      Nominal Map   : {s['map_m']:.2f} +/- {s['map_s']:.2f} ke-")
         A(f"      Threshold Fit : {s['fit_m']:.2f} +/- {s['fit_s']:.2f} ke-")
         A(f"      data residual (fit vs data)        : {s['resid']:.3e}")
         if "mc_resid" in s:
-            A(f"      Kramer-sim vs data                 : {s['mc_resid']:.3e}")
-            A(f"      basis closure (interp vs Kramer)   : {s['basis_resid']:.3e}  (small = basis reproduces the full sim)")
+            A(f"      sim r{c['sim_r']} vs data                  : {s['mc_resid']:.3e}")
+            A(f"      basis closure (interp vs sim)      : {s['basis_resid']:.3e}  (small = basis reproduces the full sim)")
         A(f"      pixels outside the simulated nodes [{s['grid_lo']:.2f},{s['grid_hi']:.2f}] "
           f"(extrapolated): {100*s['frac_extrap']:.1f}%")
     A()
     if joint:
-        A("RESULTS -- joint fit (ONE shared threshold distribution for all prc)")
+        A("RESULTS -- joint fit (ONE shared threshold distribution across all spectra)")
         A("-" * 36)
-        A("  The per-pixel thresholds are fixed hardware; only the reset window changes between prc2 and")
-        A("  prc16. So a SINGLE w(T) should explain both spectra. The joint fit stacks the prc Q-axes and")
-        A("  solves  argmin_w sum_prc || sum_T w(T) f_T^prc(Q) - D_prc(Q) ||^2  on the same simplex.")
-        A("  Requiring one threshold distribution to match both reset conditions adds leverage and breaks")
-        A("  degeneracies that either spectrum alone would allow.")
+        A("  The per-pixel thresholds are fixed hardware; only the reset window (prc) changes, and the")
+        A("  choice of Q population (observable) is just a different view of the same hits. So a SINGLE")
+        A("  w(T) should explain ALL the spectra at once. The joint fit stacks their Q-axes and solves")
+        A("  argmin_w sum_k || sum_T w(T) f_T^k(Q) - D_k(Q) ||^2  on the same simplex. Requiring one")
+        A("  threshold distribution to match every condition adds leverage and breaks degeneracies that")
+        A("  any single spectrum alone would allow. (Today the spectra are the per-prc single-hit Q; the")
+        A("  SAME machinery fits the whole suite of Q plots once more observables are opted in.)")
         A(f"      Threshold Fit (joint) : {joint['fit_m']:.2f} +/- {joint['fit_s']:.2f} ke-")
-        for p in joint["prcs"]:
-            A(f"      data residual prc{p}  : {joint['resids'][p]:.3e}")
+        for lab in joint["labels"]:
+            A(f"      data residual {lab}  : {joint['resids'][lab]:.3e}")
         A()
     with open(path, "w") as fh:
         fh.write("\n".join(L) + "\n")
@@ -502,8 +555,11 @@ def main():
     ap.add_argument("--grid", nargs="+", required=True,
                     help="ti_mult_grid.npz basis per prc: 'prc=path' tokens or bare paths aligned with --prc")
     ap.add_argument("--prc", type=int, nargs="+", default=[2, 16])
-    ap.add_argument("--observable", choices=["single", "hit"], default="single",
-                    help="single = single-hit-pixel Q (default, sharpest turn-on); hit = every hit's Q")
+    ap.add_argument("--observable", choices=["single", "hit"], nargs="+", default=["single"],
+                    help="which Q population(s) to fit: single = single-hit-pixel Q (default, sharpest "
+                         "turn-on); hit = every hit's Q. Passing SEVERAL opts the whole suite into the "
+                         "JOINT fit (one shared w(T) across all prc x observable spectra); the first is "
+                         "the 'primary' used for the per-prc 2-panel plots and the legacy npz keys.")
     ap.add_argument("--reset-per-prc", action="store_true",
                     help="take each prc's basis at the reset node MATCHING its reset window (cycles = "
                          "round(prc * --prc-step-us / grid ts); prc2 -> 128, prc16 -> 1024) instead of the "
@@ -518,13 +574,13 @@ def main():
                          "deriving the count from --thr-binw")
     ap.add_argument("--thr-lo", type=float, default=1.25,
                     help="low edge of the fit's threshold range in ke- (default 1.25 = the bottom SIMULATED "
-                         "grid node once the basis is grown to span [1.25,11.25])")
-    ap.add_argument("--thr-hi", type=float, default=11.25,
-                    help="high edge of the fit's threshold range in ke- (default 11.25 = the top simulated "
-                         "node; covers ~99%% of the map, the thin tail to 20 ke- folds into the top node)")
+                         "grid node once the basis is grown to span [1.25,15])")
+    ap.add_argument("--thr-hi", type=float, default=15.0,
+                    help="high edge of the fit's threshold range in ke- (default 15.0 = the top simulated "
+                         "node once the basis is grown to [1.25,15]; the thin tail to 20 ke- extrapolates)")
     ap.add_argument("--no-extrapolate", dest="extrapolate", action="store_false",
                     help="disable the linear-spline extrapolation and clamp thresholds outside the simulated "
-                         "node range to the edge shape. With a basis grown to [1.25,11.25] the fit range is "
+                         "node range to the edge shape. With a basis grown to [1.25,15] the fit range is "
                          "all interpolation, so extrapolation then only fills the small <lo / >hi residual.")
     ap.add_argument("--no-seed-map", dest="seed_map", action="store_false",
                     help="start the fit from a uniform threshold distribution instead of seeding it at the "
@@ -576,27 +632,35 @@ def main():
     print(f"threshold map: {vals_all.size} pixels, median {np.median(vals_all):.2f} ke-, "
           f"in-basis-range fraction set per prc below")
 
-    collected = {}  # prc -> arrays + single-prc fit, for the joint fit and the summary
+    collected = {}  # label -> spec dict (prc x observable); the joint fit stacks ALL of them
+    primary = args.observable[0]
     for prc in args.prc:
         if prc not in grids:
             print(f"prc{prc}: no --grid basis, skipping"); continue
-        T, F, Y, base_T, use_rst = load_basis(grids[prc], args.observable, prc=prc,
-                                              prc_step_us=args.prc_step_us, reset_per_prc=args.reset_per_prc)
-        Tf, Ff = fine_grid(T, F, n_fine, args.thr_lo, args.thr_hi, extrap=args.extrapolate)
-        w0 = seed_from_map(Tf, vals_all) if args.seed_map else None
-        frac_in = float(((vals_all >= T.min()) & (vals_all <= T.max())).mean())
+
+        # basis per requested observable (same grid, sliced per observable); the reset is obs-independent
+        bases = {}
+        for obs in args.observable:
+            T, F, Y, base_T, use_rst = load_basis(grids[prc], obs, prc=prc,
+                                                  prc_step_us=args.prc_step_us, reset_per_prc=args.reset_per_prc)
+            Tf, Ff = fine_grid(T, F, n_fine, args.thr_lo, args.thr_hi, extrap=args.extrapolate)
+            bases[obs] = dict(T=T, F=F, Y=Y, base_T=base_T, use_rst=use_rst, Tf=Tf, Ff=Ff)
+        use_rst = bases[primary]["use_rst"]; Tp = bases[primary]["T"]
+        frac_in = float(((vals_all >= Tp.min()) & (vals_all <= Tp.max())).mean())
         frac_fit = float(((vals_all >= args.thr_lo) & (vals_all <= args.thr_hi)).mean())
-        print(f"\nprc{prc}: basis T={T} ke- (base {base_T:.2f}), reset {use_rst} cyc, "
-              f"yield/shower={np.round(Y,1)}; fit range [{args.thr_lo:.1f},{args.thr_hi:.1f}] ke- "
+        print(f"\nprc{prc}: basis T={Tp} ke- (base {bases[primary]['base_T']:.2f}), reset {use_rst} cyc, "
+              f"obs={'+'.join(args.observable)}; fit range [{args.thr_lo:.1f},{args.thr_hi:.1f}] ke- "
               f"({'extrap' if args.extrapolate else 'clamped'}, seed={'sim-map' if args.seed_map else 'uniform'}, "
               f"reg={args.reg:g}{', prior '+str(args.prior) if args.prior>0 else ''}); "
-              f"{100*frac_in:.1f}% of pixels in grid [{T.min():.2f},{T.max():.2f}], {100*frac_fit:.1f}% in fit range")
-        plot_basis(T, F, base_T, vals_all, os.path.join(args.outdir, f"thrfit_basis_prc{prc}.png"),
-                   args.observable, use_rst, extrap=args.extrapolate)
+              f"{100*frac_in:.1f}% of pixels in grid [{Tp.min():.2f},{Tp.max():.2f}], {100*frac_fit:.1f}% in fit range")
+        plot_basis(bases[primary]["T"], bases[primary]["F"], bases[primary]["base_T"], vals_all,
+                   os.path.join(args.outdir, f"thrfit_basis_prc{prc}.png"), primary, use_rst, extrap=args.extrapolate)
 
+        # data (+ Kramer-sim MC) densities for ALL requested observables -- one FLOW read per prc
         if args.self_test:
-            # machinery checks on the NATIVE basis: delta recovery + hand-set-mixture recovery.
-            jn = int(np.argmin(np.abs(T - base_T)))
+            # machinery checks on the primary NATIVE basis: delta + hand-set-mixture recovery
+            T, F = bases[primary]["T"], bases[primary]["F"]
+            jn = int(np.argmin(np.abs(T - bases[primary]["base_T"])))
             w = fit_weights(F, F[jn])
             print(f"  self-test delta @ {T[jn]:.2f} ke-: recovered weights = {np.round(w, 3)}  "
                   f"(argmax {T[int(np.argmax(w))]:.2f} ke-)")
@@ -605,63 +669,71 @@ def main():
             w_rec = fit_weights(F, mixture(F, w_true))
             print(f"  self-test mixture: true {np.round(w_true,3)} -> recovered {np.round(w_rec,3)}  "
                   f"(max abs err {np.max(np.abs(w_true-w_rec)):.3f})")
-            d = predict_known(T, F, vals_all, extrap=args.extrapolate)   # physics-closure pseudo-data
-            ndat = 0; mc_d = None; out_png = f"thrfit_selftest_prc{prc}.png"
+            dens = {obs: (predict_known(bases[obs]["T"], bases[obs]["F"], vals_all, extrap=args.extrapolate), 0)
+                    for obs in args.observable}
+            mc = {obs: None for obs in args.observable}
+        elif args.data_npz:
+            npz = (os.path.join(args.data_npz, f"data_density_prc{prc}.npz")
+                   if os.path.isdir(args.data_npz) else args.data_npz)
+            dd = np.load(npz)
+            dens, mc = load_densities(dd, args.observable, primary)
+            print(f"  loaded data density from {npz} (obs={'+'.join(dens)}, n={dens[primary][1]}"
+                  f"{', +sim' if mc.get(primary) is not None else ', no sim in npz'})")
         else:
-            if args.data_npz:
-                npz = (os.path.join(args.data_npz, f"data_density_prc{prc}.npz")
-                       if os.path.isdir(args.data_npz) else args.data_npz)
-                dd = np.load(npz); d = np.asarray(dd["density"], float); ndat = int(dd.get("n", 0))
-                # the Kramer-sim density is saved alongside the data by a FLOW run; older npz lack it.
-                mc_arr = dd.get("mc_density")
-                mc_d = (np.asarray(mc_arr, float)
-                        if mc_arr is not None and np.asarray(mc_arr).size == CTR.size else None)
-                print(f"  loaded data density from {npz} (n={ndat}"
-                      f"{', +Kramer-sim' if mc_d is not None else ', no Kramer-sim in npz'})")
-            else:
-                if not args.data_base:
-                    from fsdcube_hitq_datamc import DATA_BASE_DEF
-                    args.data_base = DATA_BASE_DEF
-                d, ndat = data_density_from_flow(args, prc)
-                mc_d, mc_n = (mc_density_from_flow(args, prc) if args.use_sim else (None, 0))
-                np.savez(os.path.join(args.outdir, f"data_density_prc{prc}.npz"),
-                         ctr=CTR, density=d, n=ndat, observable=args.observable, reset=use_rst,
-                         mc_density=(np.zeros(0) if mc_d is None else mc_d), mc_n=mc_n)
-            out_png = f"thrfit_prc{prc}.png"
+            if not args.data_base:
+                from fsdcube_hitq_datamc import DATA_BASE_DEF
+                args.data_base = DATA_BASE_DEF
+            dens = data_densities_from_flow(args, prc, args.observable)
+            mc = (mc_densities_from_flow(args, prc, args.observable) if args.use_sim
+                  else {obs: None for obs in args.observable})
+            save_densities(os.path.join(args.outdir, f"data_density_prc{prc}.npz"),
+                           dens, mc, args.observable, primary, reset=use_rst)
 
-        w_fit = fit_weights(Ff, d, reg=args.reg, w0=w0, prior=args.prior)
-        plot_fit(T, F, Tf, w_fit, d, vals_all, prc,
-                 os.path.join(args.outdir, out_png), extrap=args.extrapolate, mc_d=mc_d)
-        st = fit_stats(T, Tf, Ff, d, w_fit, vals_all, args.thr_lo, args.thr_hi)
-        if mc_d is not None:   # Kramer-sim vs data, and basis-closure (nominal-map interp vs Kramer sim)
-            pk = predict_known(T, F, vals_all, extrap=args.extrapolate)
-            st["mc_resid"] = float(np.sqrt(((mc_d - d) ** 2).sum()) * BINW)
-            st["basis_resid"] = float(np.sqrt(((pk - mc_d) ** 2).sum()) * BINW)
-        print(f"  prc{prc} (reset {use_rst} cyc): fit {st['fit_m']:.2f}+/-{st['fit_s']:.2f} ke- vs "
-              f"map {st['map_m']:.2f}+/-{st['map_s']:.2f} (resid {st['resid']:.2e}, n_data={ndat})"
-              + (f"; Kramer-sim vs data {st['mc_resid']:.2e}, basis-closure {st['basis_resid']:.2e}"
-                 if mc_d is not None else ""))
-        collected[prc] = dict(T=T, F=F, Tf=Tf, Ff=Ff, d=d, w_fit=w_fit, use_rst=use_rst,
-                              ndat=ndat, stats=st, mc_d=mc_d)
+        # fit each spectrum; the per-prc 2-panel plot is drawn for the PRIMARY observable only
+        for obs in args.observable:
+            if obs not in dens:
+                continue                              # requested obs absent from an older npz (warned above)
+            b = bases[obs]; T, F, Tf, Ff = b["T"], b["F"], b["Tf"], b["Ff"]
+            w0 = seed_from_map(Tf, vals_all) if args.seed_map else None
+            d, ndat = dens[obs]; mc_d = mc.get(obs)
+            w_fit = fit_weights(Ff, d, reg=args.reg, w0=w0, prior=args.prior)
+            label = f"prc{prc}" if len(args.observable) == 1 else f"prc{prc} {obs}"
+            if obs == primary:
+                out_png = f"thrfit_selftest_prc{prc}.png" if args.self_test else f"thrfit_prc{prc}.png"
+                plot_fit(T, F, Tf, w_fit, d, vals_all, prc, os.path.join(args.outdir, out_png),
+                         extrap=args.extrapolate, mc_d=mc_d, sim_r=args.sim_r)
+            st = fit_stats(T, Tf, Ff, d, w_fit, vals_all, args.thr_lo, args.thr_hi)
+            if mc_d is not None:   # full-sim vs data, and basis-closure (nominal-map interp vs full sim)
+                pk = predict_known(T, F, vals_all, extrap=args.extrapolate)
+                st["mc_resid"] = float(np.sqrt(((mc_d - d) ** 2).sum()) * BINW)
+                st["basis_resid"] = float(np.sqrt(((pk - mc_d) ** 2).sum()) * BINW)
+            print(f"  {label} (reset {use_rst} cyc): fit {st['fit_m']:.2f}+/-{st['fit_s']:.2f} ke- vs "
+                  f"map {st['map_m']:.2f}+/-{st['map_s']:.2f} (resid {st['resid']:.2e}, n_data={ndat})"
+                  + (f"; sim r{args.sim_r} vs data {st['mc_resid']:.2e}, basis-closure {st['basis_resid']:.2e}"
+                     if mc_d is not None else ""))
+            collected[label] = dict(label=label, prc=prc, obs=obs, sim_r=args.sim_r,
+                                    T=T, F=F, Tf=Tf, Ff=Ff, d=d, w_fit=w_fit, use_rst=use_rst,
+                                    ndat=ndat, stats=st, mc_d=mc_d, primary=(obs == primary))
 
-    # JOINT fit: one shared w(T) for all collected prc (shared hardware thresholds, differing reset).
+    # JOINT fit: one shared w(T) across ALL collected spectra (prc x observable; shared hardware thresholds)
     joint = None
-    if len(collected) >= 2:
-        prcs = list(collected.keys()); Tf = collected[prcs[0]]["Tf"]
+    specs = list(collected.values())
+    if len(specs) >= 2:
+        Tf = specs[0]["Tf"]
         w0 = seed_from_map(Tf, vals_all) if args.seed_map else None
-        w_j = fit_joint([collected[p]["Ff"] for p in prcs], [collected[p]["d"] for p in prcs],
+        w_j = fit_joint([c["Ff"] for c in specs], [c["d"] for c in specs],
                         reg=args.reg, w0=w0, prior=args.prior)
         tag = "thrfit_joint_selftest.png" if args.self_test else "thrfit_joint.png"
-        plot_joint(collected, Tf, vals_all, w_j, os.path.join(args.outdir, tag), extrap=args.extrapolate)
+        plot_joint(specs, Tf, vals_all, w_j, os.path.join(args.outdir, tag), extrap=args.extrapolate)
         jm, js = moments(Tf, w_j)
-        resids = {p: float(np.sqrt(((mixture(collected[p]["Ff"], w_j) - collected[p]["d"]) ** 2).sum()) * BINW)
-                  for p in prcs}
-        joint = dict(prcs=prcs, w=w_j, fit_m=float(jm), fit_s=float(js), resids=resids)
-        print(f"  joint fit ({'+'.join('prc'+str(p) for p in prcs)}): shared thresholds "
-              f"{jm:.2f}+/-{js:.2f} ke- (resid " + ", ".join(f"prc{p} {resids[p]:.2e}" for p in prcs) + ")")
+        resids = {c["label"]: float(np.sqrt(((mixture(c["Ff"], w_j) - c["d"]) ** 2).sum()) * BINW)
+                  for c in specs}
+        joint = dict(labels=[c["label"] for c in specs], w=w_j, fit_m=float(jm), fit_s=float(js), resids=resids)
+        print(f"  joint fit ({'+'.join(c['label'] for c in specs)}): shared thresholds "
+              f"{jm:.2f}+/-{js:.2f} ke- (resid " + ", ".join(f"{c['label']} {resids[c['label']]:.2e}" for c in specs) + ")")
 
-    if collected:
-        write_summary(os.path.join(args.outdir, "thrfit_summary.txt"), args, collected, joint, vals_all)
+    if specs:
+        write_summary(os.path.join(args.outdir, "thrfit_summary.txt"), args, specs, joint, vals_all)
     print(f"\nwrote outputs -> {args.outdir}/")
 
 

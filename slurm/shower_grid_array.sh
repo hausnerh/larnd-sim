@@ -36,11 +36,13 @@
 #SBATCH -o grid_part_%A_%a.log
 
 NSLICE="${NSLICE:-250}"
-# THRESHOLDS span [1.25, 11.25] ke- in 1.25 ke- steps so the threshold-mixture fit basis is SIMULATED
-# across the whole per-pixel map (1-20 ke-, p99 11.6), not extrapolated from [2.5,7.5]. Resets loop
-# OUTER in the grid (one induction/recompile each), thresholds within a reset are FEE-only, so the 9
-# thresholds cost little over the old 5. The thin tail above 11.25 is left to the fit's extrapolation.
-THRESHOLDS="${THRESHOLDS:-1250 2500 3750 5000 6250 7500 8750 10000 11250}"
+# THRESHOLDS span [1.25, 15] ke- in 1.25 ke- steps so the threshold-mixture fit basis is SIMULATED
+# across the whole per-pixel map (1-20 ke-, p99 11.6), not extrapolated from [2.5,7.5]. The top three
+# nodes (12.5, 13.75, 15) PIN the high-threshold tail the data prefer with real basis shapes instead of
+# extrapolation. Resets loop OUTER in the grid (one induction/recompile each), thresholds within a reset
+# are FEE-only, so the 12 thresholds cost little over the old 5. The thin tail above 15 is left to the
+# fit's extrapolation (the real map's p99 is 11.6 ke-, so >15 is a sliver).
+THRESHOLDS="${THRESHOLDS:-1250 2500 3750 5000 6250 7500 8750 10000 11250 12500 13750 15000}"
 RESETS="${RESETS:--1 1024 512 256 128 64}"
 # OUTBASE lets an orchestrator point each run (e.g. per-prc) at its own grid dir; parts land in
 # $OUTBASE/part_<k> and merge_grids.sh (OUT=$OUTBASE) collapses them to $OUTBASE/ti_mult_grid.npz.

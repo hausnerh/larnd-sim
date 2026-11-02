@@ -85,7 +85,7 @@ if [ "${THRFIT:-1}" = "1" ] && [ "$#" -gt 0 ]; then
     --prc $PRCS --grid "$@" --outdir "$PLOT_OUT/thrfit" $TFIT_RESET_FLAG $TFIT_SIM_FLAG ${THRFIT_EXTRA:-} \
     || echo "!! threshold fit failed (non-fatal) -- the main plots in $PLOT_OUT are already written"
   # SECOND set: extend the fit range UPWARD (--thr-hi, default 20 ke- = the map's max) so the fit has
-  # headroom above the top simulated node instead of piling threshold weight at the 11.25 edge. Reuses
+  # headroom above the top simulated node (15 ke-) instead of piling threshold weight at that edge. Reuses
   # the data densities the first run just saved (--data-npz), so NO second FLOW read. THRFIT_EXT=0 to
   # skip; THRFIT_EXT_HI to set the top edge. Figures are identical in style (the dir name says which).
   if [ "${THRFIT_EXT:-1}" = "1" ]; then
