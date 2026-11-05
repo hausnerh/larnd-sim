@@ -29,9 +29,12 @@ import numpy as np
 
 # default event-level charge/events 'ADC' cut -- same window the plotter uses
 ADC_MIN, ADC_MAX = 0.2e6, 0.5e6
+# pixel identity is the (z, y) anode-plane coordinate ONLY -- the plotter keys on
+# pixel2id_abs(z, y). Do NOT include the drift coordinate (calib 'x', which is continuous
+# per hit): that would make every hit its own pixel and force single-hit frac = 1.
 LEVELS = {
-    "raw_hits":          dict(coords=("x_pix", "y_pix", "z_pix"), q="ADC", unit="ADC"),
-    "calib_prompt_hits": dict(coords=("x", "y", "z"),             q="Q",   unit="ke-"),
+    "raw_hits":          dict(coords=("z_pix", "y_pix"), q="ADC", unit="ADC"),
+    "calib_prompt_hits": dict(coords=("z", "y"),         q="Q",   unit="ke-"),
 }
 
 
