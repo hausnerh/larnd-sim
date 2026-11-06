@@ -203,14 +203,17 @@ def main():
     seg_color = {c: col for c, _, col in SEG_CATS}
     seg_label = {c: lab for c, lab, _ in SEG_CATS}
 
-    # ---- deposited-energy budget by process (printed) ----
-    print("\n[dE budget by process]  (fraction of ALL deposited energy)")
+    # ---- deposited-energy budget by process (collected -> written to the .txt summary) ----
+    summary = [f"# file: {args.path}",
+               f"# segment->trajectory link: '{link}'",
+               f"# segments={seg.size}  trajectories={trj.size}",
+               "", "[dE budget by process]  (fraction of ALL deposited energy)"]
     tot = dE.sum()
     for c in seg_keys:
         m = seg_cat == c
         e = dE[m].sum()
         if e > 0:
-            print(f"  {seg_label[c]:38s}: {100*e/tot:6.2f}%  ({m.sum()} segments)")
+            summary.append(f"  {seg_label[c]:38s}: {100*e/tot:6.2f}%  ({int(m.sum())} segments)")
 
     # ---- per-decay topology: which transition converted in each decay ----
     uev = np.unique(sev)
@@ -237,9 +240,9 @@ def main():
     tot_by_decay = {c: [] for c in dkeys}
     for e in uev:
         tot_by_decay[decay_cat(int(e))].append(per_ev_dE[int(e)])
-    print("\n[decays by topology]")
+    summary += ["", "[decays by topology]"]
     for c in dkeys:
-        print(f"  {dlabel[c]:40s}: {len(tot_by_decay[c]):6d} decays")
+        summary.append(f"  {dlabel[c]:40s}: {len(tot_by_decay[c]):6d} decays")
 
     # ---- plot ----
     import matplotlib
@@ -264,10 +267,6 @@ def main():
     ax[0].set_xlabel("total deposited energy per decay  [MeV]")
     ax[0].set_ylabel("decays")
     ax[0].legend(fontsize=8, loc="upper left")
-    ax[0].text(0.98, 0.52, "dashed = nuclear energy + Pb K X-ray (88 keV)\n"
-               "absorbed locally = the observed peak\n"
-               "dotted = bare nuclear energy (X-ray escapes)",
-               transform=ax[0].transAxes, ha="right", va="center", fontsize=7, color="0.3")
 
     # Panel B: per-segment dE, stacked by originating process (log y)
     segedges = np.linspace(0, args.seg_emax*1e3, 220)   # keV
@@ -277,30 +276,31 @@ def main():
                color=[seg_color[c] for c in present], label=[seg_label[c] for c in present],
                edgecolor="none", alpha=0.9)
     ax[1].set_yscale("log")
-    ymaxB = ax[1].get_ylim()[1]
+    yb = ax[1].get_ylim()[0]
     # Short-range conversion e- deposit in ~1 segment -> the blue/green spikes ARE these lines.
+    # Labels sit at the BOTTOM so the legend never covers them.
     for L in CE_570:
         ax[1].axvline(L*1e3, color="#1f77b4", ls=":", lw=0.7)
     for L in CE_1064:
         ax[1].axvline(L*1e3, color="#2ca02c", ls=":", lw=0.7)
-    ax[1].text(481.7, ymaxB, " 482 (K-570)", rotation=90, va="top", ha="left", fontsize=7, color="#1f77b4")
-    ax[1].text(975.7, ymaxB, " 976 (K-1064)", rotation=90, va="top", ha="left", fontsize=7, color="#2ca02c")
+    ax[1].text(481.7, yb*1.4, " 482 (K-570)", rotation=90, va="bottom", ha="left", fontsize=7, color="#1f77b4")
+    ax[1].text(975.7, yb*1.4, " 976 (K-1064)", rotation=90, va="bottom", ha="left", fontsize=7, color="#2ca02c")
     for E in (75.0, 87.3):                          # Pb K X-ray photo-absorption
         ax[1].axvline(E, color="k", ls=":", lw=0.7)
-    ax[1].text(80, ymaxB, " Pb K X-ray", rotation=90, va="top", ha="left", fontsize=7, color="k")
+    ax[1].text(80, yb*1.4, " Pb K X-ray", rotation=90, va="bottom", ha="left", fontsize=7, color="k")
     ax[1].set_title("Per-segment dE, by originating process")
     ax[1].set_xlabel("per-segment deposited energy  [keV]")
     ax[1].set_ylabel("segments")
-    ax[1].legend(fontsize=8, loc="upper right")
-    ax[1].text(0.98, 0.32, "conversion e$^-$ are short-range -> deposit in ~1 segment:\n"
-               "the blue/green spikes ARE the 482/554/566 & 976/1048 keV lines.\n"
-               "Compton e$^-$ form the smooth continuum.",
-               transform=ax[1].transAxes, ha="right", va="center", fontsize=7, color="0.3")
+    ax[1].legend(fontsize=8, loc="upper left")
 
     fig.tight_layout()
     out = os.path.join(outdir, "bi207_processes.png")
     fig.savefig(out, dpi=120)
-    print(f"\nwrote {out}")
+    txt = os.path.join(outdir, "bi207_processes.txt")
+    with open(txt, "w") as f:
+        f.write("\n".join(summary) + "\n")
+    print(f"wrote {out}")
+    print(f"wrote {txt}")
 
 
 if __name__ == "__main__":
