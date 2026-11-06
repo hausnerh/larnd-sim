@@ -48,15 +48,18 @@ CE_WIN, G_WIN = 0.020, 0.035         # MeV matching windows
 
 # Category -> (label, color). Order controls the stack order (low energy at bottom).
 SEG_CATS = [
-    ("ce570",    "conv. e$^-$ (570 keV transition)",  "#1f77b4"),
-    ("ce1064",   "conv. e$^-$ (1064 keV transition)", "#2ca02c"),
-    ("ce1770",   "conv. e$^-$ (1770 keV transition)", "#17becf"),
-    ("auger",    "Auger / atomic e$^-$ (Pb X-ray)",   "#9467bd"),
-    ("comp570",  "Compton/PE from 570 keV $\\gamma$", "#ff7f0e"),
-    ("comp1064", "Compton/PE from 1064 keV $\\gamma$","#d62728"),
-    ("comp1770", "Compton/PE from 1770 keV $\\gamma$","#8c564b"),
-    ("other",    "other / untraced",                  "#7f7f7f"),
+    ("ce570",    "conv. e$^-$ (570 keV transition)",   "#1f77b4"),
+    ("ce1064",   "conv. e$^-$ (1064 keV transition)",  "#2ca02c"),
+    ("ce1770",   "conv. e$^-$ (1770 keV transition)",  "#17becf"),
+    ("auger",    "Auger / atomic e$^-$ (off nucleus)", "#9467bd"),
+    ("xray",     "Pb K X-ray photo-e$^-$ (~75-88 keV)","#e377c2"),
+    ("comp570",  "Compton/PE from 570 keV $\\gamma$",  "#ff7f0e"),
+    ("comp1064", "Compton/PE from 1064 keV $\\gamma$", "#d62728"),
+    ("comp1770", "Compton/PE from 1770 keV $\\gamma$", "#8c564b"),
+    ("untraced", "untraced $\\gamma$-induced",         "#7f7f7f"),
 ]
+PB_K = 0.088  # Pb K-shell binding (MeV): energy deposited when the EC/conversion K-vacancy
+              # cascade (X-ray + Auger) is absorbed locally. Shifts the deposited peaks up.
 DECAY_CATS = [
     ("conv1064", "1064 keV converted",  "#2ca02c"),
     ("conv570",  "570 keV converted",   "#1f77b4"),
@@ -97,49 +100,59 @@ def build_origin(trj):
     idx_of = {int(k): i for i, k in enumerate(key)}
 
     def origin(k):
+        """Returns (root_pdg, root_E, on_ion). on_ion=True means the climb stopped on a
+        STORED nucleus/ion parent (reliable: a genuine conversion/Auger e- or de-excitation
+        gamma). on_ion=False means the parent was not stored (an untraceable gamma chain)."""
         k = int(k)
         guard = 0
         while True:
             i = idx_of.get(k)
             if i is None:
-                return (None, None)
+                return (None, None, False)
             pk = (k // BIG) * BIG + int(par[i])     # parent key in the SAME event
             j = idx_of.get(pk)
-            # Stop when the parent is absent (k is a stored root) or is a nucleus/ion:
-            if j is None or pdg[j] > BIG:
-                return (int(pdg[i]), float(E[i]))
+            if j is None:
+                return (int(pdg[i]), float(E[i]), False)   # parent not stored -> untraceable
+            if pdg[j] > BIG:
+                return (int(pdg[i]), float(E[i]), True)    # parent IS the decaying nucleus/ion
             k = pk
             guard += 1
             if guard > 400:
-                return (int(pdg[i]), float(E[i]))
+                return (int(pdg[i]), float(E[i]), False)
 
     return origin, idx_of
 
 
-def categorize(root_pdg, root_E):
-    """Map a root quantum (pdg, E) to a segment-process category key."""
+def categorize(root_pdg, root_E, on_ion):
+    """Map a root quantum (pdg, E, on_ion) to a segment-process category key.
+
+    on_ion distinguishes a genuine direct daughter of the nucleus (conversion/Auger e- or
+    de-excitation gamma -- reliable) from an electron whose parent photon was not stored
+    (an untraceable Compton/PE chain)."""
     if root_pdg is None:
-        return "other"
-    if root_pdg == 22:
+        return "untraced"
+    if root_pdg == 22:                         # traced to a photon
         if abs(root_E - G1064) < G_WIN:
             return "comp1064"
         if abs(root_E - G570) < G_WIN:
             return "comp570"
         if abs(root_E - G1770) < G_WIN:
             return "comp1770"
-        return "other"          # scattered/brems gamma we could not trace to a line
+        if root_E < 0.12:                      # Pb K/L fluorescence X-ray, photo-absorbed
+            return "xray"
+        return "untraced"                      # mid-energy scattered gamma, line lost
     if root_pdg == 11:
-        ke = root_E - ME        # edep E_start is TOTAL energy; conversion lines are KE
-        if any(abs(ke - L) < CE_WIN for L in CE_1064):
-            return "ce1064"
-        if any(abs(ke - L) < CE_WIN for L in CE_570):
-            return "ce570"
-        if any(abs(ke - L) < CE_WIN for L in CE_1770):
-            return "ce1770"
-        if ke < 0.12:
-            return "auger"
-        return "other"
-    return "other"
+        ke = root_E - ME                       # edep E_start is TOTAL energy; CE lines are KE
+        if on_ion:                             # electron emitted directly off the nucleus
+            if any(abs(ke - L) < CE_WIN for L in CE_1064):
+                return "ce1064"
+            if any(abs(ke - L) < CE_WIN for L in CE_570):
+                return "ce570"
+            if any(abs(ke - L) < CE_WIN for L in CE_1770):
+                return "ce1770"
+            return "auger"                     # Auger / low-E atomic electron off the nucleus
+        return "untraced"                      # parent photon not stored -> cannot assign a line
+    return "untraced"
 
 
 def main():
@@ -240,16 +253,20 @@ def main():
     ax[0].hist(stacks, bins=edges, stacked=True, histtype="stepfilled",
                color=[dcolor[c] for c in dkeys], label=[dlabel[c] for c in dkeys],
                edgecolor="none", alpha=0.9)
-    for E, txt in [(G570, "570 keV"), (G1064, "1064 keV"), (1.6334, "1064+570 = 1.633 MeV")]:
-        ax[0].axvline(E, color="k", ls=":", lw=0.8)
-        ax[0].text(E, ax[0].get_ylim()[1]*0.96, txt, rotation=90,
-                   va="top", ha="right", fontsize=8, color="k")
+    ymaxA = ax[0].get_ylim()[1]
+    for E0, txt in [(G570, "570"), (G1064, "1064"), (1.6334, "1064+570")]:
+        ax[0].axvline(E0, color="0.65", ls=":", lw=0.7)            # bare nuclear (X-ray escapes)
+        ax[0].axvline(E0 + PB_K, color="k", ls="--", lw=1.0)       # + Pb K X-ray = observed peak
+        ax[0].text(E0 + PB_K, ymaxA*0.98, f" {txt}+PbK = {int(round((E0+PB_K)*1e3))} keV",
+                   rotation=90, va="top", ha="left", fontsize=8, color="k")
     ax[0].set_title("Total dE per decay, by which transition converted\n"
                     "(conversion e$^-$ deposit locally -> full peak; escaping $\\gamma$ -> shoulders)")
     ax[0].set_xlabel("total deposited energy per decay  [MeV]")
     ax[0].set_ylabel("decays")
     ax[0].legend(fontsize=8, loc="upper left")
-    ax[0].text(0.98, 0.5, "full peak sits ~75-88 keV above 1.633\nwhen the Pb K X-ray is also absorbed",
+    ax[0].text(0.98, 0.52, "dashed = nuclear energy + Pb K X-ray (88 keV)\n"
+               "absorbed locally = the observed peak\n"
+               "dotted = bare nuclear energy (X-ray escapes)",
                transform=ax[0].transAxes, ha="right", va="center", fontsize=7, color="0.3")
 
     # Panel B: per-segment dE, stacked by originating process (log y)
@@ -259,15 +276,26 @@ def main():
     ax[1].hist(seg_stacks, bins=segedges, stacked=True, histtype="stepfilled",
                color=[seg_color[c] for c in present], label=[seg_label[c] for c in present],
                edgecolor="none", alpha=0.9)
-    for E, txt in [(74.97, "Pb K$\\alpha$ 75"), (87.3, "Pb K$\\beta$ 87")]:
-        ax[1].axvline(E, color="k", ls=":", lw=0.8)
-        ax[1].text(E, ax[1].get_ylim()[1], " "+txt, rotation=90, va="top", ha="left",
-                   fontsize=7, color="k")
     ax[1].set_yscale("log")
+    ymaxB = ax[1].get_ylim()[1]
+    # Short-range conversion e- deposit in ~1 segment -> the blue/green spikes ARE these lines.
+    for L in CE_570:
+        ax[1].axvline(L*1e3, color="#1f77b4", ls=":", lw=0.7)
+    for L in CE_1064:
+        ax[1].axvline(L*1e3, color="#2ca02c", ls=":", lw=0.7)
+    ax[1].text(481.7, ymaxB, " 482 (K-570)", rotation=90, va="top", ha="left", fontsize=7, color="#1f77b4")
+    ax[1].text(975.7, ymaxB, " 976 (K-1064)", rotation=90, va="top", ha="left", fontsize=7, color="#2ca02c")
+    for E in (75.0, 87.3):                          # Pb K X-ray photo-absorption
+        ax[1].axvline(E, color="k", ls=":", lw=0.7)
+    ax[1].text(80, ymaxB, " Pb K X-ray", rotation=90, va="top", ha="left", fontsize=7, color="k")
     ax[1].set_title("Per-segment dE, by originating process")
     ax[1].set_xlabel("per-segment deposited energy  [keV]")
     ax[1].set_ylabel("segments")
     ax[1].legend(fontsize=8, loc="upper right")
+    ax[1].text(0.98, 0.32, "conversion e$^-$ are short-range -> deposit in ~1 segment:\n"
+               "the blue/green spikes ARE the 482/554/566 & 976/1048 keV lines.\n"
+               "Compton e$^-$ form the smooth continuum.",
+               transform=ax[1].transAxes, ha="right", va="center", fontsize=7, color="0.3")
 
     fig.tight_layout()
     out = os.path.join(outdir, "bi207_processes.png")
