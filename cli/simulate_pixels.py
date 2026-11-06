@@ -31,7 +31,10 @@ import h5py
 import numba as nb
 from numba.cuda import device_array, to_device
 from numba.cuda.random import create_xoroshiro128p_states
-from numba.cuda.core.errors import NumbaPerformanceWarning
+try:
+    from numba.cuda.core.errors import NumbaPerformanceWarning   # numba-cuda (new split layout)
+except ModuleNotFoundError:
+    from numba.core.errors import NumbaPerformanceWarning        # standard / older numba
 
 from tqdm import tqdm
 
