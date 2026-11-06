@@ -40,6 +40,7 @@
 # max_radius=4 + this orchestrator, f_T's single-hit-Q peak should move from ~4.5 to ~12 ke-
 # and the map-mixture (predict_known) should track his prc2_r4 sim to ~2%.
 # =============================================================================
+import os
 from math import ceil
 
 import numpy as np
@@ -92,6 +93,14 @@ def enable_farfield(ctx, ff_properties_path, mode="segments",
     _assert_vendored()
     from larndsim.consts import sim, detector, ff_induction
 
+    # Resolve a repo-relative path (e.g. "larndsim/farfield_properties/ff_r4.yaml") against the
+    # larndsim install, so --farfield-properties works regardless of the caller's cwd.
+    if not os.path.exists(ff_properties_path):
+        import larndsim
+        root = os.path.dirname(os.path.dirname(os.path.abspath(larndsim.__file__)))
+        cand = os.path.join(root, ff_properties_path)
+        if os.path.exists(cand):
+            ff_properties_path = cand
     ff_induction.set_ff_induction_properties(ff_properties_path)  # charge_neighbor_radius=4, dipole consts
     sim.FARFIELD_ENABLED = True
     sim.FARFIELD_MODE = mode                 # 'segments'
