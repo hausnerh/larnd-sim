@@ -72,22 +72,31 @@ def main():
     # ---- 1) DECAY validation from trajectories ----
     e_e = g_e = conv_e = None
     if trj is not None and trj.size:
+        names = trj.dtype.names
+        print(f"# trajectory fields: {names}")
         pdg = trj["pdg_id"]
         Es = trj["E_start"].astype(float)   # MeV; convention (KE vs total) checked below
         e_e = Es[pdg == 11]
         g_e = Es[pdg == 22]
-        # Conversion/Auger electrons = e- whose PARENT is the primary decaying ion (pdg>1e9),
-        # matched WITHIN each event. This isolates the decay's own electrons from the Compton /
-        # delta-ray / shower continuum, so the calibration lines show cleanly even at low stats.
+        # Conversion/Auger electrons = e- whose PARENT is a NUCLEUS/ion (pdg>1e9), matched
+        # WITHIN each event. In the Bi-207 chain BOTH the primary Bi-207 and its de-exciting
+        # Pb-207* daughter are ions; the conversion e- comes off the de-exciting nucleus and
+        # Auger e- off the atom, so we accept ANY ion parent (not only the primary). This
+        # isolates the decay's own electrons from the Compton / delta-ray continuum (whose
+        # parents are gammas / electrons), so the calibration lines show cleanly at low stats.
         BIG = 1_000_000_000
-        prim = trj["primary"].astype(bool)
-        ion = (pdg > BIG) & prim
-        ion_key = trj["event_id"][ion].astype(np.int64) * BIG + trj["traj_id"][ion].astype(np.int64)
-        em = pdg == 11
-        epar = trj["event_id"][em].astype(np.int64) * BIG + trj["parent_id"][em].astype(np.int64)
-        conv_e = e_e[np.isin(epar, ion_key)]
+        if {"traj_id", "parent_id", "event_id"} <= set(names):
+            ion = (pdg > BIG)
+            ion_key = trj["event_id"][ion].astype(np.int64) * BIG + trj["traj_id"][ion].astype(np.int64)
+            em = pdg == 11
+            epar = trj["event_id"][em].astype(np.int64) * BIG + trj["parent_id"][em].astype(np.int64)
+            conv_e = e_e[np.isin(epar, ion_key)]
+            sel = "parent = decaying nucleus/ion"
+        else:
+            conv_e = e_e                      # fields absent: fall back to all electrons
+            sel = "ALL e- (no traj_id/parent_id to isolate conversion e-)"
         print(f"\n[1] DECAY  (trajectories={trj.size}: e-={e_e.size}, gamma={g_e.size}, "
-              f"conversion/Auger e-={conv_e.size})")
+              f"conversion/Auger e-={conv_e.size}; {sel})")
         if conv_e.size:
             # edep E_start may be TOTAL energy; conversion lines are KE. Report both; the
             # non-empty rows reveal the convention.
