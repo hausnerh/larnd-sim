@@ -107,7 +107,9 @@ bi207_fsd()
 
   echo ">>> [3/3] ndlar_flow (container h5flow + cloned ${ND_FLOW}/src) -> ${flow}"
   rm -f "${flow}"
-  incont "cd '${ND_FLOW}' && PYTHONPATH='${ND_FLOW}/src':\${PYTHONPATH:-} h5flow -i '${larnd}' -o '${flow}' -c \
+  # npcompat/sitecustomize.py restores numpy aliases the clone uses (np.bool, ...) but the
+  # container's newer numpy removed; it auto-imports because its dir is first on PYTHONPATH.
+  incont "cd '${ND_FLOW}' && PYTHONPATH='${ND_SRC}/tests/bi207/npcompat':'${ND_FLOW}/src':\${PYTHONPATH:-} h5flow -i '${larnd}' -o '${flow}' -c \
       yamls/fsdcube_flow/workflows/charge/charge_event_building_mc.yaml \
       yamls/fsdcube_flow/workflows/charge/charge_event_reconstruction_mc.yaml \
       yamls/fsdcube_flow/workflows/combined/combined_reconstruction_mc.yaml \
