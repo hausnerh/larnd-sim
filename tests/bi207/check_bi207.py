@@ -70,19 +70,30 @@ def main():
         trj = _get(h, "trajectories")
 
     # ---- 1) DECAY validation from trajectories ----
-    e_e = g_e = None
+    e_e = g_e = conv_e = None
     if trj is not None and trj.size:
         pdg = trj["pdg_id"]
         Es = trj["E_start"].astype(float)   # MeV; convention (KE vs total) checked below
         e_e = Es[pdg == 11]
         g_e = Es[pdg == 22]
-        print(f"\n[1] DECAY  (trajectories={trj.size}: e-={e_e.size}, gamma={g_e.size})")
-        if e_e.size:
-            # edep-sim E_start may be TOTAL energy; conversion lines are KE. Try both and
-            # report whichever window catches them (the non-empty one is the convention).
-            print("  electrons -- if the KE rows are empty but the +511 rows fill, E_start is TOTAL energy:")
-            line_counts(e_e, E_LINES, "e- as-KE", offset=0.0)
-            line_counts(e_e, E_LINES, "e- as-total(+me)", offset=ME)
+        # Conversion/Auger electrons = e- whose PARENT is the primary decaying ion (pdg>1e9),
+        # matched WITHIN each event. This isolates the decay's own electrons from the Compton /
+        # delta-ray / shower continuum, so the calibration lines show cleanly even at low stats.
+        BIG = 1_000_000_000
+        prim = trj["primary"].astype(bool)
+        ion = (pdg > BIG) & prim
+        ion_key = trj["event_id"][ion].astype(np.int64) * BIG + trj["traj_id"][ion].astype(np.int64)
+        em = pdg == 11
+        epar = trj["event_id"][em].astype(np.int64) * BIG + trj["parent_id"][em].astype(np.int64)
+        conv_e = e_e[np.isin(epar, ion_key)]
+        print(f"\n[1] DECAY  (trajectories={trj.size}: e-={e_e.size}, gamma={g_e.size}, "
+              f"conversion/Auger e-={conv_e.size})")
+        if conv_e.size:
+            # edep E_start may be TOTAL energy; conversion lines are KE. Report both; the
+            # non-empty rows reveal the convention.
+            print("  CONVERSION electrons (daughters of the decaying ion) -- expect peaks at the lines:")
+            line_counts(conv_e, E_LINES, "conv-e- KE", offset=0.0)
+            line_counts(conv_e, E_LINES, "conv-e- total(+me)", offset=ME)
         if g_e.size:
             line_counts(g_e, G_LINES, "gamma", offset=0.0)
     else:
@@ -111,12 +122,13 @@ def main():
     import matplotlib.pyplot as plt
     fig, ax = plt.subplots(2, 2, figsize=(12, 8))
     edges = np.linspace(0, args.emax, 200)
-    if e_e is not None and e_e.size:
-        ax[0, 0].hist(e_e, bins=edges, histtype="step", color="C0")
+    _epl = conv_e if (conv_e is not None and conv_e.size) else e_e
+    if _epl is not None and _epl.size:
+        ax[0, 0].hist(_epl, bins=edges, histtype="step", color="C0")
         for L in E_LINES:
             ax[0, 0].axvline(L, color="r", ls=":", lw=0.8)
             ax[0, 0].axvline(L + ME, color="orange", ls=":", lw=0.6)
-        ax[0, 0].set_title("primary e- E_start (red=KE lines, orange=+me)")
+        ax[0, 0].set_title("conversion e- E_start (red=KE lines, orange=+me)")
         ax[0, 0].set_xlabel("MeV")
     if g_e is not None and g_e.size:
         ax[0, 1].hist(g_e, bins=edges, histtype="step", color="C2")
