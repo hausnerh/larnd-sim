@@ -156,9 +156,15 @@ def apply_farfield(ctx, ev, drifted_tracks, classification_cache):
     ps_dev = cp.asarray(ev["pixels_signals"], dtype=cp.float32)    # (npix, nt0), t0-inflated
     nt0 = ps_dev.shape[1]
 
-    # Device structured tracks for the FFE kernels (launch_ffe_kernel filters tracks by
-    # pixel_plane on-device, then the segment kernel consumes them).
-    tracks_dev = cp.asarray(drifted_tracks)
+    # HOST structured tracks for the FFE kernels. launch_ffe_kernel filters by
+    # `tracks['pixel_plane'] == tpc_idx` (a host NumPy boolean mask) and Numba then
+    # auto-copies the filtered record subarray to the device WITH its Record dtype.
+    # A CuPy structured array must NOT be passed to a Numba CUDA kernel: its CUDA Array
+    # Interface exposes only an opaque void dtype (|V<nbytes>), which Numba cannot turn
+    # into a Record type ("Cannot determine Numba type of cupy.ndarray" / NotImplemented |V).
+    tracks_host = drifted_tracks
+    if not isinstance(tracks_host, np.ndarray):          # defensive: cupy -> host numpy
+        tracks_host = cp.asnumpy(tracks_host)
     plane_all = np.asarray(drifted_tracks["pixel_plane"]).astype(np.int32)
     active_tpcs = np.unique(plane_all)
 
@@ -178,7 +184,7 @@ def apply_farfield(ctx, ev, drifted_tracks, classification_cache):
             continue
         m_dev = cp.asarray(row_mask)
         ff = signal_calculation.launch_ffe_kernel(
-            tpc_idx=int(tpc_idx), tracks=tracks_dev,
+            tpc_idx=int(tpc_idx), tracks=tracks_host,
             pixel_x=pixel_x[m_dev], pixel_y=pixel_y[m_dev],
             n_ticks=nt0, category=1, voxel_cache={})
         ps_dev[m_dev, :] += ff
@@ -201,7 +207,7 @@ def apply_farfield(ctx, ev, drifted_tracks, classification_cache):
             continue
 
         ff = signal_calculation.launch_ffe_kernel(
-            tpc_idx=int(tpc_idx), tracks=tracks_dev,
+            tpc_idx=int(tpc_idx), tracks=tracks_host,
             pixel_x=ix, pixel_y=iy, n_ticks=nt0, category=0, voxel_cache={})
 
         # min(t0) tick offset before digitization (simulate_pixels L1590-1605), incl. his
