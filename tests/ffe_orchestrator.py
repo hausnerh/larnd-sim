@@ -123,7 +123,19 @@ def precompute_classification(drifted_tracks):
     category-0 step reads .induction_pixels / .induction_pixels_x / .induction_pixels_y off it.
     """
     from larndsim.far_field import pixel_classifier
+    from larndsim.consts import detector
     _require_fields(drifted_tracks, "precompute_classification")
+    # Drop out-of-volume segments: drifting.py stamps them pixel_plane = DEFAULT_PLANE_INDEX
+    # (0x0000BEEF = 48879), and get_classification_cache groups by np.unique(pixel_plane) ->
+    # it would index TPC_BORDERS[48879]. mkramer's showers sit in the module0 geometry, so
+    # ~70% of segments land outside fsd_cube's single TPC; those induce nothing on it.
+    n_tpc = int(np.asarray(detector.TPC_BORDERS).shape[0])
+    planes = np.asarray(drifted_tracks["pixel_plane"])
+    valid = (planes >= 0) & (planes < n_tpc)
+    if not valid.all():
+        drifted_tracks = drifted_tracks[valid]
+    if drifted_tracks.size == 0:
+        return {}
     return pixel_classifier.get_classification_cache(drifted_tracks)
 
 
@@ -165,8 +177,12 @@ def apply_farfield(ctx, ev, drifted_tracks, classification_cache):
     tracks_host = drifted_tracks
     if not isinstance(tracks_host, np.ndarray):          # defensive: cupy -> host numpy
         tracks_host = cp.asnumpy(tracks_host)
+    n_tpc = int(np.asarray(det.TPC_BORDERS).shape[0])
     plane_all = np.asarray(drifted_tracks["pixel_plane"]).astype(np.int32)
-    active_tpcs = np.unique(plane_all)
+    # Valid TPC planes only -- skip the DEFAULT_PLANE_INDEX (0xBEEF) out-of-volume sentinel,
+    # which would make launch_ffe_kernel index TPC_BORDERS[48879]. launch_segments filters
+    # tracks by pixel_plane==tpc_idx, so out-of-volume segments drop out of every kernel too.
+    active_tpcs = np.array([t for t in np.unique(plane_all) if 0 <= t < n_tpc], dtype=np.int32)
 
     # --- Pixel (x, y) for the NEAR pixels, exactly as simulate_pixels L1494-1501 ---
     px_idx = unique_pix_h % nx
