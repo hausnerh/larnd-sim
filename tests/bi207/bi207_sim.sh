@@ -76,10 +76,13 @@ bi207_gen()
 # use the GPU in conda, step 3 shells into the container (incont works on the GPU node too).
 #
 # Steps 1-2 use $ND_SRC (your branch, with the fsd_cube hooks) -- NOT the container's bundled
-# larnd-sim. Set ND_FLOW to the ndlar_flow repo root AS SEEN INSIDE THE CONTAINER (the dir with
-# yamls/); find it with:  incont "python -c 'import h5flow,os;print(os.path.dirname(h5flow.__file__))'; find / -maxdepth 6 -type d -name fsdcube_flow 2>/dev/null"
-# (ND_FLOW is the parent of that 'yamls' dir). $ND_WORK is mounted in the container, so the LARND/FLOW
-# paths resolve there unchanged.
+# larnd-sim. The container's bundled ndlar_flow (/opt/generators/ndlar_flow) is TOO OLD -- it has no
+# yamls/fsdcube_flow. So clone a CURRENT ndlar_flow into $ND_WORK (mounted in the container) and point
+# ND_FLOW at it; we run the container's h5flow + deps but prepend $ND_FLOW/src so the clone's newer
+# modules + yamls are used:
+#     git clone --depth 1 https://github.com/DUNE/ndlar_flow "$ND_WORK/ndlar_flow"
+#     export ND_FLOW="$ND_WORK/ndlar_flow"
+# $ND_WORK is mounted in the container, so the clone + the LARND/FLOW paths resolve there unchanged.
 # Args: [tag] [inset_cm].  Default tag=bi207, inset=0.5 cm off the cathode INTO the LAr (so nearly all
 # of the isotropic decay cloud is collected while still at ~full drift).
 bi207_fsd()
@@ -102,9 +105,9 @@ bi207_fsd()
     --input_filename="${fsd}" --output_filename="${larnd}" \
     --config=fsd_cube --rand_seed=1 || return 3
 
-  echo ">>> [3/3] ndlar_flow (h5flow, in container via incont) -> ${flow}"
+  echo ">>> [3/3] ndlar_flow (container h5flow + cloned ${ND_FLOW}/src) -> ${flow}"
   rm -f "${flow}"
-  incont "cd '${ND_FLOW}' && h5flow -i '${larnd}' -o '${flow}' -c \
+  incont "cd '${ND_FLOW}' && PYTHONPATH='${ND_FLOW}/src':\${PYTHONPATH:-} h5flow -i '${larnd}' -o '${flow}' -c \
       yamls/fsdcube_flow/workflows/charge/charge_event_building_mc.yaml \
       yamls/fsdcube_flow/workflows/charge/charge_event_reconstruction_mc.yaml \
       yamls/fsdcube_flow/workflows/combined/combined_reconstruction_mc.yaml \
