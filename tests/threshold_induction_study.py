@@ -103,6 +103,7 @@ sys.path.insert(0, _TESTS_DIR)
 # script is run straight out of a checkout, not only when the package is pip-installed.
 sys.path.insert(1, os.path.dirname(_TESTS_DIR))
 import verify_diffusion as vd  # noqa: E402
+import ffe_orchestrator as ffe  # noqa: E402  -- far-field (mkramer r4) basis extension
 
 SQRT2PI = sqrt(2.0 * pi)
 
@@ -534,7 +535,7 @@ def event_induce(ctx, drifted, neigh, radius, seed, collect_frac=0.15):
     # far the largest per-event object and OOM'd the 200-event cache -- so we DROP
     # it: zero num_backtrack makes get_adc_values skip backtracking entirely while
     # adc_list (built from pixels_signals alone) is bit-for-bit unchanged.
-    return dict(
+    ev = dict(
         unique_pix=uph,
         pixels_signals=ps_host,
         pixels_tracks_signals=np.zeros(1, dtype=np.float64),
@@ -548,6 +549,15 @@ def event_induce(ctx, drifted, neigh, radius, seed, collect_frac=0.15):
         truth_e=ps_host.sum(axis=1, dtype=np.float64) * ts,   # net collected charge (e-)
         max_time=ps_host.shape[1] * ts,
     )
+    # Far-field induction (mkramer r4): add once per event. Induction is threshold-independent,
+    # so this cached pre-signal is reused across the whole threshold/reset scan. No-op unless
+    # --farfield set sim.FARFIELD_ENABLED (via ffe.enable_farfield). `drifted` here is the
+    # event's in-volume segments (the FF halo comes from near-plane segments; the out-of-volume
+    # deposits dropped in event_drift induce negligibly).
+    from larndsim.consts import sim as _sim
+    if getattr(_sim, "FARFIELD_ENABLED", False):
+        ev = ffe.apply_farfield(ctx, ev, drifted, ffe.precompute_classification(drifted))
+    return ev
 
 
 def _cache_mb(evs):
@@ -3220,6 +3230,18 @@ def parse_args():
     ap.add_argument("--detector", default=None)
     ap.add_argument("--pixel-layout", default=None)
     ap.add_argument("--sim-properties", default=None)
+    # Far-field induction (reproduces mkramer prc2_r4: near-field radius 4 + FFE). Default OFF
+    # keeps the near-field-only basis bit-for-bit reproducible. Needs his bee9d14 far-field
+    # modules present (tests/ffe_orchestrator._assert_vendored prints how to vendor them).
+    ap.add_argument("--farfield", action="store_true",
+                    help="enable far-field induction in the basis (segments/infinite_plane); "
+                         "pins near-field MAX_RADIUS to --farfield-max-radius. OFF by default.")
+    ap.add_argument("--farfield-properties", default=None,
+                    help="far-field properties YAML (e.g. larndsim/farfield_properties/ff_r4.yaml); "
+                         "sets charge_neighbor_radius + dipole constants. Required with --farfield.")
+    ap.add_argument("--farfield-max-radius", type=int, default=4,
+                    help="near-field MAX_RADIUS when --farfield is on (mkramer r4 = 4; overrides "
+                         "the response table's natural 12).")
     ap.add_argument("--edep-h5", default=None,
                     help="dumpTree edep-sim HDF5, OR a larnd-sim output .hdf5 that carries its "
                          "input 'segments' through (re-runs those same showers through the "
@@ -5316,6 +5338,24 @@ def analyze_spectra(spectra, outdir):
     recommend_operating_point(spectra, sample_results, outdir, noise_e)
 
 
+def _maybe_enable_farfield(ctx, args):
+    """Turn on far-field for the basis when --farfield is given (mkramer r4 reproduction).
+
+    Sets sim.FARFIELD_* (segments/infinite_plane), loads ff_rN.yaml, and pins near-field
+    MAX_RADIUS. Must run AFTER vd.load_simulation (detector/response loaded) and BEFORE the
+    first induction kernel launch. No-op without --farfield."""
+    if not getattr(args, "farfield", False):
+        return
+    if not args.farfield_properties:
+        sys.exit("ERROR: --farfield requires --farfield-properties "
+                 "(e.g. larndsim/farfield_properties/ff_r4.yaml)")
+    info = ffe.enable_farfield(ctx, args.farfield_properties, mode="segments",
+                               dipole="infinite_plane", max_radius=args.farfield_max_radius)
+    print(f"Far-field ENABLED: mode={info['mode']} dipole={info['dipole']} "
+          f"MAX_RADIUS={info['max_radius']} charge_neighbor_radius={info['charge_neighbor_radius']} "
+          f"({os.path.basename(args.farfield_properties)})")
+
+
 def main():
     args = parse_args()
     import matplotlib
@@ -5352,6 +5392,7 @@ def main():
             ctx = vd.load_simulation(args); vd.print_config(ctx)
             ctx._response0 = ctx.response.copy(); ctx._induction_mask = induction_mask(ctx)
             ctx.induction_scale = 1.0
+            _maybe_enable_farfield(ctx, args)
             spectra = produce_mult_grid(ctx, args)
             save_mult_grid(spectra, f"{args.outdir}/ti_mult_grid.npz")
             print(f"Wrote multiplicity grid to {args.outdir}/ti_mult_grid.npz\n  -> re-plot locally "
@@ -5385,6 +5426,7 @@ def main():
         ctx._response0 = ctx.response.copy()
         ctx._induction_mask = induction_mask(ctx)
         ctx.induction_scale = 1.0
+        _maybe_enable_farfield(ctx, args)
         spectra = produce_burst_only(ctx, args) if args.burst_only else produce_spectra(ctx, args)
         spec_path = args.spectra_out or f"{args.outdir}/ti_spectra.npz"
         save_spectra(spectra, spec_path)
