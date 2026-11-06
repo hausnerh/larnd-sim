@@ -66,3 +66,44 @@ bi207_gen()
   echo "VALIDATE (plot shows the e- lines emerging with stats):"
   echo "  python ${ND_SRC}/tests/bi207/check_bi207.py ${ND_WORK}/${tag}.EDEPSIM.h5 --outdir ${ND_WORK}/bi207_check_${tag}"
 }
+
+# STAGE 2+3 one-shot: translate the Bi-207 edep onto the fsd_cube cathode, run the FEE sim
+# (simulate_pixels, needs a GPU) and ndlar_flow (h5flow, CPU), leaving a FLOW file ready for
+# check_bi207_fee.py. The h5flow leg mirrors ndlar_flow's test/end2end/run_fsdcube_mc.sh (the
+# fsdcube MC workflow; our LARND is the same simulate_pixels(fsd_cube) output mkramer's showers use).
+# Needs: a GPU node for simulate_pixels, and ND_FLOW = your ndlar_flow repo root (the dir with yamls/).
+# Args: [tag] [inset_cm].  Default tag=bi207, inset=0.5 cm off the cathode INTO the LAr (so nearly all
+# of the isotropic decay cloud is collected while still at ~full drift).
+bi207_fsd()
+{
+  local tag=${1:-bi207} inset=${2:-0.5}
+  local edep="${ND_WORK}/${tag}.EDEPSIM.h5"
+  local fsd="${ND_WORK}/${tag}_fsd.EDEPSIM.h5"
+  local larnd="${ND_WORK}/${tag}_fsd.LARND.h5"
+  local flow="${ND_WORK}/${tag}_fsd.FLOW.hdf5"
+  : "${ND_FLOW:?set ND_FLOW to your ndlar_flow repo root (the dir containing yamls/)}"
+  [ -f "${edep}" ] || { echo "missing ${edep} (run bi207_gen ${tag} first)"; return 1; }
+
+  echo ">>> [1/3] translate onto the fsd_cube cathode (inset ${inset} cm) -> ${fsd}"
+  rm -f "${fsd}"
+  python "${ND_SRC}/tests/bi207/bi207_to_fsd.py" "${edep}" "${fsd}" --inset "${inset}" || return 2
+
+  echo ">>> [2/3] simulate_pixels (FEE, GPU) -> ${larnd}"
+  rm -f "${larnd}"
+  python "${ND_SRC}/cli/simulate_pixels.py" \
+    --input_filename="${fsd}" --output_filename="${larnd}" \
+    --config=fsd_cube --rand_seed=1 || return 3
+
+  echo ">>> [3/3] ndlar_flow (h5flow, CPU) -> ${flow}"
+  rm -f "${flow}"
+  ( cd "${ND_FLOW}" && h5flow -i "${larnd}" -o "${flow}" -c \
+      yamls/fsdcube_flow/workflows/charge/charge_event_building_mc.yaml \
+      yamls/fsdcube_flow/workflows/charge/charge_event_reconstruction_mc.yaml \
+      yamls/fsdcube_flow/workflows/combined/combined_reconstruction_mc.yaml \
+      yamls/fsdcube_flow/workflows/charge/prompt_calibration_mc.yaml \
+      yamls/fsdcube_flow/workflows/charge/filtered_calibration_mc.yaml ) || return 4
+
+  echo "DONE -> ${flow}"
+  echo "ANALYZE (FEE Q spectra vs predicted Bi-207 lines):"
+  echo "  python ${ND_SRC}/tests/bi207/check_bi207_fee.py ${flow} --outdir ${ND_WORK}/${tag}_fee"
+}
