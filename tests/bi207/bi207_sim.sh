@@ -92,6 +92,7 @@ bi207_fsd()
   local fsd="${ND_WORK}/${tag}_fsd.EDEPSIM.h5"
   local larnd="${ND_WORK}/${tag}_fsd.LARND.h5"
   local flow="${ND_WORK}/${tag}_fsd.FLOW.hdf5"
+  local pydeps="${ND_WORK}/pydeps"
   # ND_FLOW is a manual export (dune_sim.sh doesn't set it); default to the conventional clone
   # under $ND_WORK so a fresh login shell works without re-exporting it.
   local ndflow="${ND_FLOW:-${ND_WORK}/ndlar_flow}"
@@ -110,9 +111,16 @@ bi207_fsd()
 
   echo ">>> [3/3] ndlar_flow (container h5flow + cloned ${ndflow}/src) -> ${flow}"
   rm -f "${flow}"
-  # npcompat/sitecustomize.py restores numpy aliases the clone uses (np.bool, ...) but the
-  # container's newer numpy removed; it auto-imports because its dir is first on PYTHONPATH.
-  incont "cd '${ndflow}' && PYTHONPATH='${ND_SRC}/tests/bi207/npcompat':'${ndflow}/src':\${PYTHONPATH:-} h5flow -i '${larnd}' -o '${flow}' -c \
+  # The develop clone's raw_event_generator imports dbscan1d, which the container's venv lacks.
+  # Install it ONCE into a mounted dir with --no-deps (so it uses the container's numpy 1.x rather
+  # than dragging in a shadowing numpy 2.x that breaks the container's compiled h5py/scipy/sklearn).
+  if [ ! -d "${pydeps}/dbscan1d" ]; then
+    echo "    (installing dbscan1d into ${pydeps})"
+    incont "pip install --no-cache-dir --no-deps --target='${pydeps}' dbscan1d==0.2.3" || return 4
+  fi
+  # npcompat/sitecustomize.py restores numpy aliases the clone uses (np.bool, ...) that the
+  # container's newer numpy removed; it auto-imports because its dir is on PYTHONPATH.
+  incont "cd '${ndflow}' && PYTHONPATH='${pydeps}':'${ND_SRC}/tests/bi207/npcompat':'${ndflow}/src':\${PYTHONPATH:-} h5flow -i '${larnd}' -o '${flow}' -c \
       yamls/fsdcube_flow/workflows/charge/charge_event_building_mc.yaml \
       yamls/fsdcube_flow/workflows/charge/charge_event_reconstruction_mc.yaml \
       yamls/fsdcube_flow/workflows/combined/combined_reconstruction_mc.yaml \
