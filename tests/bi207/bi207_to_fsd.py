@@ -128,6 +128,21 @@ def main():
         seg2 = rfn.append_fields(seg2, "file_traj_id", ftid.astype(np.int32), usemask=False)
         print(f"added file_traj_id ({len(np.unique(ftid))} unique trajectories)")
 
+    # G4RadioactiveDecay samples each decay at a time drawn from Bi-207's ~31.6 yr half-life, so
+    # every segment time carries a ~1e15 us (tens-of-years) offset -- and in float32 at that
+    # magnitude all sub-second precision is already gone. simulate_pixels then rejects every segment
+    # as "highly-delayed" (t0 > MAX_SEGMENT_T0) -> "Empty input dataset, exiting". Each edep event
+    # is one prompt decay (cascade sub-ns vs us drift), so zero all segment time fields: the
+    # calibration model is one trigger per decay at t0 = 0.
+    SEG_T = ("t0", "t0_start", "t0_end", "t", "t_start", "t_end")
+    zeroed = [tf for tf in SEG_T if tf in seg2.dtype.names]
+    if zeroed:
+        t0_was = float(seg2["t0"].max()) if "t0" in seg2.dtype.names else float("nan")
+        for tf in zeroed:
+            seg2[tf] = 0
+        print(f"zeroed segment times {zeroed} (decay-time offset was up to {t0_was:.3e} us "
+              f"~ {t0_was/3.156e13:.1f} yr = Bi-207 half-life)")
+
     trj2 = None
     if trj is not None:
         trj2 = trj.copy()
@@ -136,6 +151,9 @@ def main():
                 v = np.asarray(trj2[f], float)
                 v[:, 0] += shift[0]; v[:, 1] += shift[1]; v[:, 2] += shift[2]
                 trj2[f] = v
+        for tf in ("t_start", "t_end", "t"):      # same decay-time offset on the trajectories
+            if tf in trj2.dtype.names:
+                trj2[tf] = 0
 
     # fraction that will survive inside the fsd_cube volume (what simulate_pixels will keep)
     inside = np.ones(seg2.size, bool)
