@@ -29,6 +29,7 @@ import os
 import sys
 
 import numpy as np
+from numpy.lib import recfunctions as rfn
 
 SEG_XYZ = ("x_start", "y_start", "z_start", "x_end", "y_end", "z_end", "x", "y", "z")
 TRJ_XYZ = ("xyz_start", "xyz_end")        # (N,3) subarray fields
@@ -111,6 +112,22 @@ def main():
     for f in SEG_XYZ:
         if f in seg2.dtype.names:
             seg2[f] = seg2[f] + shift[axis_of[f[0]]]    # f[0] is x/y/z -> drift/plane axis
+
+    # simulate_pixels reads tracks['file_traj_id'] (a file-global unique trajectory id). The
+    # /gps/ion -> dumpTree path emits only per-event 'traj_id', not 'file_traj_id', so synthesize
+    # one: a dense 0..K-1 id per unique (event_id, traj_id) pair, unique across the whole file.
+    if "file_traj_id" not in seg2.dtype.names:
+        if "traj_id" in seg2.dtype.names:
+            ev = (seg2["event_id"].astype(np.int64) if "event_id" in seg2.dtype.names
+                  else np.zeros(seg2.size, np.int64))
+            tj = seg2["traj_id"].astype(np.int64)
+            _, ftid = np.unique(np.stack([ev, tj], axis=1), axis=0, return_inverse=True)
+            ftid = np.ravel(ftid)                       # numpy>=2 may return a 2-D inverse
+        else:
+            ftid = np.arange(seg2.size)
+        seg2 = rfn.append_fields(seg2, "file_traj_id", ftid.astype(np.int32), usemask=False)
+        print(f"added file_traj_id ({len(np.unique(ftid))} unique trajectories)")
+
     trj2 = None
     if trj is not None:
         trj2 = trj.copy()
