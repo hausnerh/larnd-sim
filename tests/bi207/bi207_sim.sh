@@ -92,7 +92,10 @@ bi207_fsd()
   local fsd="${ND_WORK}/${tag}_fsd.EDEPSIM.h5"
   local larnd="${ND_WORK}/${tag}_fsd.LARND.h5"
   local flow="${ND_WORK}/${tag}_fsd.FLOW.hdf5"
-  : "${ND_FLOW:?set ND_FLOW to the ndlar_flow root INSIDE the container (the dir containing yamls/); see the comment above bi207_fsd for a one-liner to find it}"
+  # ND_FLOW is a manual export (dune_sim.sh doesn't set it); default to the conventional clone
+  # under $ND_WORK so a fresh login shell works without re-exporting it.
+  local ndflow="${ND_FLOW:-${ND_WORK}/ndlar_flow}"
+  [ -d "${ndflow}/yamls/fsdcube_flow" ] || { echo "no ndlar_flow with fsdcube_flow at ${ndflow}; set ND_FLOW or clone: git clone --depth 1 https://github.com/DUNE/ndlar_flow ${ND_WORK}/ndlar_flow"; return 1; }
   [ -f "${edep}" ] || { echo "missing ${edep} (run bi207_gen ${tag} first)"; return 1; }
 
   echo ">>> [1/3] translate onto the fsd_cube cathode (inset ${inset} cm) -> ${fsd}"
@@ -105,11 +108,11 @@ bi207_fsd()
     --input_filename="${fsd}" --output_filename="${larnd}" \
     --config=fsd_cube --rand_seed=1 || return 3
 
-  echo ">>> [3/3] ndlar_flow (container h5flow + cloned ${ND_FLOW}/src) -> ${flow}"
+  echo ">>> [3/3] ndlar_flow (container h5flow + cloned ${ndflow}/src) -> ${flow}"
   rm -f "${flow}"
   # npcompat/sitecustomize.py restores numpy aliases the clone uses (np.bool, ...) but the
   # container's newer numpy removed; it auto-imports because its dir is first on PYTHONPATH.
-  incont "cd '${ND_FLOW}' && PYTHONPATH='${ND_SRC}/tests/bi207/npcompat':'${ND_FLOW}/src':\${PYTHONPATH:-} h5flow -i '${larnd}' -o '${flow}' -c \
+  incont "cd '${ndflow}' && PYTHONPATH='${ND_SRC}/tests/bi207/npcompat':'${ndflow}/src':\${PYTHONPATH:-} h5flow -i '${larnd}' -o '${flow}' -c \
       yamls/fsdcube_flow/workflows/charge/charge_event_building_mc.yaml \
       yamls/fsdcube_flow/workflows/charge/charge_event_reconstruction_mc.yaml \
       yamls/fsdcube_flow/workflows/combined/combined_reconstruction_mc.yaml \
