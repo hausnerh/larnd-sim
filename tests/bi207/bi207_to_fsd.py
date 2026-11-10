@@ -29,7 +29,6 @@ import os
 import sys
 
 import numpy as np
-from numpy.lib import recfunctions as rfn
 
 SEG_XYZ = ("x_start", "y_start", "z_start", "x_end", "y_end", "z_end", "x", "y", "z")
 TRJ_XYZ = ("xyz_start", "xyz_end")        # (N,3) subarray fields
@@ -60,6 +59,31 @@ def fsd_cube_cathode_center(tpc):
                        0.5*(B[1, 0] + B[1, 1]),
                        B[2, 1]], float)            # z1 = cathode
     return center, 2, B
+
+
+def aligned_segments(seg, ftid):
+    """Rebuild the segments with a Numba/CUDA-aligned record dtype, appending int32 file_traj_id.
+
+    Two fixes the /gps/ion -> dumpTree path needs before the drift kernel will compile:
+    (1) the radioactive-decay dumpTree stores t0/t0_start/t0_end as float64 (to hold the ~1e16 us
+        decay time); downcast them to the canonical float32 -- lossless once zeroed, and f4 only
+        needs 4-byte alignment; (2) lay out the record with C alignment (np.dtype(..., align=True))
+        so every float64/uint64 field sits on its natural offset -- numba's CUDA backend rejects a
+        packed record ("float64 is not aligned").
+    """
+    fields = []
+    for n in seg.dtype.names:
+        base = seg.dtype.fields[n][0]
+        if n in ("t0", "t0_start", "t0_end") and base == np.float64:
+            base = np.dtype("f4")
+        fields.append((n, base))
+    if "file_traj_id" not in seg.dtype.names:
+        fields.append(("file_traj_id", np.dtype("i4")))
+    out = np.zeros(seg.shape, dtype=np.dtype(fields, align=True))
+    for n in seg.dtype.names:
+        out[n] = seg[n]
+    out["file_traj_id"] = np.asarray(ftid, dtype="i4")
+    return out
 
 
 def main():
@@ -113,27 +137,12 @@ def main():
         if f in seg2.dtype.names:
             seg2[f] = seg2[f] + shift[axis_of[f[0]]]    # f[0] is x/y/z -> drift/plane axis
 
-    # simulate_pixels reads tracks['file_traj_id'] (a file-global unique trajectory id). The
-    # /gps/ion -> dumpTree path emits only per-event 'traj_id', not 'file_traj_id', so synthesize
-    # one: a dense 0..K-1 id per unique (event_id, traj_id) pair, unique across the whole file.
-    if "file_traj_id" not in seg2.dtype.names:
-        if "traj_id" in seg2.dtype.names:
-            ev = (seg2["event_id"].astype(np.int64) if "event_id" in seg2.dtype.names
-                  else np.zeros(seg2.size, np.int64))
-            tj = seg2["traj_id"].astype(np.int64)
-            _, ftid = np.unique(np.stack([ev, tj], axis=1), axis=0, return_inverse=True)
-            ftid = np.ravel(ftid)                       # numpy>=2 may return a 2-D inverse
-        else:
-            ftid = np.arange(seg2.size)
-        seg2 = rfn.append_fields(seg2, "file_traj_id", ftid.astype(np.int32), usemask=False)
-        print(f"added file_traj_id ({len(np.unique(ftid))} unique trajectories)")
-
     # G4RadioactiveDecay samples each decay at a time drawn from Bi-207's ~31.6 yr half-life, so
-    # every segment time carries a ~1e15 us (tens-of-years) offset -- and in float32 at that
-    # magnitude all sub-second precision is already gone. simulate_pixels then rejects every segment
-    # as "highly-delayed" (t0 > MAX_SEGMENT_T0) -> "Empty input dataset, exiting". Each edep event
-    # is one prompt decay (cascade sub-ns vs us drift), so zero all segment time fields: the
-    # calibration model is one trigger per decay at t0 = 0.
+    # every segment time carries a ~1e16 us (hundreds-of-years) offset. simulate_pixels rejects such
+    # segments as "highly-delayed" (t0 > MAX_SEGMENT_T0) -> "Empty input dataset, exiting". Each edep
+    # event is one prompt decay (cascade sub-ns vs us drift), so zero all segment time fields: the
+    # calibration model is one trigger per decay at t0 = 0. ZERO BEFORE the f8->f4 downcast in
+    # aligned_segments, else the ~1e16 value would overflow float32 to inf.
     SEG_T = ("t0", "t0_start", "t0_end", "t", "t_start", "t_end")
     zeroed = [tf for tf in SEG_T if tf in seg2.dtype.names]
     if zeroed:
@@ -142,6 +151,24 @@ def main():
             seg2[tf] = 0
         print(f"zeroed segment times {zeroed} (decay-time offset was up to {t0_was:.3e} us "
               f"~ {t0_was/3.156e13:.1f} yr = Bi-207 half-life)")
+
+    # simulate_pixels reads tracks['file_traj_id'] (a file-global unique trajectory id). The
+    # /gps/ion -> dumpTree path emits only per-event 'traj_id', so synthesize one: a dense 0..K-1
+    # id per unique (event_id, traj_id) pair, unique across the whole file.
+    if "file_traj_id" in seg2.dtype.names:
+        ftid = seg2["file_traj_id"]
+    elif "traj_id" in seg2.dtype.names:
+        ev = (seg2["event_id"].astype(np.int64) if "event_id" in seg2.dtype.names
+              else np.zeros(seg2.size, np.int64))
+        tj = seg2["traj_id"].astype(np.int64)
+        _, ftid = np.unique(np.stack([ev, tj], axis=1), axis=0, return_inverse=True)
+        ftid = np.ravel(ftid)                           # numpy>=2 may return a 2-D inverse
+    else:
+        ftid = np.arange(seg2.size)
+
+    # rebuild with an aligned dtype (+ int32 file_traj_id, f4 time fields) so the CUDA kernels accept it
+    seg2 = aligned_segments(seg2, ftid)
+    print(f"segments: {len(np.unique(ftid))} unique trajectories; aligned dtype, f4 time fields")
 
     trj2 = None
     if trj is not None:
