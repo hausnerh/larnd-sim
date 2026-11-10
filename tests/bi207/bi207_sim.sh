@@ -133,16 +133,17 @@ bi207_fsd()
 }
 
 # Submit the whole pipeline (bi207_batch.sh) as a Perlmutter GPU batch job, so the long GPU +
-# ndlar_flow legs run unattended. Needs a GPU account: ND_ACCT (e.g. m1234_g) or SBATCH_ACCOUNT.
-# Forwards BI207_N / BI207_TAG / BI207_INSET and ND_QOS / ND_TIME into the job (--export=ALL).
-#     ND_ACCT=m1234_g bi207_submit                       # run the pipeline on existing edep
-#     BI207_N=5000 ND_ACCT=m1234_g bi207_submit          # also (re)generate 5000 decays first
-#     ND_QOS=debug ND_TIME=00:30:00 ND_ACCT=m1234_g bi207_submit   # quick smoke test
+# ndlar_flow legs run unattended. GPU account is picked up from ND_ACCT_GPU (your dune_sim.sh sets
+# it, e.g. dune_g); override with ND_ACCT or SBATCH_ACCOUNT. Forwards BI207_N / BI207_TAG /
+# BI207_INSET and ND_QOS / ND_TIME into the job (--export=ALL).
+#     bi207_submit                                       # run the pipeline on existing edep
+#     BI207_N=5000 bi207_submit                          # also (re)generate 5000 decays first
+#     ND_QOS=debug ND_TIME=00:30:00 bi207_submit         # quick smoke test
 # Watch: `squeue --me`.  Log + outputs land in $ND_WORK (bi207_<jobid>.out, ${tag}_fee/).
 bi207_submit()
 {
-  local acct="${ND_ACCT:-${SBATCH_ACCOUNT:-}}"
-  [ -n "${acct}" ] || { echo "set ND_ACCT=<nersc GPU account, e.g. m1234_g> (or SBATCH_ACCOUNT) first"; return 1; }
+  local acct="${ND_ACCT:-${ND_ACCT_GPU:-${SBATCH_ACCOUNT:-}}}"
+  [ -n "${acct}" ] || { echo "set ND_ACCT_GPU (e.g. dune_g) -- or ND_ACCT / SBATCH_ACCOUNT -- first"; return 1; }
   [ -f "${ND_SRC}/tests/bi207/bi207_batch.sh" ] || { echo "missing ${ND_SRC}/tests/bi207/bi207_batch.sh (git -C \$ND_SRC pull)"; return 1; }
   local args=(-A "${acct}" -o "${ND_WORK}/bi207_%j.out" --export=ALL)
   [ -n "${ND_QOS:-}" ]  && args+=(-q "${ND_QOS}")

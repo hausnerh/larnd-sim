@@ -6,10 +6,10 @@
 # simulate_pixels (FEE, GPU) -> ndlar_flow (h5flow, container) -> check_bi207_fee analysis.
 #
 # SUBMIT (after `source ~/dune_sim.sh` + `source $ND_SRC/tests/bi207/bi207_sim.sh`):
-#     ND_ACCT=<your nersc GPU account, e.g. m1234_g>  bi207_submit
-#     BI207_N=5000 ND_ACCT=m1234_g  bi207_submit        # also (re)generate 5000 decays first
+#     bi207_submit                                      # GPU account from ND_ACCT_GPU (e.g. dune_g)
+#     BI207_N=5000 bi207_submit                         # also (re)generate 5000 decays first
 # or submit by hand:
-#     sbatch -A <acct>_g -o $ND_WORK/bi207_%j.out $ND_SRC/tests/bi207/bi207_batch.sh
+#     sbatch -A $ND_ACCT_GPU -o $ND_WORK/bi207_%j.out $ND_SRC/tests/bi207/bi207_batch.sh
 # or just run it on an interactive GPU node (nd_node):
 #     bash $ND_SRC/tests/bi207/bi207_batch.sh
 # Watch it:  squeue --me        Log:  $ND_WORK/bi207_<jobid>.out
