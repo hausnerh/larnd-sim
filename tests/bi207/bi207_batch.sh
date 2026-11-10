@@ -18,6 +18,8 @@
 #   BI207_N     if >0 AND no <tag>.EDEPSIM.h5 exists yet, generate that many decays first
 #   BI207_TAG   file tag                     (default bi207)
 #   BI207_INSET source inset into LAr, cm    (default 0.5)
+#   BI207_REUSE =1 reuses an existing <tag>_fsd.LARND.h5 and SKIPS the ~45 min GPU sim (for
+#               re-running just ndlar_flow + analysis after fixing the flow leg)
 #   ND_SETUP    path to your dune_sim.sh     (default $HOME/dune_sim.sh)
 # Override SLURM at submit time: ND_QOS / ND_TIME (bi207_submit passes -q/-t), e.g.
 #   ND_QOS=debug ND_TIME=00:30:00 ND_ACCT=m1234_g bi207_submit   # quick smoke test
@@ -46,11 +48,18 @@ N="${BI207_N:-0}"
 cd "${ND_WORK}" || exit 1
 echo "### Bi-207 FSD-cube pipeline  tag=${TAG} inset=${INSET}  host=$(hostname)  $(date)"
 
-# ndlar_flow clone (needs yamls/fsdcube_flow; the container's bundled copy is too old) --------
+# ndlar_flow clone (needs yamls/fsdcube_flow; the container's bundled copy is too old). Keep it at
+# develop HEAD: the MC raw_event_generator fix (delay_extractor=None in sim mode) lives there, and a
+# stale shallow clone still has the old `self.delay_extractor.data` crash. develop IS the repo's
+# default branch, so a plain clone lands on it; we just refresh an existing one each run. -----------
 ndflow="${ND_FLOW:-${ND_WORK}/ndlar_flow}"
-if [ ! -d "${ndflow}/yamls/fsdcube_flow" ]; then
-  echo "### cloning ndlar_flow -> ${ndflow}"
+if [ ! -d "${ndflow}/.git" ]; then
+  echo "### cloning ndlar_flow (develop) -> ${ndflow}"
   git clone --depth 1 https://github.com/DUNE/ndlar_flow "${ndflow}" || exit 1
+else
+  echo "### refreshing ndlar_flow -> origin/develop"
+  git -C "${ndflow}" fetch --depth 1 origin develop && git -C "${ndflow}" reset --hard origin/develop \
+    || echo "### WARN: could not refresh ${ndflow}; using the existing checkout"
 fi
 export ND_FLOW="${ndflow}"
 

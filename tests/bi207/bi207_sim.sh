@@ -104,10 +104,14 @@ bi207_fsd()
   python "${ND_SRC}/tests/bi207/bi207_to_fsd.py" "${edep}" "${fsd}" --inset "${inset}" || return 2
 
   echo ">>> [2/3] simulate_pixels (FEE, conda+GPU) -> ${larnd}"
+  if [ -s "${larnd}" ] && [ "${BI207_REUSE:-0}" = "1" ]; then
+    echo "    (BI207_REUSE=1: reusing existing ${larnd}, skipping the ~45 min GPU sim)"
+  else
   rm -f "${larnd}"
   python "${ND_SRC}/cli/simulate_pixels.py" \
     --input_filename="${fsd}" --output_filename="${larnd}" \
     --config=fsd_cube --rand_seed=1 || return 3
+  fi
 
   echo ">>> [3/3] ndlar_flow (container h5flow + cloned ${ndflow}/src) -> ${flow}"
   rm -f "${flow}"
