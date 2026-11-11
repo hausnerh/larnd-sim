@@ -18,6 +18,11 @@
 #   EDEP='/pscratch/sd/m/mkramer/test/larnd-sim.segFFE3/output/skim_more/prc*_r*_patch_noDrop/*.hdf5' \
 #     NSLICE=250 sbatch --array=0-3 slurm/shower_grid_array.sh
 # Set RECENTER=0 to keep his in-frame positions (default recenters, as for own showers).
+# For the r4 data/MC-matching basis (single-hit-Q peak ~12 ke-), add FARFIELD=1 and point EDEP at his
+# prc*_r4 showers, e.g.:
+#   EDEP='/pscratch/sd/m/mkramer/test/larnd-sim.segFFE3/output/skim_more/prc2_r4_patch_noDrop/*.hdf5' \
+#     RECENTER=0 FARFIELD=1 OUTBASE=$ND_WORK/tistudy_datamc/grid_prc2 NSLICE=120 \
+#     sbatch --array=0-4 slurm/shower_grid_array.sh     # 5x120=600 showers (far-field is slower/event)
 # Then, after all tasks finish, merge:
 #   sbatch --dependency=afterok:<arrayJobID> slurm/merge_grids.sh    # or run merge_grids.sh args by hand
 #
@@ -69,6 +74,17 @@ case "$EDEP" in
 esac
 RECENTER="${RECENTER:-1}"
 [ "$RECENTER" = "0" ] && RECENTER_FLAG="" || RECENTER_FLAG="--recenter-showers"
+
+# FARFIELD=1 extends the basis with mkramer's vendored radius-4 + far-field induction (ff_r4), so the
+# single-hit-Q f_T shapes match his prc*_r4 sim (peak ~12 ke-) instead of the radius-12 near-field
+# spike at ~4.5 ke- that confounds the threshold-mixture fit. OFF by default -> near-field-only basis
+# stays byte-reproducible. Pair with EDEP=<his prc*_r4 showers> RECENTER=0.
+if [ "${FARFIELD:-0}" = "1" ]; then
+  FARFIELD_FLAGS="--farfield --farfield-properties ${FARFIELD_PROPERTIES:-larndsim/farfield_properties/ff_r4.yaml} --farfield-max-radius ${FARFIELD_MAX_RADIUS:-4}"
+else
+  FARFIELD_FLAGS=""
+fi
+
 k="$SLURM_ARRAY_TASK_ID"
 OFFSET=$(( k * NSLICE ))
 OUT="$OUTBASE/part_${k}"
@@ -81,7 +97,7 @@ echo "task $k: edep=$EDEP  recenter=$RECENTER  slice=[${OFFSET}:$(( OFFSET + NSL
 if python -u tests/threshold_induction_study.py --config fsd_cube --mult-grid \
      --edep-h5 "$EDEP" $RECENTER_FLAG --edep-offset "$OFFSET" --n-events "$NSLICE" \
      --seed $(( 12345 + k )) --outdir "$OUT" \
-     --thresholds $THRESHOLDS --resets $RESETS; then
+     --thresholds $THRESHOLDS --resets $RESETS $FARFIELD_FLAGS; then
   [ -s "$OUT/ti_mult_grid.npz" ] || { echo "!! PART $k: python exited 0 but no $OUT/ti_mult_grid.npz" >&2; exit 2; }
   echo "PART $k DONE -> $OUT/ti_mult_grid.npz"
 else
