@@ -70,38 +70,34 @@ def adc_linear(detector):
 
 
 def event_id_per_data_packet(h, data_mask):
-    """Best-effort per-packet event_id via mc_packets_assn -> truth segments. None if unavailable."""
+    """Per-packet truth decay id straight from mc_packets_assn['event_ids'].
+
+    larnd-sim writes mc_packets_assn (one compound row per packet, same length/order as 'packets')
+    with an 'event_ids' field of shape (1,): the generating event (decay) id of that packet. We read
+    it directly -- no join through the 'segments'/'tracks' table -- and mask to the data packets.
+    Returns an int64 array aligned to packets[data_mask], or None if the field is not present.
+    """
     try:
         if "mc_packets_assn" not in h:
+            print("  (no mc_packets_assn in the file -> per-decay grouping unavailable)")
             return None
-        assn = np.asarray(h["mc_packets_assn"][:])[data_mask]
-        # find the truth segments dataset carrying event_id, indexable by the assn track ids
-        segs = None
-        for key in ("tracks", "segments", "mc_truth/segments", "mc_truth/tracks"):
-            if key in h and "event_id" in getattr(h[key], "dtype", np.dtype([])).names:
-                segs = np.asarray(h[key]["event_id"][:])
-                break
-        if segs is None:
+        assn = h["mc_packets_assn"]
+        names = getattr(assn.dtype, "names", None) or ()
+        # This larnd-sim stores the per-packet decay id directly as 'event_ids'. Older/other builds
+        # may call it 'event_id'; accept either. If neither is present, say so (don't guess a join).
+        field = next((f for f in ("event_ids", "event_id") if f in names), None)
+        if field is None:
+            print(f"  (mc_packets_assn has no event-id field; fields={names} -> grouping unavailable)")
             return None
-        # assn carries contributing track indices; take the first non-negative per packet
-        if assn.dtype.names and "track_ids" in assn.dtype.names:
-            tids = np.asarray(assn["track_ids"])
-        else:
-            tids = np.asarray(assn)  # already an (N, k) int array
-        tids = np.atleast_2d(tids)
-        if tids.shape[0] != data_mask.sum():
-            tids = tids.reshape(data_mask.sum(), -1)
-        first = np.full(tids.shape[0], -1, dtype=np.int64)
-        for j in range(tids.shape[1]):
-            col = tids[:, j]
-            take = (first < 0) & (col >= 0)
-            first[take] = col[take]
-        ok = (first >= 0) & (first < segs.size)
-        ev = np.full(first.shape, -1, dtype=np.int64)
-        ev[ok] = segs[first[ok]]
-        return ev
+        ev = np.asarray(assn[field][:])                 # (Npackets, 1) or (Npackets,)
+        ev = ev.reshape(ev.shape[0], -1)[:, 0].astype(np.int64)
+        if ev.shape[0] != data_mask.shape[0]:
+            print(f"  (mc_packets_assn len {ev.shape[0]} != packets {data_mask.shape[0]} "
+                  f"-> grouping unavailable)")
+            return None
+        return ev[data_mask]
     except Exception as exc:
-        print(f"  (per-event grouping via mc_packets_assn unavailable: {exc!r})")
+        print(f"  (per-decay grouping via mc_packets_assn unavailable: {exc!r})")
         return None
 
 
