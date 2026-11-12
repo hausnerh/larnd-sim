@@ -1,31 +1,25 @@
 #!/usr/bin/env python3
 # =============================================================================
 # tests/bi207/check_bi207_larnd.py -- read the FEE output DIRECTLY from the larnd-sim LARND file and
-# look for the Bi-207 calibration lines, bypassing ndlar_flow.
+# look for the Bi-207 K-570 calibration line + pixel coverage, bypassing ndlar_flow.
 #
 # WHY: the LARND file IS the front-end-electronics response. Each LArPix-v3 DATA packet
 # (packet_type == detector.PACKET_TYPE == 1 for fsd_cube) carries a digitized ADC in 'dataword'.
 # larnd-sim's fee.digitize() maps collected charge Q[e-] -> ADC via, after the mV/e units cancel and
-# with V_CM handled:
-#     ADC = floor( (Q*GAIN + (V_PEDESTAL - V_CM)) * ADC_COUNTS/((V_REF - V_CM)*ADC_SCALE_FACTOR)
-#                  + ADC_OFFSET )
-# i.e. ADC = intercept + slope*Q, a line. We invert it (adding 0.5 for the floor midpoint) to recover
-# the per-pixel collected charge. For fsd_cube this is ADC ~= 289 + Q[ke-]. Constants come from the
-# loaded fsd_cube config -- nothing hard-coded.
+# with V_CM handled:  ADC = floor( intercept + slope*Q[e-] ), a line. We invert it (+0.5 for the floor
+# midpoint) to recover per-pixel collected charge. For fsd_cube ADC ~= 289 + Q[ke-]. Constants come
+# from the loaded fsd_cube config -- nothing hard-coded.
 #
-# This writes FOUR separate images (each its own file, so they can be used independently):
-#   bi207_perhit_q.png     per-PIXEL-HIT charge: one entry per data packet (every hit).
-#   bi207_perdecay_q.png   per-DECAY charge: summed across the pixels one decay (event_id) lit.
-#   bi207_multiplicity.png pixel-hits per decay (how often a decay spreads across >1 pixel).
-#   bi207_pixel_hitmap.png the pixel plane, colored by how many hits each pixel saw (coverage from
-#                          THIS source placement -- the map you need to decide per-pixel calibration).
-# plus bi207_larnd.txt (numbers). Charge histograms are binned on the native ADC grid (one bin per
-# ADC count) so there is no bin/quantization aliasing.
-#
-# The ndlar_flow fsdcube reco chain is what normally calibrates these packets into calib_prompt_hits,
-# but it chokes on this sparse, ~500 s-span single-source calibration MC (get_anchor_unix_ts hang;
-# builder OOM). Reading the ADC straight from the LARND answers "does the simulated hardware preserve
-# the Bi-207 peaks, and which pixels see them?" without that chain.
+# Writes (each its own file):
+#   bi207_perhit_q.png     per-PIXEL-HIT charge (one entry per data packet) + a Gaussian fit to K-570.
+#   bi207_perdecay_q.png   per-DECAY charge, summed across the pixels one decay lit + a K-570 fit.
+#   bi207_multiplicity.png pixel-hits per decay.
+#   bi207_pixel_hitmap.png the ANODE pixel plane (128 cols x 80 rows), LOG-colored by hits/pixel, i.e.
+#                          which pixels this source placement illuminates (drift is perpendicular to
+#                          this plane -- the pixel position comes from the hit's chip/channel, not from
+#                          any reco x/y/z). This is the map you need to decide per-pixel calibration.
+# plus bi207_larnd.txt. Charge histograms bin on the native ADC grid (one bin per ADC count) so there
+# is no bin/quantization aliasing.
 #
 # Usage (NERSC, larnd conda env; login node is fine -- tiny, CPU-only, no container/GPU):
 #   python tests/bi207/check_bi207_larnd.py $ND_WORK/bi207_fsd.LARND.h5 --outdir $ND_WORK/bi207_larnd
@@ -36,17 +30,30 @@ import sys
 
 import numpy as np
 
-# predicted COLLECTED charge of the Bi-207 handles at fsd_cube (0.25 kV/cm, tau 1100 us, ~full drift
-# from a cathode source), from check_bi207_fee.py's Box-recombination + attenuation model [ke-]. These
-# are BARE conversion-electron energies pushed through W_ion -> Box recombination -> drift attenuation;
-# they exclude the coincident Pb K X-ray (~88 keV), which is why the observed K-570 peak sits a little
-# ABOVE its 8 ke- guide. Treat them as ~0.5 ke- guides, not exact.
-PRED_LINES = [
-    (8.0,  "K-570 (482 keV)"),
-    (16.0, "K-1064 (976 keV)"),
-    (17.5, "L-1064 (1048 keV)"),
-    (29.0, "full cascade (1.72 MeV)"),
-]
+# larnd-sim Box-recombination + drift-attenuation model (physics.py constants), so we can turn a
+# deposited energy into the collected charge the FEE should see, consistently for any line.
+BOX_ALPHA = 0.93
+BOX_BETA = 0.207
+W_ION = 23.6e-6      # MeV per ionization electron
+LAR_RHO = 1.38       # g/cm^3
+E_FIELD = 0.25       # kV/cm (FSDCube half-nominal)
+DEDX = 2.5           # MeV/cm, representative for these ~0.5-1 MeV electrons
+DRIFT_ATTEN = 0.667  # exp(-t_drift/tau) for ~full drift (47.75 cm, tau 1100 us) from a cathode source
+
+# Bi-207 K-570 handle. The nuclear transition is 569.7 keV; its K-shell internal-conversion electron
+# carries KE = 569.7 - 88(Pb K binding) = 481.7 keV. If the Pb K X-ray (~88 keV) is reabsorbed locally
+# (it usually is, over ~mm in LAr) the pixel sees the FULL 569.7 keV; if it escapes, only 481.7 keV.
+K570_E_BARE = 0.4817   # MeV, conversion electron alone
+K570_E_FULL = 0.5697   # MeV, electron + locally-absorbed Pb K X-ray (the full transition)
+
+
+def edep_to_ke(e_mev):
+    """Deposited energy [MeV] -> collected charge [ke-] via larnd-sim's Box recombination + drift
+    attenuation (the same model that sets the reference lines). csi, recomb per physics.box_model."""
+    csi = BOX_BETA * DEDX / (E_FIELD * LAR_RHO)
+    recomb = np.log(BOX_ALPHA + csi) / csi
+    n_e = recomb * e_mev / W_ION
+    return n_e * DRIFT_ATTEN / 1.0e3
 
 
 def open_ro(path):
@@ -82,9 +89,9 @@ def adc_linear(detector):
 
 
 def adc_aligned_edges(qlo_ke, qhi_ke, slope, intercept, nadc=1):
-    """Histogram bin edges aligned to the ADC grid: each bin spans exactly `nadc` ADC counts, so a
-    single-hit charge (which is quantized to one ADC count, value at count+0.5) sits bin-centered and
-    there is NO aliasing beat between bin width and the ~1 ke-/count quantization. Edges in ke-."""
+    """Bin edges aligned to the ADC grid: each bin spans exactly `nadc` ADC counts, so a single-hit
+    charge (quantized to one ADC count) sits bin-centered and there is NO aliasing beat with the
+    ~1 ke-/count quantization. Edges in ke-."""
     s = slope * 1.0e3                      # ADC counts per ke-
     a_lo = int(np.floor(intercept + s * qlo_ke))
     a_hi = int(np.ceil(intercept + s * qhi_ke))
@@ -92,12 +99,62 @@ def adc_aligned_edges(qlo_ke, qhi_ke, slope, intercept, nadc=1):
         a_hi = a_lo + 1
     step = max(1, int(nadc))
     a = np.arange(a_lo, a_hi + step, step)
-    return (a - intercept) / s             # ADC count -> ke- (lower edge of that count's cell)
+    return (a - intercept) / s
+
+
+def fit_gaussian_peak(values, edges, win_lo, win_hi):
+    """Fit a Gaussian to the peak inside [win_lo, win_hi], using only the bins where the peak rises
+    ABOVE its own half-maximum (the FWHM region), with Poisson (sqrt N) errors. Returns a dict with
+    mu, dmu (uncertainty on the mean), sigma, fwhm, amplitude, and the fit window -- or None."""
+    try:
+        from scipy.optimize import curve_fit
+    except Exception as exc:
+        print(f"  (scipy unavailable: {exc!r} -> skipping the Gaussian fit)")
+        return None
+    counts, _ = np.histogram(values, bins=edges)
+    centers = 0.5 * (edges[:-1] + edges[1:])
+    inwin = (centers >= win_lo) & (centers <= win_hi)
+    if inwin.sum() < 4:
+        return None
+    cc = counts[inwin].astype(float)
+    xx = centers[inwin]
+    ipk = int(np.argmax(cc))
+    a0, x0 = cc[ipk], xx[ipk]
+    half = a0 / 2.0
+    above = cc >= half
+    lo = ipk
+    while lo > 0 and above[lo - 1]:
+        lo -= 1
+    hi = ipk
+    while hi < len(cc) - 1 and above[hi + 1]:
+        hi += 1
+    # widen by one bin each side if the FWHM core is too thin to constrain 3 parameters
+    lo = max(0, lo - (1 if hi - lo < 3 else 0))
+    hi = min(len(cc) - 1, hi + (1 if hi - lo < 3 else 0))
+    xf, yf = xx[lo:hi + 1], cc[lo:hi + 1]
+    if xf.size < 4:
+        return None
+    fwhm0 = max(xf[-1] - xf[0], edges[1] - edges[0])
+    yerr = np.sqrt(np.maximum(yf, 1.0))
+
+    def gauss(x, amp, mu, sig):
+        return amp * np.exp(-0.5 * ((x - mu) / sig) ** 2)
+
+    try:
+        popt, pcov = curve_fit(gauss, xf, yf, p0=[a0, x0, fwhm0 / 2.355],
+                               sigma=yerr, absolute_sigma=True, maxfev=20000)
+    except Exception as exc:
+        print(f"  (Gaussian fit did not converge: {exc!r})")
+        return None
+    amp, mu, sig = popt
+    dmu = float(np.sqrt(abs(pcov[1][1])))
+    return dict(amp=float(amp), mu=float(mu), dmu=dmu, sigma=float(abs(sig)),
+                fwhm=float(2.3548 * abs(sig)), win=(float(xf[0]), float(xf[-1])))
 
 
 def event_id_per_data_packet(h, data_mask):
-    """Per-packet truth decay id straight from mc_packets_assn['event_ids'] (one (1,)i8 per packet,
-    same length/order as 'packets'). Returns int64 aligned to packets[data_mask], or None."""
+    """Per-packet truth decay id straight from mc_packets_assn['event_ids']. Returns int64 aligned to
+    packets[data_mask], or None."""
     try:
         if "mc_packets_assn" not in h:
             print("  (no mc_packets_assn in the file -> per-decay grouping unavailable)")
@@ -111,8 +168,7 @@ def event_id_per_data_packet(h, data_mask):
         ev = np.asarray(assn[field][:])
         ev = ev.reshape(ev.shape[0], -1)[:, 0].astype(np.int64)
         if ev.shape[0] != data_mask.shape[0]:
-            print(f"  (mc_packets_assn len {ev.shape[0]} != packets {data_mask.shape[0]} "
-                  f"-> grouping unavailable)")
+            print(f"  (mc_packets_assn len {ev.shape[0]} != packets {data_mask.shape[0]})")
             return None
         return ev[data_mask]
     except Exception as exc:
@@ -121,13 +177,13 @@ def event_id_per_data_packet(h, data_mask):
 
 
 def load_pixel_index_map(pixel_layout_path):
-    """Return (kmap, nx, ny, pitch_cm): kmap[chip*1000+channel] = (ix, iy) pixel indices on the plane.
+    """Return (kmap, nx, ny, pitch_cm): kmap[chip*1000+channel] = (col, row) anode-plane pixel indices.
     fsd_cube is a single tile, so (chip, channel) alone locate the pixel. None on any failure."""
     try:
         import yaml
         with open(pixel_layout_path) as f:
             lay = yaml.load(f, Loader=yaml.FullLoader)
-        ccp = lay["chip_channel_to_position"]            # {chip*1000+channel: [ix, iy]}
+        ccp = lay["chip_channel_to_position"]            # {chip*1000+channel: [col, row]}
         kmap = {int(k): (int(v[0]), int(v[1])) for k, v in ccp.items()}
         pos = np.array(list(kmap.values()), dtype=np.int64)
         nx = int(pos[:, 0].max()) + 1
@@ -139,9 +195,8 @@ def load_pixel_index_map(pixel_layout_path):
         return None
 
 
-def pixel_indices(h, data_mask, kmap):
-    """Map each data packet to (ix, iy) via (chip_id, channel_id). Returns (ix, iy) int64 arrays with
-    -1 where the packet has no field or an unmapped chip/channel. None if the fields are absent."""
+def packet_chip_channel(h, data_mask):
+    """(chip, channel) int64 arrays for the data packets, or None if the fields are absent."""
     p = np.asarray(h["packets"][:])
     names = p.dtype.names or ()
     chip_f = next((f for f in ("chip_id", "chipid", "chip") if f in names), None)
@@ -149,33 +204,18 @@ def pixel_indices(h, data_mask, kmap):
     if chip_f is None or chan_f is None:
         print(f"  (packets lack chip/channel fields; have {names} -> skipping the hit heatmap)")
         return None
-    chip = p[chip_f][data_mask].astype(np.int64)
-    chan = p[chan_f][data_mask].astype(np.int64)
-    key = chip * 1000 + chan
-    ix = np.full(key.size, -1, dtype=np.int64)
-    iy = np.full(key.size, -1, dtype=np.int64)
-    for i, k in enumerate(key):                           # N ~ 1500, a plain loop is plenty
-        pos = kmap.get(int(k))
-        if pos is not None:
-            ix[i], iy[i] = pos
-    return ix, iy
-
-
-def _draw_lines(ax, qmax):
-    for q, lab in PRED_LINES:
-        if q <= qmax:
-            ax.axvline(q, color="crimson", ls="--", lw=1)
-            ax.text(q, ax.get_ylim()[1] * 0.97, lab, rotation=90, va="top", ha="right",
-                    fontsize=7, color="crimson")
+    return (p[chip_f][data_mask].astype(np.int64), p[chan_f][data_mask].astype(np.int64))
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Decode the larnd-sim FEE (LARND) output to charge and "
-                                             "look for the Bi-207 lines + pixel coverage, no ndlar_flow.")
+    ap = argparse.ArgumentParser(description="Decode the larnd-sim FEE (LARND) output to charge, fit "
+                                             "the Bi-207 K-570 line, and map pixel coverage. No ndlar_flow.")
     ap.add_argument("larnd", help="larnd-sim output .h5 (…_fsd.LARND.h5)")
     ap.add_argument("--outdir", default="bi207_larnd", help="output directory for the pngs + txt")
-    ap.add_argument("--qmax", type=float, default=45.0, help="charge-axis max [ke-]")
+    ap.add_argument("--qmax", type=float, default=30.0, help="charge-axis max [ke-]")
     ap.add_argument("--nadc", type=int, default=1, help="ADC counts per charge-histogram bin (>=1)")
+    ap.add_argument("--fit-lo", type=float, default=4.0, help="low edge of the K-570 fit search window [ke-]")
+    ap.add_argument("--fit-hi", type=float, default=14.0, help="high edge of the K-570 fit search window [ke-]")
     args = ap.parse_args()
     os.makedirs(args.outdir, exist_ok=True)
 
@@ -183,6 +223,11 @@ def main():
     slope, intercept, data_type = adc_linear(detector)
     print(f"fsd_cube FEE: ADC = {intercept:.3f} + {slope*1e3:.4f} * Q[ke-]   "
           f"(pedestal ADC {intercept:.1f}; ~{1.0/(slope*1e3):.2f} ke- per ADC count; data packet_type={data_type})")
+
+    q_bare = edep_to_ke(K570_E_BARE)       # 481.7 keV conversion electron alone
+    q_full = edep_to_ke(K570_E_FULL)       # + locally-absorbed Pb K X-ray (full 569.7 keV transition)
+    print(f"K-570 predicted collected charge: {q_bare:.2f} ke- (bare 482 keV e-), "
+          f"{q_full:.2f} ke- (570 keV, +Pb K X-ray)")
 
     kmap_info = load_pixel_index_map(pixel_layout_path)
 
@@ -197,15 +242,11 @@ def main():
         if ndata == 0:
             sys.exit("no data packets -- nothing to decode")
         adc = p["dataword"][dmask].astype(np.float64)
-        # unclipped inverse (keep the exact ADC grid; sub-pedestal hits show slightly < 0 ke- rather
-        # than piling artificially at 0). floor-midpoint +0.5 centers each ADC count's value.
-        q_ke = (adc + 0.5 - intercept) / (slope * 1.0e3)
+        q_ke = (adc + 0.5 - intercept) / (slope * 1.0e3)   # unclipped; sub-pedestal shows slightly <0
         ev = event_id_per_data_packet(h, dmask)
-        pix = pixel_indices(h, dmask, kmap_info[0]) if kmap_info is not None else None
+        chch = packet_chip_channel(h, dmask) if kmap_info is not None else None
 
-    n_subped = int((q_ke < 0).sum())
-
-    # ---- per-decay sum + multiplicity (truth grouping, if available) ----
+    # ---- per-decay sum + multiplicity ----
     per_evt_q = per_evt_n = None
     if ev is not None and (ev >= 0).any():
         good = ev >= 0
@@ -216,42 +257,62 @@ def main():
         print(f"grouped {int(good.sum())} hits into {uev.size} decays "
               f"(median {np.median(per_evt_n):.0f} hits/decay, max {per_evt_n.max()})")
 
-    # ---- plots (one file each) ----
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
+    from matplotlib.colors import LogNorm
 
-    def save_hist(values, edges, title, xlabel, ylabel, color, fname, lines=True):
-        fig, ax = plt.subplots(figsize=(6.6, 4.8))
+    def draw_k570(ax):
+        ax.axvline(q_bare, color="darkorange", ls="--", lw=1.2)
+        ax.text(q_bare, ax.get_ylim()[1] * 0.98, "K-570: 482 keV e-", rotation=90,
+                va="top", ha="right", fontsize=8, color="darkorange")
+        ax.axvline(q_full, color="crimson", ls="--", lw=1.2)
+        ax.text(q_full, ax.get_ylim()[1] * 0.98, "K-570: 570 keV (+Pb X-ray)", rotation=90,
+                va="top", ha="right", fontsize=8, color="crimson")
+
+    def spectrum(values, title, xlabel, ylabel, color, fname):
+        edges = adc_aligned_edges(min(0.0, values.min()), args.qmax, slope, intercept, args.nadc)
+        fit = fit_gaussian_peak(values, edges, args.fit_lo, args.fit_hi)
+        fig, ax = plt.subplots(figsize=(6.8, 4.9))
         ax.hist(values, bins=edges, histtype="stepfilled", color=color, alpha=0.9, edgecolor=color)
+        ax.set_xlim(min(0.0, float(edges[0])), args.qmax)
         ax.set_title(title)
         ax.set_xlabel(xlabel)
         ax.set_ylabel(ylabel)
-        ax.set_xlim(min(0.0, float(edges[0])), args.qmax)
-        if lines:
-            _draw_lines(ax, args.qmax)
+        draw_k570(ax)
+        if fit is not None:
+            xs = np.linspace(fit["win"][0] - fit["sigma"], fit["win"][1] + fit["sigma"], 200)
+            ax.plot(xs, fit["amp"] * np.exp(-0.5 * ((xs - fit["mu"]) / fit["sigma"]) ** 2),
+                    color="black", lw=2)
+            ax.axvspan(fit["win"][0], fit["win"][1], color="gold", alpha=0.15)
+            dev_full = (fit["mu"] - q_full) / fit["dmu"] if fit["dmu"] > 0 else float("nan")
+            dev_bare = (fit["mu"] - q_bare) / fit["dmu"] if fit["dmu"] > 0 else float("nan")
+            ax.text(0.97, 0.78,
+                    f"K-570 Gaussian fit (FWHM region)\n"
+                    f"mu = {fit['mu']:.2f} +/- {fit['dmu']:.2f} ke-\n"
+                    f"sigma = {fit['sigma']:.2f} ke-  (FWHM {fit['fwhm']:.2f})\n"
+                    f"vs 570 keV ({q_full:.2f}): {dev_full:+.1f} sigma\n"
+                    f"vs 482 keV ({q_bare:.2f}): {dev_bare:+.1f} sigma",
+                    transform=ax.transAxes, ha="right", va="top", fontsize=8,
+                    bbox=dict(boxstyle="round", fc="white", ec="0.6", alpha=0.9))
         fig.tight_layout()
         out = os.path.join(args.outdir, fname)
         fig.savefig(out, dpi=140)
         plt.close(fig)
         print(f"wrote {out}")
+        return fit
 
-    # per-pixel-hit charge (every data packet)
-    edges_hit = adc_aligned_edges(min(0.0, q_ke.min()), args.qmax, slope, intercept, args.nadc)
-    save_hist(q_ke, edges_hit,
-              f"Per-pixel-hit collected charge   (N={ndata} hits)",
-              "Q per pixel-hit [ke-]", f"hits / {args.nadc} ADC count",
-              "#4477aa", "bi207_perhit_q.png")
+    fit_hit = spectrum(q_ke, f"Per-pixel-hit collected charge   (N={ndata} hits)",
+                       "Q per pixel-hit [ke-]", f"hits / {args.nadc} ADC count",
+                       "#4477aa", "bi207_perhit_q.png")
 
-    # per-decay summed charge (sum across the decay's pixels)
+    fit_dec = None
     if per_evt_q is not None:
-        edges_dec = adc_aligned_edges(min(0.0, per_evt_q.min()), args.qmax, slope, intercept, args.nadc)
-        save_hist(per_evt_q, edges_dec,
-                  f"Per-decay charge, summed across its pixels   (N={per_evt_q.size} decays)",
-                  "sum Q over the decay's pixel-hits [ke-]", f"decays / {args.nadc} ADC count",
-                  "#228833", "bi207_perdecay_q.png")
+        fit_dec = spectrum(per_evt_q,
+                           f"Per-decay charge, summed across its pixels   (N={per_evt_q.size} decays)",
+                           "sum Q over the decay's pixel-hits [ke-]", f"decays / {args.nadc} ADC count",
+                           "#228833", "bi207_perdecay_q.png")
 
-        # hit multiplicity per decay
         fig, ax = plt.subplots(figsize=(6.6, 4.8))
         mx = int(max(1, per_evt_n.max()))
         ax.hist(per_evt_n, bins=np.arange(0.5, mx + 1.5), histtype="stepfilled",
@@ -266,35 +327,67 @@ def main():
         plt.close(fig)
         print(f"wrote {out}")
 
-    # pixel-plane hit heatmap
+    # ---- pixel-plane hit heatmap (LOG color so one hot pixel can't hide the rest) ----
     n_pix_hit = frac_plane = None
-    if pix is not None and kmap_info is not None:
-        _, nx, ny, pitch = kmap_info
-        ix, iy = pix
-        valid = (ix >= 0) & (iy >= 0)
+    if chch is not None and kmap_info is not None:
+        kmap, nx, ny, pitch = kmap_info
+        chip, chan = chch
+        key = chip * 1000 + chan
+        col = np.full(key.size, -1, dtype=np.int64)
+        row = np.full(key.size, -1, dtype=np.int64)
+        for i, k in enumerate(key):
+            pos = kmap.get(int(k))
+            if pos is not None:
+                col[i], row[i] = pos
+        valid = (col >= 0) & (row >= 0)
         H = np.zeros((nx, ny), dtype=np.int64)
-        np.add.at(H, (ix[valid], iy[valid]), 1)
+        np.add.at(H, (col[valid], row[valid]), 1)
         n_pix_hit = int((H > 0).sum())
         frac_plane = n_pix_hit / float(nx * ny)
-        fig, ax = plt.subplots(figsize=(7.4, 5.0))
-        # imshow with x = pixel-plane x, y = pixel-plane y; H is [ix, iy] so transpose for (row=y,col=x)
-        im = ax.imshow(H.T, origin="lower", aspect="equal",
-                       extent=[0, nx * pitch, 0, ny * pitch], cmap="viridis")
-        ax.set_title(f"Pixel-plane hit coverage   ({n_pix_hit}/{nx*ny} pixels hit, {100*frac_plane:.1f}%)")
-        ax.set_xlabel("pixel-plane x [cm]")
-        ax.set_ylabel("pixel-plane y [cm]")
+        hit_counts = H[H > 0]
+
+        # diagnostics: where the hits actually land, and the hottest pixels (chip/channel identity)
+        if valid.any():
+            cc_cent = float(np.average(col[valid]))
+            rr_cent = float(np.average(row[valid]))
+        else:
+            cc_cent = rr_cent = float("nan")
+        order = np.argsort(H, axis=None)[::-1]
+        print(f"pixel coverage: {n_pix_hit}/{nx*ny} pixels hit ({100*frac_plane:.1f}%); "
+              f"hits/hit-pixel median {np.median(hit_counts):.0f}, max {int(hit_counts.max())}")
+        print(f"hit centroid (col,row) = ({cc_cent:.1f}, {rr_cent:.1f})  [plane center is "
+              f"({(nx-1)/2:.0f}, {(ny-1)/2:.0f}); a centered cathode source should land near center]")
+        print("hottest pixels (col,row,hits):")
+        inv_key = {v: k for k, v in kmap.items()}       # (col,row) -> chip*1000+channel
+        for idx in order[:8]:
+            c, r = np.unravel_index(idx, H.shape)
+            if H[c, r] == 0:
+                break
+            kk = inv_key.get((int(c), int(r)))
+            cid, ch = (kk // 1000, kk % 1000) if kk is not None else (-1, -1)
+            print(f"    ({int(c):3d},{int(r):3d})  hits={int(H[c,r]):4d}  chip={cid} channel={ch}")
+
+        fig, ax = plt.subplots(figsize=(7.6, 5.2))
+        im = ax.imshow(H.T, origin="lower", aspect="equal", extent=[0, nx, 0, ny],
+                       cmap="viridis", norm=LogNorm(vmin=1, vmax=max(2, int(hit_counts.max()))))
+        ax.set_title(f"Anode pixel-plane hit coverage   ({n_pix_hit}/{nx*ny} pixels, {100*frac_plane:.1f}%)\n"
+                     f"pixel from hit chip/channel; drift is perpendicular (into page); pitch {pitch*10:.2f} mm",
+                     fontsize=10)
+        ax.set_xlabel(f"anode pixel column  (0-{nx-1})")
+        ax.set_ylabel(f"anode pixel row  (0-{ny-1})")
         cb = fig.colorbar(im, ax=ax)
-        cb.set_label("hits on the pixel")
-        # mark the plane center (where a centered cathode source projects)
-        ax.plot(nx * pitch / 2, ny * pitch / 2, marker="+", ms=12, mew=1.5, color="crimson")
+        cb.set_label("hits on the pixel (log)")
+        ax.plot((nx - 1) / 2 + 0.5, (ny - 1) / 2 + 0.5, marker="+", ms=14, mew=1.8, color="crimson",
+                label="plane center (centered-source projection)")
+        if np.isfinite(cc_cent):
+            ax.plot(cc_cent + 0.5, rr_cent + 0.5, marker="x", ms=11, mew=1.8, color="white",
+                    label="hit centroid")
+        ax.legend(loc="upper left", fontsize=7, framealpha=0.8)
         fig.tight_layout()
         out = os.path.join(args.outdir, "bi207_pixel_hitmap.png")
         fig.savefig(out, dpi=140)
         plt.close(fig)
         print(f"wrote {out}")
-        hit_counts = H[H > 0]
-        print(f"pixel coverage: {n_pix_hit}/{nx*ny} pixels hit ({100*frac_plane:.1f}%); "
-              f"hits/hit-pixel median {np.median(hit_counts):.0f}, max {int(hit_counts.max())}")
 
     # ---- text summary ----
     txt = os.path.join(args.outdir, "bi207_larnd.txt")
@@ -303,26 +396,28 @@ def main():
         f.write(f"input: {args.larnd}\n")
         f.write(f"ADC = {intercept:.4f} + {slope:.6e} * Q[e-]   (data packet_type {data_type}; "
                 f"{args.nadc} ADC count/bin)\n")
-        f.write(f"data packets (hits): {ndata}   (sub-pedestal, Q<0: {n_subped})\n")
+        f.write(f"K-570 predicted collected charge: {q_bare:.2f} ke- (bare 482 keV e-), "
+                f"{q_full:.2f} ke- (570 keV, +Pb K X-ray)\n")
+        f.write(f"data packets (hits): {ndata}\n")
         f.write(f"per-hit Q[ke-]: min {q_ke.min():.2f}  median {np.median(q_ke):.2f}  "
                 f"max {q_ke.max():.2f}  mean {q_ke.mean():.2f}\n")
-        for lo, hi, lab in [(6, 10, "K-570 ~8"), (14, 19, "K/L-1064 ~16-18"), (26, 32, "cascade ~29")]:
-            n = int(((q_ke >= lo) & (q_ke < hi)).sum())
-            f.write(f"  hits in [{lo},{hi}) ke- ({lab}): {n}\n")
+        if fit_hit is not None:
+            f.write(f"per-hit K-570 Gaussian fit (FWHM region {fit_hit['win'][0]:.1f}-{fit_hit['win'][1]:.1f} ke-): "
+                    f"mu = {fit_hit['mu']:.3f} +/- {fit_hit['dmu']:.3f} ke-, sigma {fit_hit['sigma']:.3f} "
+                    f"(FWHM {fit_hit['fwhm']:.2f})\n")
         if per_evt_q is not None:
             f.write(f"\nper-decay summed Q[ke-]: median {np.median(per_evt_q):.2f}  max {per_evt_q.max():.2f}\n")
             f.write(f"hit multiplicity/decay: median {np.median(per_evt_n):.0f}  max {int(per_evt_n.max())}  "
                     f"frac single-pixel {np.mean(per_evt_n == 1):.2f}\n")
-            for lo, hi, lab in [(6, 10, "K-570 ~8"), (14, 19, "K/L-1064 ~16-18"), (26, 32, "cascade ~29")]:
-                n = int(((per_evt_q >= lo) & (per_evt_q < hi)).sum())
-                f.write(f"  decays with sum Q in [{lo},{hi}) ke- ({lab}): {n}\n")
+            if fit_dec is not None:
+                f.write(f"per-decay K-570 Gaussian fit: mu = {fit_dec['mu']:.3f} +/- {fit_dec['dmu']:.3f} ke-, "
+                        f"sigma {fit_dec['sigma']:.3f} (FWHM {fit_dec['fwhm']:.2f})\n")
         if n_pix_hit is not None:
             f.write(f"\npixel-plane coverage (this source placement): {n_pix_hit} pixels hit "
-                    f"({100*frac_plane:.1f}% of the plane)\n")
+                    f"({100*frac_plane:.1f}% of the {nx}x{ny} plane)\n")
+            f.write(f"hit centroid (col,row): ({cc_cent:.1f}, {rr_cent:.1f}); plane center "
+                    f"({(nx-1)/2:.0f}, {(ny-1)/2:.0f})\n")
     print(f"wrote {txt}")
-    print("\nFour images written: per-hit Q, per-decay Q, multiplicity, pixel hitmap. The hitmap shows\n"
-          "which pixels this source placement illuminates -- i.e. how many could be calibrated per-pixel\n"
-          "from one position, and where you'd need to move/raster the source to cover the rest.")
 
 
 if __name__ == "__main__":
