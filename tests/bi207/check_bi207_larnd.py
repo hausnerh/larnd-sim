@@ -367,22 +367,30 @@ def main():
             cid, ch = (kk // 1000, kk % 1000) if kk is not None else (-1, -1)
             print(f"    ({int(c):3d},{int(r):3d})  hits={int(H[c,r]):4d}  chip={cid} channel={ch}")
 
-        fig, ax = plt.subplots(figsize=(7.6, 5.2))
-        im = ax.imshow(H.T, origin="lower", aspect="equal", extent=[0, nx, 0, ny],
+        # Draw it as the thesis Fig 4.3 anode (Y-Z) plane: Y [cm] (119-148.8, the 80-pixel 'row'
+        # axis) on the VERTICAL, Z [cm] (0-47.6, the 128-pixel 'col' axis) on the HORIZONTAL, in
+        # physical cm from the fsd_cube TPC_BORDERS. Drift (X) is perpendicular to this plane.
+        B = np.asarray(detector.TPC_BORDERS)[0]
+        z0, z1 = sorted((float(B[0][0]), float(B[0][1])))     # col -> larnd-x == thesis Z (horizontal)
+        y0, y1 = sorted((float(B[1][0]), float(B[1][1])))     # row -> larnd-y == thesis Y (vertical)
+        px = (z1 - z0) / nx
+        py = (y1 - y0) / ny
+        z_cen, y_cen = z0 + (cc_cent + 0.5) * px, y0 + (rr_cent + 0.5) * py
+        fig, ax = plt.subplots(figsize=(5.6, 6.8))
+        im = ax.imshow(H.T, origin="lower", aspect="auto", extent=[z0, z1, y0, y1],
                        cmap="viridis", norm=LogNorm(vmin=1, vmax=max(2, int(hit_counts.max()))))
-        ax.set_title(f"Anode pixel-plane hit coverage   ({n_pix_hit}/{nx*ny} pixels, {100*frac_plane:.1f}%)\n"
-                     f"pixel from hit chip/channel; drift is perpendicular (into page); pitch {pitch*10:.2f} mm",
-                     fontsize=10)
-        ax.set_xlabel(f"anode pixel column  (0-{nx-1})")
-        ax.set_ylabel(f"anode pixel row  (0-{ny-1})")
+        ax.set_title(f"Anode (Y-Z) pixel-plane hit coverage\n"
+                     f"{n_pix_hit}/{nx*ny} pixels hit ({100*frac_plane:.1f}%); drift (X) is perpendicular; "
+                     f"pitch {pitch*10:.2f} mm", fontsize=10)
+        ax.set_xlabel("Z (cm)   [128 pixels]")
+        ax.set_ylabel("Y (cm)   [80 pixels]")
         cb = fig.colorbar(im, ax=ax)
         cb.set_label("hits on the pixel (log)")
-        ax.plot((nx - 1) / 2 + 0.5, (ny - 1) / 2 + 0.5, marker="+", ms=14, mew=1.8, color="crimson",
+        ax.plot((z0 + z1) / 2, (y0 + y1) / 2, marker="+", ms=15, mew=1.8, color="crimson",
                 label="plane center (centered-source projection)")
         if np.isfinite(cc_cent):
-            ax.plot(cc_cent + 0.5, rr_cent + 0.5, marker="x", ms=11, mew=1.8, color="white",
-                    label="hit centroid")
-        ax.legend(loc="upper left", fontsize=7, framealpha=0.8)
+            ax.plot(z_cen, y_cen, marker="x", ms=11, mew=1.8, color="white", label="hit centroid")
+        ax.legend(loc="upper left", fontsize=7, framealpha=0.85)
         fig.tight_layout()
         out = os.path.join(args.outdir, "bi207_pixel_hitmap.png")
         fig.savefig(out, dpi=140)
