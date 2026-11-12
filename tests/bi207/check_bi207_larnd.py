@@ -14,10 +14,14 @@
 #   bi207_perhit_q.png     per-PIXEL-HIT charge (one entry per data packet) + a Gaussian fit to K-570.
 #   bi207_perdecay_q.png   per-DECAY charge, summed across the pixels one decay lit + a K-570 fit.
 #   bi207_multiplicity.png pixel-hits per decay.
-#   bi207_pixel_hitmap.png the ANODE pixel plane (128 cols x 80 rows), LOG-colored by hits/pixel, i.e.
-#                          which pixels this source placement illuminates (drift is perpendicular to
-#                          this plane -- the pixel position comes from the hit's chip/channel, not from
-#                          any reco x/y/z). This is the map you need to decide per-pixel calibration.
+#   bi207_pixel_hitmap.png the ANODE (Y-Z) pixel plane (128 Z x 80 Y), LOG-colored by hits/pixel, i.e.
+#                          which pixels this source placement illuminates (drift X is perpendicular).
+#                          Each packet's pixel is found through larnd-sim's OWN pipeline -- the sim's
+#                          mc_packets_assn gives the packet's segment, pixels_from_track indexing +
+#                          pixel2id give its pixel, and detsim.get_pixel_coordinates gives the center --
+#                          NOT by inverting chip/channel (a standalone PIXEL_CONNECTION_DICT load does
+#                          not reproduce simulate_pixels' chip map for this config). The map you need to
+#                          decide per-pixel calibration.
 # plus bi207_larnd.txt. Charge histograms bin on the native ADC grid (one bin per ADC count) so there
 # is no bin/quantization aliasing.
 #
@@ -176,60 +180,57 @@ def event_id_per_data_packet(h, data_mask):
         return None
 
 
-def build_pixel_map(detector):
-    """Authoritative (chip, channel) -> PHYSICAL pixel map, mirroring fee.py's forward assignment
-    EXACTLY so the hitmap position matches what simulate_pixels wrote.
-
-    fee.py (line ~248) sets each packet's (chip_id, channel_id) =
-        PIXEL_CONNECTION_DICT[ rotate_tile((pix_x % NPT[0], pix_y % NPT[1]), tile_id) ],
-    with tile_id = TILE_MAP[anode][pix_x//NPT[0]][pix_y//NPT[1]] and rotate_tile flipping pix_x/pix_y
-    by the tile orientation. So the raw chip_channel_to_position index is the POST-rotate_tile value --
-    inverting it naively misplaces hits (a centered source landed at col 125 instead of 64). We invert
-    correctly by iterating every physical pixel, computing its (chip, channel) the same way, and keying
-    on that. Physical x = TPC_BORDERS[plane][0][0] + pix_x*pitch (pixels_from_track: pix_x = pitches
-    from the border). Returns (ccmap, nx, ny, pitch, (x0,x1), (y0,y1)) or None.
+def hit_pixel_ids(h, data_mask, detector):
+    """Pixel each data packet fired, found through larnd-sim's OWN pipeline (not by inverting
+    chip/channel, which a standalone load does not reproduce for this config):
+      packet --mc_packets_assn--> its leading segment --pixels_from_track indexing--> (i_x,i_y)
+             --pixels_from_track.pixel2id--> pixel_id.
+    We then read the pixel CENTER from detsim.get_pixel_coordinates (done by the caller). Reusing the
+    sim's own functions guarantees the hitmap matches what simulate_pixels wrote. Returns int64 pixel
+    ids aligned to packets[data_mask] (-1 where unresolved), plus (nx, ny, plane_of_hit) -- or None.
     """
     try:
-        from larndsim.fee import rotate_tile
-        nx, ny = int(detector.N_PIXELS[0]), int(detector.N_PIXELS[1])
-        npt0, npt1 = int(detector.N_PIXELS_PER_TILE[0]), int(detector.N_PIXELS_PER_TILE[1])
-        pcd = detector.PIXEL_CONNECTION_DICT
-        tmap = detector.TILE_MAP
-        B = np.asarray(detector.TPC_BORDERS)[0]
-        x0, x1 = float(min(B[0])), float(max(B[0]))      # larnd-x (anode horizontal == thesis Z)
-        y0, y1 = float(min(B[1])), float(max(B[1]))      # larnd-y (anode vertical  == thesis Y)
-        pitch = float(detector.PIXEL_PITCH)
-        ccmap = {}
-        for px in range(nx):
-            tx = px // npt0
-            for py in range(ny):
-                ty = py // npt1
-                try:
-                    tile_id = tmap[0][tx][ty]            # single anode plane -> index 0
-                    cc = pcd.get(tuple(rotate_tile((px % npt0, py % npt1), tile_id)))
-                except Exception:
-                    cc = None
-                if cc is not None:
-                    ccmap[(int(cc[0]), int(cc[1]))] = (px, py)
-        if not ccmap:
-            print("  (built an empty chip/channel->pixel map -> skipping heatmap)")
+        from larndsim.pixels_from_track import pixel2id
+        if "mc_packets_assn" not in h or "segments" not in h:
+            print("  (no mc_packets_assn/segments in the LARND -> cannot build the hitmap)")
             return None
-        return ccmap, nx, ny, pitch, (x0, x1), (y0, y1)
+        assn = np.asarray(h["mc_packets_assn"][:])[data_mask]
+        if "segment_ids" not in (assn.dtype.names or ()):
+            print(f"  (mc_packets_assn has no segment_ids; fields={assn.dtype.names})")
+            return None
+        sid = np.asarray(assn["segment_ids"]).reshape(assn.shape[0], -1)[:, 0].astype(np.int64)
+        seg = h["segments"]
+        sn = seg.dtype.names or ()
+
+        def col(ax):
+            if ax in sn:
+                return np.asarray(seg[ax][:], float)
+            if f"{ax}_start" in sn and f"{ax}_end" in sn:
+                return 0.5 * (np.asarray(seg[f"{ax}_start"][:], float) + np.asarray(seg[f"{ax}_end"][:], float))
+            return None
+        sx, sy = col("x"), col("y")
+        if sx is None or sy is None:
+            print(f"  (segments lack x/y; fields={sn} -> cannot build the hitmap)")
+            return None
+        splane = (np.asarray(seg["pixel_plane"][:]).astype(int) if "pixel_plane" in sn
+                  else np.zeros(sx.shape, int))
+        pitch = float(detector.PIXEL_PITCH)
+        borders = np.asarray(detector.TPC_BORDERS)
+        pid = np.full(sid.shape, -1, dtype=np.int64)
+        ok = (sid >= 0) & (sid < sx.size)
+        for i in np.nonzero(ok)[0]:
+            s = int(sid[i])
+            pl = int(splane[s])
+            b = borders[pl]
+            # pixels_from_track.py:125-126 -- the pixel index is pitches from the TPC border
+            i_x = int((sx[s] - b[0][0]) // pitch)
+            i_y = int((sy[s] - b[1][0]) // pitch)
+            pid[i] = pixel2id(i_x, i_y, pl)
+        nx, ny = int(detector.N_PIXELS[0]), int(detector.N_PIXELS[1])
+        return pid, nx, ny
     except Exception as exc:
-        print(f"  (authoritative pixel map unavailable: {exc!r} -> skipping the hit heatmap)")
+        print(f"  (hit-pixel mapping unavailable: {exc!r} -> skipping the hit heatmap)")
         return None
-
-
-def packet_chip_channel(h, data_mask):
-    """(chip, channel) int64 arrays for the data packets, or None if the fields are absent."""
-    p = np.asarray(h["packets"][:])
-    names = p.dtype.names or ()
-    chip_f = next((f for f in ("chip_id", "chipid", "chip") if f in names), None)
-    chan_f = next((f for f in ("channel_id", "channelid", "channel") if f in names), None)
-    if chip_f is None or chan_f is None:
-        print(f"  (packets lack chip/channel fields; have {names} -> skipping the hit heatmap)")
-        return None
-    return (p[chip_f][data_mask].astype(np.int64), p[chan_f][data_mask].astype(np.int64))
 
 
 def main():
@@ -254,8 +255,6 @@ def main():
     print(f"K-570 predicted collected charge: {q_bare:.2f} ke- (bare 482 keV e-), "
           f"{q_full:.2f} ke- (570 keV, +Pb K X-ray)")
 
-    pmap = build_pixel_map(detector)
-
     with open_ro(args.larnd) as h:
         if "packets" not in h:
             sys.exit("no 'packets' dataset in the LARND file")
@@ -269,7 +268,7 @@ def main():
         adc = p["dataword"][dmask].astype(np.float64)
         q_ke = (adc + 0.5 - intercept) / (slope * 1.0e3)   # unclipped; sub-pedestal shows slightly <0
         ev = event_id_per_data_packet(h, dmask)
-        chch = packet_chip_channel(h, dmask) if pmap is not None else None
+        pixinfo = hit_pixel_ids(h, dmask, detector)
 
     # ---- per-decay sum + multiplicity ----
     per_evt_q = per_evt_n = None
@@ -352,52 +351,53 @@ def main():
         plt.close(fig)
         print(f"wrote {out}")
 
-    # ---- pixel-plane hit heatmap (authoritative physical pixel; LOG color) ----
+    # ---- pixel-plane hit heatmap: pixel from larnd-sim's own pixelization (hit_pixel_ids), pixel
+    #      center from detsim.get_pixel_coordinates, index from pixels_from_track.id2pixel; LOG color ----
     n_pix_hit = frac_plane = None
-    cc_cent = rr_cent = float("nan")
-    if chch is not None and pmap is not None:
-        ccmap, nx, ny, pitch, (x0, x1), (y0, y1) = pmap   # nx=larnd-x(Z,128), ny=larnd-y(Y,80)
-        chip, chan = chch
-        pcol = np.full(chip.size, -1, dtype=np.int64)     # physical pix_x (larnd-x / thesis Z)
-        prow = np.full(chip.size, -1, dtype=np.int64)     # physical pix_y (larnd-y / thesis Y)
-        for i in range(chip.size):
-            pos = ccmap.get((int(chip[i]), int(chan[i])))
-            if pos is not None:
-                pcol[i], prow[i] = pos
-        valid = (pcol >= 0) & (prow >= 0)
+    z_cen = y_cen = float("nan")
+    if pixinfo is not None:
+        from larndsim.pixels_from_track import id2pixel, pixel2id
+        from larndsim.detsim import get_pixel_coordinates
+        pid, nx, ny = pixinfo                              # nx=larnd-x(Z,128), ny=larnd-y(Y,80)
+        B = np.asarray(detector.TPC_BORDERS)[0]
+        x0, x1 = sorted((float(B[0][0]), float(B[0][1])))  # larnd-x = thesis Z (anode horizontal)
+        y0, y1 = sorted((float(B[1][0]), float(B[1][1])))  # larnd-y = thesis Y (anode vertical)
+        pitch = float(detector.PIXEL_PITCH)
+        ix = np.full(pid.shape, -1, dtype=np.int64)
+        iy = np.full(pid.shape, -1, dtype=np.int64)
+        zx = np.full(pid.shape, np.nan)                    # pixel-center Z [cm] via get_pixel_coordinates
+        zy = np.full(pid.shape, np.nan)                    # pixel-center Y [cm]
+        for i in np.nonzero(pid >= 0)[0]:
+            a, b, _pl = id2pixel(int(pid[i]))
+            ix[i], iy[i] = int(a), int(b)
+            cx, cy = get_pixel_coordinates(int(pid[i]))
+            zx[i], zy[i] = float(cx), float(cy)
+        valid = (ix >= 0) & (ix < nx) & (iy >= 0) & (iy < ny)
         H = np.zeros((nx, ny), dtype=np.int64)
-        np.add.at(H, (pcol[valid], prow[valid]), 1)
+        np.add.at(H, (ix[valid], iy[valid]), 1)
         n_pix_hit = int((H > 0).sum())
         frac_plane = n_pix_hit / float(nx * ny)
-        hit_counts = H[H > 0]
-
-        px, py = (x1 - x0) / nx, (y1 - y0) / ny
-        def cm(c, r):                                     # pixel index -> physical (Z,Y) cm
-            return x0 + (c + 0.5) * px, y0 + (r + 0.5) * py
+        hit_counts = H[H > 0] if (H > 0).any() else np.array([0])
+        zc, yc = (x0 + x1) / 2, (y0 + y1) / 2              # anode center = centered-source projection
         if valid.any():
-            cc_cent, rr_cent = float(np.average(pcol[valid])), float(np.average(prow[valid]))
-        z_cen, y_cen = cm(cc_cent, rr_cent)
-        zc, yc = (x0 + x1) / 2, (y0 + y1) / 2             # anode-plane center = centered-source projection
+            z_cen, y_cen = float(np.median(zx[valid])), float(np.median(zy[valid]))
         order = np.argsort(H, axis=None)[::-1]
-        inv = {v: k for k, v in ccmap.items()}            # (pix_x,pix_y) -> (chip,channel)
         print(f"pixel coverage: {n_pix_hit}/{nx*ny} pixels hit ({100*frac_plane:.1f}%); "
-              f"hits/hit-pixel median {np.median(hit_counts):.0f}, max {int(hit_counts.max())}")
-        print(f"hit centroid: pix ({cc_cent:.1f},{rr_cent:.1f}) = Z {z_cen:.1f} cm, Y {y_cen:.1f} cm  "
+              f"hits/hit-pixel median {np.median(hit_counts):.0f}, max {int(hit_counts.max())}  "
+              f"({int(valid.sum())}/{pid.size} hits localized)")
+        print(f"hit centroid (pixel centers): Z {z_cen:.1f} cm, Y {y_cen:.1f} cm  "
               f"[anode center Z {zc:.1f}, Y {yc:.1f}; a centered cathode source lands here]")
-        print("hottest pixels (pix_x,pix_y -> Z,Y cm; hits; chip/channel):")
+        print("hottest pixels (Z,Y cm from get_pixel_coordinates; hits):")
         for idx in order[:8]:
             c, r = np.unravel_index(idx, H.shape)
             if H[c, r] == 0:
                 break
-            zz, yy = cm(int(c), int(r))
-            cc = inv.get((int(c), int(r)))
-            cid, ch = (cc[0], cc[1]) if cc is not None else (-1, -1)
-            print(f"    ({int(c):3d},{int(r):3d}) -> Z {zz:5.1f}, Y {yy:6.1f}  hits={int(H[c,r]):4d}  "
-                  f"chip={cid} channel={ch}")
+            zz, yy = get_pixel_coordinates(pixel2id(int(c), int(r), 0))
+            print(f"    Z {zz:5.1f}, Y {yy:6.1f}  hits={int(H[c, r]):4d}")
 
         # thesis Fig 4.3 anode (Y-Z) plane: Y [cm] (119-148.8, larnd-y, 80 px) VERTICAL, Z [cm]
-        # (0-47.6, larnd-x, 128 px) HORIZONTAL; drift (X) perpendicular. Physical pixel from the
-        # authoritative chip/channel map, so a centered source lands at the center.
+        # (0-47.6, larnd-x, 128 px) HORIZONTAL; drift (X) perpendicular. Pixel from the sim's own
+        # pixelization pipeline, so a centered source lands at the center.
         fig, ax = plt.subplots(figsize=(5.6, 6.8))
         im = ax.imshow(H.T, origin="lower", aspect="auto", extent=[x0, x1, y0, y1],
                        cmap="viridis", norm=LogNorm(vmin=1, vmax=max(2, int(hit_counts.max()))))
@@ -410,7 +410,7 @@ def main():
         cb.set_label("hits on the pixel (log)")
         ax.plot(zc, yc, marker="+", ms=15, mew=1.8, color="crimson",
                 label="anode center (centered-source projection)")
-        if np.isfinite(cc_cent):
+        if np.isfinite(z_cen):
             ax.plot(z_cen, y_cen, marker="x", ms=11, mew=1.8, color="white", label="hit centroid")
         ax.legend(loc="upper left", fontsize=7, framealpha=0.85)
         fig.tight_layout()
