@@ -419,6 +419,56 @@ def main():
         plt.close(fig)
         print(f"wrote {out}")
 
+        # ---- per-LINE hitmaps: which pixels see each Bi-207 charge line (for cross-checking gains) ----
+        # Charge lines (ke-), via the same box+drift model as the reference lines:
+        #   570 complex  = K-570 conversion e- (482 keV -> 8.06 ke-) + full 570 keV absorption (9.53)
+        #   1064 complex = K-1064 conversion e- (976 keV -> 16.3 ke-) + full 1064 keV absorption (17.8)
+        # A pixel that shows BOTH gives two known charge points -> a per-pixel gain/linearity cross-check.
+        # q_ke, iY, iZ and `valid` are all aligned per data-hit, so a Q-window selects that line's hits.
+        from matplotlib.colors import BoundaryNorm
+        lines = [("570", "K-570 e- + 570 full", 6.0, 11.0),
+                 ("1064", "K-1064 e- + 1064 full", 14.0, 20.0)]
+        nseen = np.zeros((nx, ny), dtype=np.int64)
+        print("per-line pixel coverage (cross-check lines):")
+        for tag, name, lo, hi in lines:
+            m = valid & (q_ke >= lo) & (q_ke <= hi)
+            Hl = np.zeros((nx, ny), dtype=np.int64)
+            np.add.at(Hl, (iY[m], iZ[m]), 1)
+            nseen += (Hl > 0).astype(np.int64)
+            nlit, nhit = int((Hl > 0).sum()), int(Hl.sum())
+            print(f"    {name} ({lo:.0f}-{hi:.0f} ke-): {nhit} hits on {nlit} pixels")
+            if nhit == 0:
+                continue
+            fig, ax = plt.subplots(figsize=(4.8, 7.2))
+            im = ax.imshow(Hl, origin="lower", aspect="equal", extent=[Z0, Z1, Y0, Y1],
+                           cmap="magma", norm=LogNorm(vmin=1, vmax=max(2, int(Hl.max()))))
+            ax.set_title(f"Bi-207 {name}\n{lo:.0f}-{hi:.0f} ke-: {nhit} hits on {nlit} pixels", fontsize=9)
+            ax.set_xlabel(f"Z (cm)  [{ny} px, short, horizontal]")
+            ax.set_ylabel(f"Y (cm)  [{nx} px, long, vertical]")
+            fig.colorbar(im, ax=ax).set_label("hits on the pixel (log)")
+            ax.plot(Zctr, Yctr, marker="+", ms=14, mew=1.6, color="cyan")
+            fig.tight_layout()
+            o = os.path.join(args.outdir, f"bi207_line_{tag}.png")
+            fig.savefig(o, dpi=140)
+            plt.close(fig)
+            print(f"wrote {o}")
+        # cross-check map: how many of the lines each pixel sees (>=2 -> a per-pixel gain cross-check)
+        both = int((nseen >= 2).sum())
+        print(f"    pixels seeing >=2 lines (cross-checkable): {both}")
+        fig, ax = plt.subplots(figsize=(4.8, 7.2))
+        cmap = plt.get_cmap("viridis", len(lines) + 1)
+        im = ax.imshow(nseen, origin="lower", aspect="equal", extent=[Z0, Z1, Y0, Y1],
+                       cmap=cmap, norm=BoundaryNorm(np.arange(-0.5, len(lines) + 1.5), cmap.N))
+        ax.set_title(f"Bi-207 charge lines seen per pixel\n{both} pixels see >=2 (gain cross-check)", fontsize=9)
+        ax.set_xlabel(f"Z (cm)  [{ny} px, short, horizontal]")
+        ax.set_ylabel(f"Y (cm)  [{nx} px, long, vertical]")
+        fig.colorbar(im, ax=ax, ticks=range(len(lines) + 1)).set_label("number of Bi-207 charge lines seen")
+        fig.tight_layout()
+        out = os.path.join(args.outdir, "bi207_lines_seen.png")
+        fig.savefig(out, dpi=140)
+        plt.close(fig)
+        print(f"wrote {out}")
+
     # ---- text summary ----
     txt = os.path.join(args.outdir, "bi207_larnd.txt")
     with open(txt, "w") as f:
