@@ -570,6 +570,10 @@ def main():
             if origin is not None and origin[0].shape == valid.shape:
                 pdg0, E0, atid = origin
                 iY0, iZ0 = (Yctr - Y0) / pitch, (Zctr - Z0) / pitch   # source pixel in index space
+                # EDEPSIM trajectory E_start is TOTAL energy (KE + rest mass); the line catalogue is
+                # KINETIC, so subtract the e-/e+ rest mass (0.511 MeV) before matching. Gammas (massless)
+                # are unchanged. Without this every electron line is mis-mapped by 0.511 MeV.
+                Ek = np.where(np.abs(pdg0) == 11, E0 - 0.511, E0)
                 e_lines = [(lab, E) for lab, E, k, _ in BI207_LINES if k == "e"]
                 g_lines = [(lab, E) for lab, E, k, _ in BI207_LINES if k in ("g", "x")]
 
@@ -684,30 +688,51 @@ def main():
                 o = os.path.join(args.outdir, "bi207_line_570_truth.png")
                 fig.savefig(o, dpi=140); plt.close(fig); print(f"wrote {o}")
 
-                # ---- multiplicity: does a line split across pixels, so the peak is in the PARTICLE-
-                #      summed Q rather than a single hit? Group each line's hits by their emitting primary
-                #      (event_id, ancestor traj_id) and sum Q across that one particle's pixels. If
-                #      hits/particle>1 and summed Q lands on the line while 1-pixel Q falls short, the line
-                #      is charge-shared and must be clustered before fitting the gain.
+                # ---- multiplicity (ALWAYS within ONE pixel -- the definition the threshold fits use):
+                #      one charge deposit on a pixel can fire several PACKETS as the FEE crosses threshold
+                #      and resets. multiplicity = number of packets ON THAT PIXEL; the pixel's TRUE charge is
+                #      their SUM, and that single-pixel sum is the input to a per-pixel gain/threshold fit.
+                #      (Charge landing on NEIGHBOURING pixels is a separate effect -- NOT multiplicity.)
                 if ev is not None:
-                    pk = ev.astype(np.int64) * 1000000 + atid        # unique key per emitted primary
-                    base = valid & (atid >= 0) & (ev >= 0)
-                    print("per-line multiplicity (one emitted particle's pixels, and its Q single vs summed):")
-                    print(f"  {'line':12s} {'parts':>6s} {'hits/part':>9s} {'multi%':>6s} "
-                          f"{'1pix Q':>7s} {'summedQ':>8s}   line")
+                    good2 = valid & (ev >= 0)
+                    pixid = (iY * ny + iZ).astype(np.int64)
+                    cell = ev.astype(np.int64) * 10000000 + pixid       # one pixel in one decay = one deposit
+                    uc, cinv = np.unique(cell[good2], return_inverse=True)
+                    mult = np.bincount(cinv)                            # packets on that pixel = MULTIPLICITY
+                    cell_q = np.zeros(uc.size); np.add.at(cell_q, cinv, q_ke[good2])   # single-pixel summed Q
+                    rep = np.full(uc.size, -1, np.int64)               # a representative hit per pixel-deposit
+                    rep[cinv] = np.nonzero(good2)[0]
+                    cell_line = line[rep]
+                    print(f"within-pixel multiplicity: {int((mult > 1).sum())}/{uc.size} lit pixels fired >1 "
+                          f"packet (max {int(mult.max())}); the per-pixel SUM is the charge the threshold fit uses.")
+                    print(f"  {'line':12s} {'pixels':>6s} {'mult>1%':>7s} {'<mult>':>6s} {'1pktQ':>6s} {'sumQ':>6s}  line")
                     for lab, E, k, _ in BI207_LINES:
-                        s = base & (line == lab)
-                        if int(s.sum()) == 0:
+                        m = cell_line == lab
+                        n = int(m.sum())
+                        if n == 0:
                             continue
-                        keys, invp = np.unique(pk[s], return_inverse=True)
-                        nper = np.bincount(invp)
-                        sq = np.zeros(keys.size); np.add.at(sq, invp, q_ke[s])
-                        one = nper == 1
-                        q1 = float(np.mean(sq[one])) if one.any() else float("nan")
-                        print(f"  {lab:12s} {keys.size:6d} {nper.mean():9.2f} {100*np.mean(nper > 1):6.0f} "
-                              f"{q1:7.2f} {np.mean(sq):8.2f}   {edep_to_ke(E):.1f} ke-")
-                    print("  -> hits/part ~1 and 1pix Q ~ summedQ  => the line sits in single hits (no clustering"
-                          " needed); hits/part>1 with summedQ > 1pix Q => charge-shared, cluster before fitting.")
+                        one = m & (mult == 1)
+                        q1 = float(np.mean(cell_q[one])) if one.any() else float("nan")
+                        print(f"  {lab:12s} {n:6d} {100*np.mean(mult[m] > 1):7.0f} {np.mean(mult[m]):6.2f} "
+                              f"{q1:6.2f} {np.mean(cell_q[m]):6.2f}  {edep_to_ke(E):.1f}")
+                    print("  -> <mult> ~1 and 1pktQ ~ sumQ => one packet per pixel (fit the hit directly);"
+                          " <mult>>1 => sum each pixel's packets before the threshold fit.")
+                    # spectrum: per-packet (single hit) Q vs per-pixel summed Q -- how multiplicity moves the lines
+                    edges = adc_aligned_edges(0.0, args.qmax, slope, intercept, args.nadc)
+                    fig, ax = plt.subplots(figsize=(7.2, 4.8))
+                    ax.hist(q_ke[good2], bins=edges, histtype="step", color="#888888", lw=1.4,
+                            label="per packet (single hit)")
+                    ax.hist(cell_q, bins=edges, histtype="step", color="#cc3311", lw=1.9,
+                            label="per pixel (its packets summed)")
+                    for lab, E, k, _ in BI207_LINES:
+                        ax.axvline(edep_to_ke(E), color="0.6", ls=":", lw=0.7)
+                    ax.set_xlim(0, args.qmax)
+                    ax.set_title("Per-packet vs per-pixel-summed charge (within-pixel multiplicity -> threshold-fit input)", fontsize=9)
+                    ax.set_xlabel("Q [ke-]"); ax.set_ylabel(f"entries / {args.nadc} ADC count")
+                    ax.legend(loc="upper right", fontsize=8)
+                    fig.tight_layout()
+                    o = os.path.join(args.outdir, "bi207_perpixel_sum.png")
+                    fig.savefig(o, dpi=140); plt.close(fig); print(f"wrote {o}")
             elif origin is None:
                 print("  (truth line census skipped: origin unavailable -- check --edep has 'trajectories')")
 
