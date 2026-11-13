@@ -49,6 +49,12 @@ DRIFT_ATTEN = 0.667  # exp(-t_drift/tau) for ~full drift (47.75 cm, tau 1100 us)
 # (it usually is, over ~mm in LAr) the pixel sees the FULL 569.7 keV; if it escapes, only 481.7 keV.
 K570_E_BARE = 0.4817   # MeV, conversion electron alone
 K570_E_FULL = 0.5697   # MeV, electron + locally-absorbed Pb K X-ray (the full transition)
+# 1064 complex. The 976 keV K-conversion electron is the MORE intense CE line (~7%/decay vs ~1.5%
+# for 482 keV: the 1063.7 keV M4 transition has a large internal-conversion coefficient). The 1064
+# full-energy gamma peak (17.8 ke-) is weak because 1 MeV gammas Compton-scatter far more than they
+# photo-absorb -- so the clean second line is the 976 keV CE at 16.3 ke-, not the 1064 gamma peak.
+K1064_E_BARE = 0.9757  # MeV, 976 keV conversion electron alone
+K1064_E_FULL = 1.0637  # MeV, full 1063.7 keV transition absorbed
 
 
 def edep_to_ke(e_mev):
@@ -251,6 +257,8 @@ def main():
 
     q_bare = edep_to_ke(K570_E_BARE)       # 481.7 keV conversion electron alone
     q_full = edep_to_ke(K570_E_FULL)       # + locally-absorbed Pb K X-ray (full 569.7 keV transition)
+    q_bare2 = edep_to_ke(K1064_E_BARE)     # 976 keV conversion electron (the clean second line)
+    q_full2 = edep_to_ke(K1064_E_FULL)     # full 1063.7 keV transition
     print(f"K-570 predicted collected charge: {q_bare:.2f} ke- (bare 482 keV e-), "
           f"{q_full:.2f} ke- (570 keV, +Pb K X-ray)")
 
@@ -468,6 +476,57 @@ def main():
         fig.savefig(out, dpi=140)
         plt.close(fig)
         print(f"wrote {out}")
+
+        # ---- near-source vs far charge spectrum: can we SEE the 1064 lines? ----
+        # The conversion electrons (482 & 976 keV) range out in <1 pixel, so they pile onto the
+        # source pixel; the 570/1064 gammas Compton-scatter across the whole plane. Cutting on
+        # radius from the source projection therefore ENRICHES the monoenergetic CE lines relative
+        # to the gamma continuum -- the best chance to resolve the 976 keV CE (16.3 ke-) as a clean
+        # SECOND calibration line. Far-field hits are the gamma Compton floor for contrast.
+        dsrc = np.hypot(cY - Yctr, cZ - Zctr)
+        near = valid & (dsrc < 1.0)                    # within ~2-3 pixels of the source
+        far = valid & (dsrc > 4.0)                     # pure gamma halo
+        if int(near.sum()) > 0:
+            edges = adc_aligned_edges(0.0, 22.0, slope, intercept, args.nadc)
+            qn, qf = q_ke[near], q_ke[far]
+            fit1064 = fit_gaussian_peak(qn, edges, 13.5, 19.0)
+            n1064 = int(((qn >= 14.0) & (qn <= 19.0)).sum())
+            print(f"near-source spectrum ({int(near.sum())} hits, d<1cm) vs far halo "
+                  f"({int(far.sum())} hits, d>4cm):")
+            print(f"    976 keV CE expected at {q_bare2:.1f} ke-, 1064 full at {q_full2:.1f} ke-; "
+                  f"{n1064} near hits in 14-19 ke-")
+            if fit1064 is not None:
+                dev = (fit1064["mu"] - q_bare2) / fit1064["dmu"] if fit1064["dmu"] > 0 else float("nan")
+                print(f"    1064-region Gaussian: mu {fit1064['mu']:.1f} +/- {fit1064['dmu']:.1f} ke-, "
+                      f"sigma {fit1064['sigma']:.1f} ({(fit1064['mu']-q_bare2):+.1f} ke- vs 976 CE, {dev:+.1f} sigma)")
+            else:
+                print("    1064-region fit did not converge (too few hits -> needs the larger sample)")
+            fig, ax = plt.subplots(figsize=(7.0, 4.9))
+            ax.hist(qn, bins=edges, histtype="stepfilled", color="#aa3377", alpha=0.85,
+                    edgecolor="#aa3377", label=f"near source (d<1 cm, N={int(near.sum())})")
+            if int(far.sum()) > 0:                     # scale the far halo to the near-source area for shape
+                wf = np.full(qf.shape, near.sum() / max(far.sum(), 1))
+                ax.hist(qf, bins=edges, weights=wf, histtype="step", color="#888888", lw=1.6,
+                        label=f"far halo (d>4 cm, scaled, N={int(far.sum())})")
+            for qx, lbl, col in [(q_bare, "482 CE", "darkorange"), (q_full, "570 full", "crimson"),
+                                 (q_bare2, "976 CE", "teal"), (q_full2, "1064 full", "navy")]:
+                ax.axvline(qx, color=col, ls="--", lw=1.2)
+                ax.text(qx, ax.get_ylim()[1] * 0.98, lbl, rotation=90, va="top", ha="right",
+                        fontsize=8, color=col)
+            if fit1064 is not None:
+                xs = np.linspace(13.5, 19.0, 120)
+                ax.plot(xs, fit1064["amp"] * np.exp(-0.5 * ((xs - fit1064["mu"]) / fit1064["sigma"]) ** 2),
+                        color="black", lw=1.8)
+            ax.set_xlim(0, 22)
+            ax.set_title("Near-source vs far charge spectrum: is the 976 keV CE line (16.3 ke-) visible?", fontsize=9)
+            ax.set_xlabel("Q per pixel-hit [ke-]")
+            ax.set_ylabel(f"hits / {args.nadc} ADC count")
+            ax.legend(loc="upper right", fontsize=8)
+            fig.tight_layout()
+            out = os.path.join(args.outdir, "bi207_nearfar_spectrum.png")
+            fig.savefig(out, dpi=140)
+            plt.close(fig)
+            print(f"wrote {out}")
 
     # ---- text summary ----
     txt = os.path.join(args.outdir, "bi207_larnd.txt")
