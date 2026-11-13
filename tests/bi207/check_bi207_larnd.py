@@ -212,20 +212,19 @@ def hit_pixel_ids(h, data_mask, detector):
         if sx is None or sy is None:
             print(f"  (segments lack x/y; fields={sn} -> cannot build the hitmap)")
             return None
-        splane = (np.asarray(seg["pixel_plane"][:]).astype(int) if "pixel_plane" in sn
-                  else np.zeros(sx.shape, int))
         pitch = float(detector.PIXEL_PITCH)
-        borders = np.asarray(detector.TPC_BORDERS)
+        # fsd_cube is a single anode plane -> plane 0 (the LARND 'segments' pixel_plane field is not a
+        # reliable plane index here). borders[0] = the one TPC's x/y range.
+        b = np.asarray(detector.TPC_BORDERS)[0]
+        bx, by = float(b[0][0]), float(b[1][0])
         pid = np.full(sid.shape, -1, dtype=np.int64)
         ok = (sid >= 0) & (sid < sx.size)
         for i in np.nonzero(ok)[0]:
             s = int(sid[i])
-            pl = int(splane[s])
-            b = borders[pl]
             # pixels_from_track.py:125-126 -- the pixel index is pitches from the TPC border
-            i_x = int((sx[s] - b[0][0]) // pitch)
-            i_y = int((sy[s] - b[1][0]) // pitch)
-            pid[i] = pixel2id(i_x, i_y, pl)
+            i_x = int((sx[s] - bx) // pitch)
+            i_y = int((sy[s] - by) // pitch)
+            pid[i] = pixel2id(i_x, i_y, 0)
         nx, ny = int(detector.N_PIXELS[0]), int(detector.N_PIXELS[1])
         return pid, nx, ny
     except Exception as exc:
