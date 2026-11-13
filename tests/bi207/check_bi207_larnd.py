@@ -588,7 +588,7 @@ def main():
                         return lab if abs(EE - E) < 0.12 else "g-other"
                     return "other"
 
-                line = np.array([match(int(pdg0[i]), float(E0[i])) for i in range(pdg0.size)], dtype=object)
+                line = np.array([match(int(pdg0[i]), float(Ek[i])) for i in range(pdg0.size)], dtype=object)
                 res = int((valid & (line == "")).sum())
                 print(f"TRUTH line census ({int(valid.sum())-res} of {int(valid.sum())} localized hits "
                       f"traced to a primary; {res} unresolved):")
@@ -615,10 +615,10 @@ def main():
 
                 # Plot A: the source's mono-energetic lines, from the emitted-primary truth energy (delta
                 # lines, before detector smearing). e- vs gamma separated; catalogue energies marked.
-                fin = valid & np.isfinite(E0)
+                fin = valid & np.isfinite(Ek)
                 if int(fin.sum()) > 0:
-                    eE = E0[fin & (np.abs(pdg0) == 11)] * 1e3
-                    gE = E0[fin & (pdg0 == 22)] * 1e3
+                    eE = Ek[fin & (np.abs(pdg0) == 11)] * 1e3    # kinetic (rest mass removed)
+                    gE = Ek[fin & (pdg0 == 22)] * 1e3
                     fig, ax = plt.subplots(figsize=(7.4, 4.6))
                     be = np.arange(0, 1860, 15)
                     ax.hist(gE, bins=be, histtype="stepfilled", color="#4477aa", alpha=0.8, label="gamma-origin")
