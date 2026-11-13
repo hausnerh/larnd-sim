@@ -6,6 +6,12 @@
 #       EVERY pixel (1 day? 1 week?)                                  with a time axis for a chosen activity
 #   Q3  do 2-3 sources (or a 2D arrangement) cut that time?       -> superpose the illumination kernel
 #
+# GEOMETRY (fsd_cube, thesis convention -- see memory fsdcube-geometry):
+#   Y = anode VERTICAL, LONG  = 47.6 cm, 128 px  (= larnd-sim x, TPC_BORDERS[0][0])
+#   Z = anode HORIZONTAL, short = 29.76 cm, 80 px (= larnd-sim y, TPC_BORDERS[0][1])
+#   X = DRIFT (= larnd-sim z), perpendicular to the anode. The detector is TALLER in Y than wide in Z.
+#   So spreading sources along Y (the long axis) is the high-value move; we also test a 2D grid.
+#
 # MODEL (all computed, nothing hand-waved):
 #   Each pixel p has an illumination rate r_p = H[p]/N_generated  [hits per EMITTED decay]. In wall-clock
 #   time T at source activity A [Bq], it collects  n_p = r_p * A * T  hits, so it reaches the calibration
@@ -19,15 +25,12 @@
 #   A longer sim (more decays) would replace the extrapolation with a direct measurement of the tail.
 #
 #   Multi-source = superpose the SAME radial kernel at each source position and recompute coverage.
-#   NOTE the anode is 47.6 cm in Z (128 px, LONG) x 29.76 cm in Y (80 px, SHORT); a z-centered source
-#   leaves the Z-corners (+-23.8 cm) hardest, so spreading sources in Y (the short axis) helps least --
-#   we compare the user's y=1/3,2/3 pair against a 3-source row and a 2x2 grid to show it.
 #
 # Reuses the decode/fit in check_bi207_larnd.py (same directory) -- no logic is duplicated.
 #
 # Usage (NERSC, larnd env, login node -- CPU, seconds):
 #   python tests/bi207/check_bi207_calib.py $ND_WORK/bi207_fsd.LARND.h5 \
-#       --edep $ND_WORK/bi207_fsd.EDEPSIM.h5  --outdir $ND_WORK/bi207_calib
+#       --edep $ND_WORK/bi207.EDEPSIM.h5  --outdir $ND_WORK/bi207_calib
 #   # --edep gives N_generated (unique primary events). If you know it, pass --n-generated N instead.
 #   # --activity 1000  sets the reference source strength [Bq] for the time axis (default 1000 = 1 kBq).
 #   # --n-target 1000  hits/pixel considered "calibrated" (default 1000; see the Q1 block for what % that is).
@@ -64,20 +67,21 @@ def count_generated(edep):
 
 
 def pixel_coordinate_grids(detector, nx, ny):
-    """Zc[nx], Yc[ny] pixel-center coordinates straight from detsim.get_pixel_coordinates."""
+    """Yc[nx], Zc[ny] pixel-center coordinates from detsim.get_pixel_coordinates, in thesis axes:
+    Yc = larnd-x = anode VERTICAL/long (128); Zc = larnd-y = anode HORIZONTAL/short (80)."""
     from larndsim.pixels_from_track import pixel2id
     from larndsim.detsim import get_pixel_coordinates
-    Zc = np.array([get_pixel_coordinates(pixel2id(i, 0, 0))[0] for i in range(nx)], float)
-    Yc = np.array([get_pixel_coordinates(pixel2id(0, j, 0))[1] for j in range(ny)], float)
-    return Zc, Yc
+    Yc = np.array([get_pixel_coordinates(pixel2id(i, 0, 0))[0] for i in range(nx)], float)  # larnd-x -> Y
+    Zc = np.array([get_pixel_coordinates(pixel2id(0, j, 0))[1] for j in range(ny)], float)  # larnd-y -> Z
+    return Yc, Zc
 
 
-def radial_model(R, Zc, Yc, sz, sy, pitch, n_ann=28):
-    """Azimuthally-averaged rate r(d) [hits/decay] about (sz,sy), INCLUDING the un-hit pixels in each
-    annulus (so it is the true areal rate at radius d, not just over lit pixels). Fit an exponential
-    A*exp(-d/lam) to the outer annuli for extrapolation past the measured support. Returns a callable
-    r_model(d) and diagnostics (annulus centers, means, A, lam, d_max)."""
-    DD = np.hypot(Zc[:, None] - sz, Yc[None, :] - sy).ravel()
+def radial_model(R, Yc, Zc, sY, sZ, pitch, n_ann=28):
+    """Azimuthally-averaged rate r(d) [hits/decay] about source (sY,sZ), INCLUDING the un-hit pixels in
+    each annulus (so it is the true areal rate at radius d, not just over lit pixels). Fit an exponential
+    A*exp(-d/lam) to the outer annuli for extrapolation past the measured support. R has shape (nY,nZ).
+    Returns a callable r_model(d) and diagnostics."""
+    DD = np.hypot(Yc[:, None] - sY, Zc[None, :] - sZ).ravel()
     RR = R.ravel()
     d_max = float(DD.max())
     edges = np.linspace(0.0, d_max + 1e-6, n_ann + 1)
@@ -89,16 +93,14 @@ def radial_model(R, Zc, Yc, sz, sy, pitch, n_ann=28):
             mean[k] = RR[m].mean()
     good = np.isfinite(mean) & (cen > pitch)          # drop the d~0 core from the falloff fit
     pos = good & (mean > 0)
-    # exponential fit log(mean) ~ a - d/lam over the outer, positive annuli
     if pos.sum() >= 3:
         d_fit, y_fit = cen[pos], np.log(mean[pos])
-        A1 = np.polyfit(d_fit, y_fit, 1)              # slope, intercept of log(mean) vs d
+        A1 = np.polyfit(d_fit, y_fit, 1)              # log(mean) ~ intercept + slope*d
         lam = -1.0 / A1[0] if A1[0] < 0 else 1e9
         A0 = float(np.exp(A1[1]))
     else:
         lam, A0 = 1e9, float(np.nanmax(mean[good])) if good.any() else 1e-6
     core = float(RR[DD <= pitch].mean()) if (DD <= pitch).any() else float(np.nanmax(mean))
-
     cen_g, mean_g = cen[np.isfinite(mean)], mean[np.isfinite(mean)]
 
     def r_model(d):
@@ -106,7 +108,7 @@ def radial_model(R, Zc, Yc, sz, sy, pitch, n_ann=28):
         out = np.where(d <= cen_g[0], core, np.interp(d, cen_g, mean_g, right=np.nan))
         ext = A0 * np.exp(-d / lam)                   # exponential tail past the measured support
         out = np.where(np.isnan(out), ext, out)
-        out = np.maximum(out, A0 * np.exp(-d / lam))  # never below the smooth tail (kills interp zeros)
+        out = np.maximum(out, ext)                    # never below the smooth tail (kills interp zeros)
         return np.maximum(out, 1e-12)
     return r_model, dict(cen=cen, mean=mean, A0=A0, lam=lam, core=core, d_max=d_max)
 
@@ -135,17 +137,16 @@ def main():
         pix = bq.hit_pixel_ids(h, dmask, detector)
     if pix is None:
         sys.exit("could not map packets to pixels")
-    from larndsim.pixels_from_track import id2pixel, pixel2id
-    from larndsim.detsim import get_pixel_coordinates
-    pid, nx, ny = pix
-    ix = np.full(pid.shape, -1, np.int64)
-    iy = np.full(pid.shape, -1, np.int64)
+    from larndsim.pixels_from_track import id2pixel
+    pid, nx, ny = pix                                   # nx = Y (larnd-x, 128); ny = Z (larnd-y, 80)
+    iY = np.full(pid.shape, -1, np.int64)
+    iZ = np.full(pid.shape, -1, np.int64)
     for i in np.nonzero(pid >= 0)[0]:
         a, b, _ = id2pixel(int(pid[i]))
-        ix[i], iy[i] = int(a), int(b)
-    valid = (ix >= 0) & (ix < nx) & (iy >= 0) & (iy < ny)
-    H = np.zeros((nx, ny), np.int64)
-    np.add.at(H, (ix[valid], iy[valid]), 1)
+        iY[i], iZ[i] = int(a), int(b)
+    valid = (iY >= 0) & (iY < nx) & (iZ >= 0) & (iZ < ny)
+    H = np.zeros((nx, ny), np.int64)                    # H[iY, iZ]
+    np.add.at(H, (iY[valid], iZ[valid]), 1)
     npix = nx * ny
     n_lit = int((H > 0).sum())
     ndet = int(np.unique(ev[ev >= 0]).size) if ev is not None else -1
@@ -159,19 +160,19 @@ def main():
         ngen, lower_bound = max(ndet, 1), True
         print("!! WARNING: no --edep/--n-generated; using DETECTED decays as N_generated.")
         print("   Times are LOWER BOUNDS (coverage UPPER bounds). Pass --edep for the real number.")
-    print(f"pixels: {nx}x{ny}={npix}; lit {n_lit} ({100*n_lit/npix:.1f}%); hits {int(dmask.sum())}; "
+    print(f"pixels: {nx}(Y)x{ny}(Z)={npix}; lit {n_lit} ({100*n_lit/npix:.1f}%); hits {int(dmask.sum())}; "
           f"detected decays {ndet}; EMITTED decays {ngen} (from {gset}.{gfield})")
 
     # ---- source projection = brightest pixel; rate grid ----
     si, sj = np.unravel_index(int(np.argmax(H)), H.shape)
-    Zc, Yc = pixel_coordinate_grids(detector, nx, ny)
-    sz, sy = float(Zc[si]), float(Yc[sj])
-    z0, z1, y0, y1 = float(Zc.min()), float(Zc.max()), float(Yc.min()), float(Yc.max())
+    Yc, Zc = pixel_coordinate_grids(detector, nx, ny)
+    sY, sZ = float(Yc[si]), float(Zc[sj])
+    Y0, Y1, Z0, Z1 = float(Yc.min()), float(Yc.max()), float(Zc.min()), float(Zc.max())
     pitch = float(detector.PIXEL_PITCH)
     R = H.astype(float) / ngen                                   # measured hits/decay per pixel
-    print(f"source projection (brightest pixel): Z {sz:.1f}, Y {sy:.1f} cm  (H={int(H[si,sj])})")
+    print(f"source projection (brightest pixel): Y {sY:.1f} (long), Z {sZ:.1f} (short) cm  (H={int(H[si,sj])})")
 
-    r_model, diag = radial_model(R, Zc, Yc, sz, sy, pitch)
+    r_model, diag = radial_model(R, Yc, Zc, sY, sZ, pitch)
     print(f"radial falloff: core {diag['core']:.3e} hits/decay, exp tail lambda {diag['lam']:.1f} cm "
           f"(measured out to d={diag['d_max']:.0f} cm)")
 
@@ -194,28 +195,27 @@ def main():
     for ln in q1_lines:
         print(ln)
 
-    # ---- arrangements: list of source (z,y) positions ----
-    cz = 0.5 * (z0 + z1)
+    # ---- arrangements: source positions as (Y, Z) = (vertical-long, horizontal-short) ----
+    cZ = 0.5 * (Z0 + Z1)                                        # center of the SHORT axis
     arr = {
-        "1 source (center)":        [(cz, 0.5 * (y0 + y1))],
-        "2 sources (y=1/3,2/3)":    [(cz, y0 + (y1 - y0) / 3), (cz, y0 + 2 * (y1 - y0) / 3)],
-        "3 sources (y row)":        [(cz, y0 + (y1 - y0) / 6), (cz, 0.5 * (y0 + y1)),
-                                     (cz, y0 + 5 * (y1 - y0) / 6)],
-        "2x2 grid":                 [(z0 + (z1 - z0) / 4, y0 + (y1 - y0) / 4),
-                                     (z0 + 3 * (z1 - z0) / 4, y0 + (y1 - y0) / 4),
-                                     (z0 + (z1 - z0) / 4, y0 + 3 * (y1 - y0) / 4),
-                                     (z0 + 3 * (z1 - z0) / 4, y0 + 3 * (y1 - y0) / 4)],
+        "1 source (center)":        [(0.5 * (Y0 + Y1), cZ)],
+        "2 sources (y=1/3,2/3)":    [(Y0 + (Y1 - Y0) / 3, cZ), (Y0 + 2 * (Y1 - Y0) / 3, cZ)],
+        "3 sources (y row)":        [(Y0 + (Y1 - Y0) / 6, cZ), (0.5 * (Y0 + Y1), cZ),
+                                     (Y0 + 5 * (Y1 - Y0) / 6, cZ)],
+        "2x2 grid":                 [(Y0 + (Y1 - Y0) / 4, Z0 + (Z1 - Z0) / 4),
+                                     (Y0 + 3 * (Y1 - Y0) / 4, Z0 + (Z1 - Z0) / 4),
+                                     (Y0 + (Y1 - Y0) / 4, Z0 + 3 * (Z1 - Z0) / 4),
+                                     (Y0 + 3 * (Y1 - Y0) / 4, Z0 + 3 * (Z1 - Z0) / 4)],
     }
 
     def rate_grid(sources):
         """Per-pixel total rate [hits/decay] = sum over sources of the radial kernel (per source)."""
         tot = np.zeros((nx, ny))
-        for (szi, syi) in sources:
-            d = np.hypot(Zc[:, None] - szi, Yc[None, :] - syi)
+        for (sYi, sZi) in sources:
+            d = np.hypot(Yc[:, None] - sYi, Zc[None, :] - sZi)
             tot += r_model(d.ravel()).reshape(nx, ny)
         return tot
 
-    # D_needed[p] = N_target / rate_p (emitted decays to calibrate that pixel); coverage(D) from the sort
     rates = {k: rate_grid(v) for k, v in arr.items()}
     D_need = {k: (args.n_target / np.maximum(v.ravel(), 1e-12)) for k, v in rates.items()}
 
@@ -231,13 +231,13 @@ def main():
     out_txt.append(f"Bi-207 per-pixel calibration study  (N_target {args.n_target:.0f} hits/pixel, "
                    f"activity {A:.0f} Bq reference)")
     out_txt.append(f"input {args.larnd}")
+    out_txt.append(f"geometry: Y vertical/long 47.6cm/{nx}px; Z horizontal/short 29.76cm/{ny}px; X drift")
     out_txt.append(f"plane {nx}x{ny}={npix} pixels; emitted decays N_gen={ngen}"
                    + ("  [LOWER-BOUND: detected count used]" if lower_bound else "") + "\n")
     out_txt.extend(["Q1 -- hits to calibrate one pixel (from the K-570 line width):"] + ["  " + l for l in q1_lines])
     out_txt.append("")
-    out_txt.append("Q2/Q3 -- coverage vs exposure (fraction of the 10,240 pixels reaching N_target):")
-    hdr = f"  {'arrangement':24s} {'1 day':>9s} {'1 week':>9s}   {'D for 90%':>12s} {'D for 99%':>12s}   t@1kBq(90/99%)"
-    out_txt.append(hdr)
+    out_txt.append("Q2/Q3 -- coverage vs exposure (fraction of the %d pixels reaching N_target):" % npix)
+    out_txt.append(f"  {'arrangement':24s} {'1 day':>9s} {'1 week':>9s}   {'D for 90%':>12s} {'D for 99%':>12s}   t@1kBq(90/99%)")
     for k in arr:
         c_day, c_week = coverage_at(k, day), coverage_at(k, week)
         Ds = np.sort(D_need[k])
@@ -267,7 +267,7 @@ def main():
     ax.axvline(week, color="0.4", ls=":", lw=1)
     ax.text(week, 5, f" 1 week @ {A:.0f} Bq", rotation=90, va="bottom", ha="right", fontsize=8, color="0.3")
     ax.set_xscale("log")
-    ax.set_xlabel("emitted decays  D = A x T   (bottom); time @ %g Bq (top)" % A)
+    ax.set_xlabel("emitted decays  D = A x T")
     ax.set_ylabel(f"% of {npix} pixels with >= {args.n_target:.0f} hits")
     ax.set_ylim(0, 101)
     ax.set_title(f"Bi-207 pixel-plane calibration coverage vs exposure\n"
@@ -275,8 +275,6 @@ def main():
                  fontsize=10)
     ax.grid(alpha=0.3, which="both")
     ax.legend(fontsize=8, loc="lower right")
-    secx = ax.secondary_xaxis("top", functions=(lambda d: d / A, lambda t: t * A))
-    secx.set_xlabel("exposure time [s] @ %g Bq" % A, fontsize=8)
     for nm in ("hour", "day", "week", "month", "year"):
         t = SECONDS[nm] * A
         if D_axis[0] < t < D_axis[-1]:
@@ -288,19 +286,19 @@ def main():
     plt.close(fig)
     print(f"wrote {f1}")
 
-    # (2) time-to-calibrate maps: 1 source vs 2 sources (days @ reference activity)
+    # (2) time-to-calibrate maps: 1 source vs 2 sources (days @ reference activity); Y vertical/long
     for k, tag in (("1 source (center)", "1src"), ("2 sources (y=1/3,2/3)", "2src")):
-        Tp = (D_need[k].reshape(nx, ny)) / (A * SECONDS["day"])   # days @ reference activity
-        fig, ax = plt.subplots(figsize=(5.6, 6.8))
-        im = ax.imshow(Tp.T, origin="lower", aspect="auto", extent=[z0, z1, y0, y1],
+        Tp = (D_need[k].reshape(nx, ny)) / (A * SECONDS["day"])   # days @ reference activity, Tp[iY,iZ]
+        fig, ax = plt.subplots(figsize=(4.8, 7.2))
+        im = ax.imshow(Tp, origin="lower", aspect="equal", extent=[Z0, Z1, Y0, Y1],
                        cmap="viridis_r", norm=LogNorm(vmin=max(1e-3, Tp.min()), vmax=Tp.max()))
         ax.set_title(f"Days to reach {args.n_target:.0f} hits/pixel @ {A:.0f} Bq\n{k}", fontsize=10)
-        ax.set_xlabel(f"Z (cm)  [{nx} px, long axis]")
-        ax.set_ylabel(f"Y (cm)  [{ny} px, short axis]")
+        ax.set_xlabel(f"Z (cm)  [{ny} px, short, horizontal]")
+        ax.set_ylabel(f"Y (cm)  [{nx} px, long, vertical]")
         cb = fig.colorbar(im, ax=ax)
         cb.set_label("days to calibrate (log)")
-        for (szi, syi) in arr[k]:
-            ax.plot(szi, syi, marker="*", ms=16, color="crimson", mec="white", mew=0.8)
+        for (sYi, sZi) in arr[k]:
+            ax.plot(sZi, sYi, marker="*", ms=16, color="crimson", mec="white", mew=0.8)
         fig.tight_layout()
         fn = os.path.join(args.outdir, f"bi207_calibtime_{tag}.png")
         fig.savefig(fn, dpi=140)
@@ -331,7 +329,7 @@ def main():
         f.write("\n".join(out_txt) + "\n")
     print(f"wrote {txt}")
     npz = os.path.join(args.outdir, "bi207_calib.npz")
-    np.savez_compressed(npz, H=H, Zc=Zc, Yc=Yc, ngen=ngen, source=(sz, sy),
+    np.savez_compressed(npz, H=H, Yc=Yc, Zc=Zc, ngen=ngen, source=(sY, sZ),
                         n_target=args.n_target, activity=A,
                         radial_cen=diag["cen"], radial_mean=diag["mean"],
                         radial_A0=diag["A0"], radial_lam=diag["lam"], radial_core=diag["core"])

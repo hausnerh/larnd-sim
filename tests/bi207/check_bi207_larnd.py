@@ -14,7 +14,7 @@
 #   bi207_perhit_q.png     per-PIXEL-HIT charge (one entry per data packet) + a Gaussian fit to K-570.
 #   bi207_perdecay_q.png   per-DECAY charge, summed across the pixels one decay lit + a K-570 fit.
 #   bi207_multiplicity.png pixel-hits per decay.
-#   bi207_pixel_hitmap.png the ANODE (Y-Z) pixel plane (128 Z x 80 Y), LOG-colored by hits/pixel, i.e.
+#   bi207_pixel_hitmap.png the ANODE (Y-Z) pixel plane (128 Y x 80 Z), LOG-colored by hits/pixel, i.e.
 #                          which pixels this source placement illuminates (drift X is perpendicular).
 #                          Each packet's pixel is found through larnd-sim's OWN pipeline -- the sim's
 #                          mc_packets_assn gives the packet's segment, pixels_from_track indexing +
@@ -353,64 +353,65 @@ def main():
     # ---- pixel-plane hit heatmap: pixel from larnd-sim's own pixelization (hit_pixel_ids), pixel
     #      center from detsim.get_pixel_coordinates, index from pixels_from_track.id2pixel; LOG color ----
     n_pix_hit = frac_plane = None
-    z_cen = y_cen = float("nan")
+    Y_cen = Z_cen = Yctr = Zctr = float("nan")
     if pixinfo is not None:
         from larndsim.pixels_from_track import id2pixel, pixel2id
         from larndsim.detsim import get_pixel_coordinates
-        pid, nx, ny = pixinfo                              # nx=larnd-x(Z,128), ny=larnd-y(Y,80)
+        pid, nx, ny = pixinfo                              # nx=larnd-x=thesis-Y(128,long); ny=larnd-y=thesis-Z(80,short)
         B = np.asarray(detector.TPC_BORDERS)[0]
-        x0, x1 = sorted((float(B[0][0]), float(B[0][1])))  # larnd-x = thesis Z (anode horizontal)
-        y0, y1 = sorted((float(B[1][0]), float(B[1][1])))  # larnd-y = thesis Y (anode vertical)
+        Y0, Y1 = sorted((float(B[0][0]), float(B[0][1])))  # larnd-x = thesis Y (anode VERTICAL, long, 47.6 cm)
+        Z0, Z1 = sorted((float(B[1][0]), float(B[1][1])))  # larnd-y = thesis Z (anode HORIZONTAL, short, 29.76 cm)
         pitch = float(detector.PIXEL_PITCH)
-        ix = np.full(pid.shape, -1, dtype=np.int64)
-        iy = np.full(pid.shape, -1, dtype=np.int64)
-        zx = np.full(pid.shape, np.nan)                    # pixel-center Z [cm] via get_pixel_coordinates
-        zy = np.full(pid.shape, np.nan)                    # pixel-center Y [cm]
+        iY = np.full(pid.shape, -1, dtype=np.int64)        # pixel index along Y (larnd-x)
+        iZ = np.full(pid.shape, -1, dtype=np.int64)        # pixel index along Z (larnd-y)
+        cY = np.full(pid.shape, np.nan)                    # pixel-center Y [cm] (vertical, long)
+        cZ = np.full(pid.shape, np.nan)                    # pixel-center Z [cm] (horizontal, short)
         for i in np.nonzero(pid >= 0)[0]:
             a, b, _pl = id2pixel(int(pid[i]))
-            ix[i], iy[i] = int(a), int(b)
-            cx, cy = get_pixel_coordinates(int(pid[i]))
-            zx[i], zy[i] = float(cx), float(cy)
-        valid = (ix >= 0) & (ix < nx) & (iy >= 0) & (iy < ny)
-        H = np.zeros((nx, ny), dtype=np.int64)
-        np.add.at(H, (ix[valid], iy[valid]), 1)
+            iY[i], iZ[i] = int(a), int(b)
+            yy, zz = get_pixel_coordinates(int(pid[i]))    # returns (larnd-x, larnd-y) = (Y, Z)
+            cY[i], cZ[i] = float(yy), float(zz)
+        valid = (iY >= 0) & (iY < nx) & (iZ >= 0) & (iZ < ny)
+        H = np.zeros((nx, ny), dtype=np.int64)             # H[iY, iZ]
+        np.add.at(H, (iY[valid], iZ[valid]), 1)
         n_pix_hit = int((H > 0).sum())
         frac_plane = n_pix_hit / float(nx * ny)
         hit_counts = H[H > 0] if (H > 0).any() else np.array([0])
-        zc, yc = (x0 + x1) / 2, (y0 + y1) / 2              # anode center = centered-source projection
+        Yctr, Zctr = (Y0 + Y1) / 2, (Z0 + Z1) / 2          # anode center = centered-source projection
         if valid.any():
-            z_cen, y_cen = float(np.median(zx[valid])), float(np.median(zy[valid]))
+            Y_cen, Z_cen = float(np.median(cY[valid])), float(np.median(cZ[valid]))
         order = np.argsort(H, axis=None)[::-1]
         print(f"pixel coverage: {n_pix_hit}/{nx*ny} pixels hit ({100*frac_plane:.1f}%); "
               f"hits/hit-pixel median {np.median(hit_counts):.0f}, max {int(hit_counts.max())}  "
               f"({int(valid.sum())}/{pid.size} hits localized)")
-        print(f"hit centroid (pixel centers): Z {z_cen:.1f} cm, Y {y_cen:.1f} cm  "
-              f"[anode center Z {zc:.1f}, Y {yc:.1f}; a centered cathode source lands here]")
-        print("hottest pixels (Z,Y cm from get_pixel_coordinates; hits):")
+        print(f"hit centroid (pixel centers): Y {Y_cen:.1f} cm, Z {Z_cen:.1f} cm  "
+              f"[anode center Y {Yctr:.1f}, Z {Zctr:.1f}; a centered cathode source lands here]")
+        print("hottest pixels (Y,Z cm from get_pixel_coordinates; hits):")
         for idx in order[:8]:
             c, r = np.unravel_index(idx, H.shape)
             if H[c, r] == 0:
                 break
-            zz, yy = get_pixel_coordinates(pixel2id(int(c), int(r), 0))
-            print(f"    Z {zz:5.1f}, Y {yy:6.1f}  hits={int(H[c, r]):4d}")
+            yy, zz = get_pixel_coordinates(pixel2id(int(c), int(r), 0))
+            print(f"    Y {yy:5.1f}, Z {zz:6.1f}  hits={int(H[c, r]):4d}")
 
-        # thesis Fig 4.3 anode (Y-Z) plane: Y [cm] (119-148.8, larnd-y, 80 px) VERTICAL, Z [cm]
-        # (0-47.6, larnd-x, 128 px) HORIZONTAL; drift (X) perpendicular. Pixel from the sim's own
+        # thesis Fig 4.3 anode (Y-Z) plane: Y [cm] (larnd-x, 128 px, 47.6 cm) VERTICAL and LONG; Z [cm]
+        # (larnd-y, 80 px, 29.76 cm) HORIZONTAL and short; drift (X=larnd-z) perpendicular. The detector
+        # is taller in Y than wide in Z -- aspect='equal' shows that 1:1. Pixel from the sim's own
         # pixelization pipeline, so a centered source lands at the center.
-        fig, ax = plt.subplots(figsize=(5.6, 6.8))
-        im = ax.imshow(H.T, origin="lower", aspect="auto", extent=[x0, x1, y0, y1],
+        fig, ax = plt.subplots(figsize=(4.8, 7.2))
+        im = ax.imshow(H, origin="lower", aspect="equal", extent=[Z0, Z1, Y0, Y1],
                        cmap="viridis", norm=LogNorm(vmin=1, vmax=max(2, int(hit_counts.max()))))
         ax.set_title(f"Anode (Y-Z) pixel-plane hit coverage\n"
                      f"{n_pix_hit}/{nx*ny} pixels hit ({100*frac_plane:.1f}%); drift (X) perpendicular; "
-                     f"pitch {pitch*10:.2f} mm", fontsize=10)
-        ax.set_xlabel(f"Z (cm)   [{nx} pixels, anode horizontal]")
-        ax.set_ylabel(f"Y (cm)   [{ny} pixels, anode vertical]")
+                     f"pitch {pitch*10:.2f} mm", fontsize=9)
+        ax.set_xlabel(f"Z (cm)   [{ny} pixels, anode horizontal, short]")
+        ax.set_ylabel(f"Y (cm)   [{nx} pixels, anode vertical, long]")
         cb = fig.colorbar(im, ax=ax)
         cb.set_label("hits on the pixel (log)")
-        ax.plot(zc, yc, marker="+", ms=15, mew=1.8, color="crimson",
+        ax.plot(Zctr, Yctr, marker="+", ms=15, mew=1.8, color="crimson",
                 label="anode center (centered-source projection)")
-        if np.isfinite(z_cen):
-            ax.plot(z_cen, y_cen, marker="x", ms=11, mew=1.8, color="white", label="hit centroid")
+        if np.isfinite(Y_cen):
+            ax.plot(Z_cen, Y_cen, marker="x", ms=11, mew=1.8, color="white", label="hit centroid")
         ax.legend(loc="upper left", fontsize=7, framealpha=0.85)
         fig.tight_layout()
         out = os.path.join(args.outdir, "bi207_pixel_hitmap.png")
@@ -444,8 +445,8 @@ def main():
         if n_pix_hit is not None:
             f.write(f"\npixel-plane coverage (this source placement): {n_pix_hit} pixels hit "
                     f"({100*frac_plane:.1f}% of the {nx}x{ny} plane)\n")
-            f.write(f"hit centroid: Z {z_cen:.1f} cm, Y {y_cen:.1f} cm; anode center "
-                    f"Z {(x0+x1)/2:.1f}, Y {(y0+y1)/2:.1f}\n")
+            f.write(f"hit centroid: Y {Y_cen:.1f} cm, Z {Z_cen:.1f} cm; anode center "
+                    f"Y {Yctr:.1f}, Z {Zctr:.1f}\n")
     print(f"wrote {txt}")
 
 
