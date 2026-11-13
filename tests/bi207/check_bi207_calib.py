@@ -30,10 +30,14 @@
 #   are filled from the azimuthal radial profile r(d) (flagged -- a longer sim would measure them).
 #   Multi-source = superpose the same radial kernel at each source position.
 #
-# SOURCE: Eckert & Ziegler Bi-207 rod source GF-007-x, activity 185 Bq - 3.7 MBq (5 nCi - 100 uCi);
-#   published detector work uses ~37 kBq (SoLid) to ~170 kBq (LEGEND). Default reference 37 kBq (1 uCi).
-#   NB pileup: at 37 kBq the ONE pixel under the source sees ~4.5 kHz (~1 hit per drift), so a strong
-#   source over-illuminates the core while barely reaching the corners -- an argument for multi-source.
+# SOURCE: Eckert & Ziegler Bi-207 thin-window conversion-ELECTRON source (catalogue sec 3, electron
+#   emitters): 37 kBq nominal, 5 mm active deposit in a 25 mm Al frame, Mylar 0.9 mg/cm2 or Ti
+#   2.4 mg/cm2 window -> the K-570/K-1064 conversion electrons ESCAPE (window dE < 1%), so the sharp
+#   local charge lines our BARE-electron sim produces are physical. Codes BIRB1083 (Mylar), BIRB1082
+#   (Ti), BIRB4391 (Mylar, activity-calibrated). Default reference 37 kBq.
+#   Caveats vs sim: the 5 mm deposit spreads the conversion line over ~1-2 pixels (we model a point);
+#   a wall-mounted foil emits ~2pi not 4pi. NB pileup: at 37 kBq the pixel under the source sees
+#   ~4.5 kHz (~1 hit/drift), so a strong source over-illuminates the core -- an argument for multi-source.
 #
 # Reuses the decode/fit in check_bi207_larnd.py (same directory) -- no logic is duplicated.
 #
@@ -127,7 +131,7 @@ def main():
     ap.add_argument("larnd", help="larnd-sim FEE output (…_fsd.LARND.h5)")
     ap.add_argument("--edep", default=None, help="EDEPSIM (…_fsd.EDEPSIM.h5) to count EMITTED decays")
     ap.add_argument("--n-generated", type=int, default=None, help="emitted Bi-207 decays (overrides --edep)")
-    ap.add_argument("--activity", type=float, default=37000.0, help="reference source activity [Bq] (E&Z GF-007: 185..3.7e6)")
+    ap.add_argument("--activity", type=float, default=37000.0, help="reference source activity [Bq] (E&Z Bi-207 e- source nominal 37 kBq)")
     ap.add_argument("--n-target", type=float, default=1000.0, help="line-hits/pixel that count as 'calibrated'")
     ap.add_argument("--line-lo", type=float, default=5.5, help="calibration line window low edge [ke-]")
     ap.add_argument("--line-hi", type=float, default=12.4, help="calibration line window high edge [ke-]")
@@ -255,7 +259,7 @@ def main():
     out.append(f"input {args.larnd}")
     out.append(f"geometry: Y vertical/long 47.6cm/{nx}px; Z horizontal/short 29.76cm/{ny}px; X drift")
     out.append(f"calibration line window: {args.line_lo:.1f}-{args.line_hi:.1f} ke- (K-570 8.06/9.53 + 570 full-energy)")
-    out.append(f"source: E&Z Bi-207 rod GF-007-x, 185 Bq-3.7 MBq; reference {A:.0f} Bq")
+    out.append(f"source: E&Z Bi-207 thin-window e- source (BIRB4391, 37 kBq nominal); reference {A:.0f} Bq")
     out.append(f"plane {nx}x{ny}={npix} px; emitted decays N_gen={ngen}"
                + ("  [LOWER-BOUND: detected count used]" if lower_bound else "") + "\n")
     out.append("Which hits calibrate? (line window vs all hits, by distance from the source):")
