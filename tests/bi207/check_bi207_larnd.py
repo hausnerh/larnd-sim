@@ -238,10 +238,94 @@ def hit_pixel_ids(h, data_mask, detector):
         return None
 
 
+# Bi-207 mono-energetic lines that could anchor a per-pixel calibration (energy of the emitted
+# particle [MeV], label, kind). Conversion electrons (e-) are LOCAL (range <1 px -> they only light
+# the source pixel, but give a clean mono line there). Full-energy gamma peaks (g) are DELOCALIZED
+# (the photon travels, so they light the whole plane, but sit on a Compton pedestal). intensities are
+# per 100 decays. The Pb-K X-ray (~75 keV) is near threshold; listed so the truth spectrum shows it.
+BI207_LINES = [
+    ("Pb-K X-ray", 0.0750, "x", 0.0),    # ~75-88 keV fluorescence, ~1.2 ke- (near threshold)
+    ("K-570 CE",   0.4817, "e", 1.5),    # 8.06 ke-   (K internal conversion of the 570 keV level)
+    ("L-570 CE",   0.5537, "e", 0.44),   # ~9.3 ke-
+    ("570 gamma",  0.5697, "g", 97.8),   # 9.53 ke-   (full-energy photo-absorption)
+    ("K-1064 CE",  0.9757, "e", 7.0),    # 16.3 ke-   (the MORE intense CE line)
+    ("L-1064 CE",  1.0478, "e", 1.8),    # ~17.5 ke-
+    ("1064 gamma", 1.0637, "g", 74.5),   # 17.8 ke-   (weak photopeak: 1 MeV g mostly Compton)
+    ("1770 gamma", 1.7703, "g", 6.87),   # ~29.6 ke-  (rare)
+]
+
+
+def hit_primary_origin(h, data_mask, edep_path):
+    """TRUTH-match each data packet to the mono-energetic line that made it. Walk its leading
+    segment's trajectory up the parent chain to the particle emitted directly by the decaying nucleus
+    (the conversion electron, or the decay gamma whose Compton/photo electron deposited the charge),
+    and return that primary's (pdg, E_start[MeV]) -- independent of the reconstructed charge. Returns
+    (pdg, E0) int64/float64 arrays aligned to packets[data_mask] (pdg 0 / E0 nan where unresolved),
+    or None. This is the 'truth' answer to 'does this pixel really see the line, or just charge in a
+    window?': a conversion-electron origin is the real line; a gamma origin is the delocalized halo."""
+    try:
+        if "mc_packets_assn" not in h or "segments" not in h:
+            return None
+        assn = np.asarray(h["mc_packets_assn"][:])[data_mask]
+        if "segment_ids" not in (assn.dtype.names or ()):
+            return None
+        sid = np.asarray(assn["segment_ids"]).reshape(assn.shape[0], -1)[:, 0].astype(np.int64)
+        seg = h["segments"]
+        sn = seg.dtype.names or ()
+        if not {"event_id", "traj_id"} <= set(sn):
+            print("  (segments lack event_id/traj_id -> truth origin unavailable)")
+            return None
+        seg_ev = np.asarray(seg["event_id"][:]).astype(np.int64)
+        seg_tj = np.asarray(seg["traj_id"][:]).astype(np.int64)
+        with open_ro(edep_path) as he:
+            if "trajectories" not in he:
+                print("  (no 'trajectories' in --edep -> truth origin unavailable)")
+                return None
+            tr = np.asarray(he["trajectories"][:])
+        tn = tr.dtype.names or ()
+        need = {"event_id", "traj_id", "parent_id", "pdg_id", "E_start"}
+        if not need <= set(tn):
+            print(f"  (trajectories missing {need - set(tn)} -> truth origin unavailable)")
+            return None
+        tev = tr["event_id"].astype(np.int64); ttj = tr["traj_id"].astype(np.int64)
+        tpar = tr["parent_id"].astype(np.int64); tpdg = tr["pdg_id"].astype(np.int64)
+        tE = tr["E_start"].astype(np.float64)
+        idx = {(int(e), int(t)): i for i, (e, t) in enumerate(zip(tev, ttj))}
+
+        def emitted(ev, tj):
+            # climb to the particle whose parent is the decaying nucleus (pdg>1e6) / primary / absent
+            cur = (ev, tj)
+            for _ in range(40):
+                if cur not in idx:
+                    break
+                i = idx[cur]; par = int(tpar[i]); pkey = (ev, par)
+                par_nucleus = pkey in idx and abs(int(tpdg[idx[pkey]])) > 1000000
+                if par < 0 or pkey not in idx or par_nucleus:
+                    return int(tpdg[i]), float(tE[i])
+                cur = pkey
+            return 0, float("nan")
+
+        pdg = np.zeros(sid.shape, np.int64); E0 = np.full(sid.shape, np.nan)
+        ok = (sid >= 0) & (sid < seg_ev.size)
+        cache = {}
+        for i in np.nonzero(ok)[0]:
+            key = (int(seg_ev[sid[i]]), int(seg_tj[sid[i]]))
+            if key not in cache:
+                cache[key] = emitted(*key)
+            pdg[i], E0[i] = cache[key]
+        return pdg, E0
+    except Exception as exc:
+        print(f"  (truth origin unavailable: {exc!r})")
+        return None
+
+
 def main():
     ap = argparse.ArgumentParser(description="Decode the larnd-sim FEE (LARND) output to charge, fit "
                                              "the Bi-207 K-570 line, and map pixel coverage. No ndlar_flow.")
     ap.add_argument("larnd", help="larnd-sim output .h5 (…_fsd.LARND.h5)")
+    ap.add_argument("--edep", default=None, help="EDEPSIM .h5 (trajectories) -> TRUTH-match the per-line "
+                    "maps: tag each hit by its directly-emitted primary (conversion e- vs decay gamma), "
+                    "instead of only its reconstructed charge window")
     ap.add_argument("--outdir", default="bi207_larnd", help="output directory for the pngs + txt")
     ap.add_argument("--qmax", type=float, default=30.0, help="charge-axis max [ke-]")
     ap.add_argument("--nadc", type=int, default=1, help="ADC counts per charge-histogram bin (>=1)")
@@ -476,6 +560,128 @@ def main():
         fig.savefig(out, dpi=140)
         plt.close(fig)
         print(f"wrote {out}")
+
+        # ---- TRUTH line census: which mono-energetic lines does the source give, and where? ----
+        if getattr(args, "edep", None):
+            with open_ro(args.larnd) as h2:
+                origin = hit_primary_origin(h2, dmask, args.edep)
+            if origin is not None and origin[0].shape == valid.shape:
+                pdg0, E0 = origin
+                e_lines = [(lab, E) for lab, E, k, _ in BI207_LINES if k == "e"]
+                g_lines = [(lab, E) for lab, E, k, _ in BI207_LINES if k in ("g", "x")]
+
+                def match(pg, E):
+                    if not np.isfinite(E):
+                        return ""
+                    if abs(pg) == 11:
+                        lab, EE = min(e_lines, key=lambda le: abs(le[1] - E))
+                        return lab if abs(EE - E) < 0.10 else "e-other"
+                    if pg == 22:
+                        lab, EE = min(g_lines, key=lambda le: abs(le[1] - E))
+                        return lab if abs(EE - E) < 0.12 else "g-other"
+                    return "other"
+
+                line = np.array([match(int(pdg0[i]), float(E0[i])) for i in range(pdg0.size)], dtype=object)
+                res = int((valid & (line == "")).sum())
+                print(f"TRUTH line census ({int(valid.sum())-res} of {int(valid.sum())} localized hits "
+                      f"traced to a primary; {res} unresolved):")
+                print(f"  {'line':12s} {'emitted':>9s} {'collected':>10s} {'hits':>6s} {'pixels':>7s} "
+                      f"{'rms':>6s}  role")
+                census = []
+                for lab, E, k, inten in BI207_LINES:
+                    m = valid & (line == lab)
+                    n = int(m.sum())
+                    if n == 0:
+                        continue
+                    qpix = int(np.unique(iY[m] * ny + iZ[m]).size)
+                    rr = float(np.sqrt(np.mean((cY[m] - Yctr) ** 2 + (cZ[m] - Zctr) ** 2)))
+                    role = "LOCAL e- line" if k == "e" else ("delocalized g peak" if k == "g" else "near-threshold")
+                    census.append((lab, edep_to_ke(E), n, qpix, rr, role))
+                    print(f"  {lab:12s} {E*1e3:6.0f} keV {edep_to_ke(E):7.2f} ke- {n:6d} {qpix:7d} "
+                          f"{rr:5.1f}cm  {role}")
+                for lab in ("e-other", "g-other", "other"):
+                    n = int((valid & (line == lab)).sum())
+                    if n:
+                        print(f"  {lab:12s} {'':>9s} {'':>10s} {n:6d}")
+                print("  -> LOCAL (conversion-electron) lines give a clean mono peak but only on the source")
+                print("     pixel; delocalized gamma full-energy peaks light the plane but ride a Compton floor.")
+
+                # Plot A: the source's mono-energetic lines, from the emitted-primary truth energy (delta
+                # lines, before detector smearing). e- vs gamma separated; catalogue energies marked.
+                fin = valid & np.isfinite(E0)
+                if int(fin.sum()) > 0:
+                    eE = E0[fin & (np.abs(pdg0) == 11)] * 1e3
+                    gE = E0[fin & (pdg0 == 22)] * 1e3
+                    fig, ax = plt.subplots(figsize=(7.4, 4.6))
+                    be = np.arange(0, 1860, 15)
+                    ax.hist(gE, bins=be, histtype="stepfilled", color="#4477aa", alpha=0.8, label="gamma-origin")
+                    ax.hist(eE, bins=be, histtype="stepfilled", color="#cc6677", alpha=0.8, label="e--origin (CE)")
+                    for lab, E, k, _ in BI207_LINES:
+                        ax.axvline(E * 1e3, color="0.4", ls=":", lw=0.9)
+                        ax.text(E * 1e3, ax.get_ylim()[1] * 0.97, lab, rotation=90, va="top",
+                                ha="right", fontsize=7, color="0.3")
+                    ax.set_yscale("log")
+                    ax.set_title("Bi-207 mono-energetic lines (truth emitted-primary energy per hit)", fontsize=9)
+                    ax.set_xlabel("emitted primary energy [keV]")
+                    ax.set_ylabel("hits / 15 keV")
+                    ax.legend(loc="upper right", fontsize=8)
+                    fig.tight_layout()
+                    o = os.path.join(args.outdir, "bi207_truth_lines.png")
+                    fig.savefig(o, dpi=140); plt.close(fig); print(f"wrote {o}")
+
+                # Plot B: the reconstructed CHARGE spectrum decomposed by truth origin -- shows which lines
+                # survive as fittable peaks vs melt into the Compton continuum (what we can calibrate off).
+                order = ["K-570 CE", "570 gamma", "L-570 CE", "K-1064 CE", "1064 gamma", "L-1064 CE",
+                         "1770 gamma", "Pb-K X-ray"]
+                cols = {"K-570 CE": "#ee6677", "570 gamma": "#4477aa", "L-570 CE": "#f4a0a8",
+                        "K-1064 CE": "#228833", "1064 gamma": "#66ccee", "L-1064 CE": "#99ddbb",
+                        "1770 gamma": "#aa3377", "Pb-K X-ray": "#bbbbbb"}
+                present = [L for L in order if int((valid & (line == L)).sum()) > 0]
+                if present:
+                    edges = adc_aligned_edges(0.0, args.qmax, slope, intercept, args.nadc)
+                    stacks = [q_ke[valid & (line == L)] for L in present]
+                    rest = valid & ~np.isin(line.astype(str), np.array(present + [""], dtype=str))
+                    if int(rest.sum()) > 0:
+                        stacks.append(q_ke[rest]); present = present + ["Compton/other"]
+                        cols["Compton/other"] = "0.75"
+                    fig, ax = plt.subplots(figsize=(7.6, 4.9))
+                    ax.hist(stacks, bins=edges, stacked=True, histtype="stepfilled",
+                            color=[cols[L] for L in present], label=present)
+                    for lab, E, k, _ in BI207_LINES:
+                        ax.axvline(edep_to_ke(E), color="0.4", ls=":", lw=0.8)
+                    ax.set_xlim(0, args.qmax)
+                    ax.set_title("Collected charge decomposed by TRUTH origin (which lines are fittable peaks)", fontsize=9)
+                    ax.set_xlabel("Q per pixel-hit [ke-]")
+                    ax.set_ylabel(f"hits / {args.nadc} ADC count")
+                    ax.legend(loc="upper right", fontsize=7, ncol=2)
+                    fig.tight_layout()
+                    o = os.path.join(args.outdir, "bi207_charge_by_truth.png")
+                    fig.savefig(o, dpi=140); plt.close(fig); print(f"wrote {o}")
+
+                # Plot C: 570 complex -- charge-window selection vs TRUTH conversion-electron origin, to
+                # show the window map's spread is gamma, not the local K-570 electron line.
+                def amap(selmask):
+                    M = np.zeros((nx, ny), np.int64)
+                    np.add.at(M, (iY[selmask], iZ[selmask]), 1)
+                    return M
+                H_win = amap(valid & (q_ke >= 6.0) & (q_ke <= 11.0))
+                H_tce = amap(valid & (line == "K-570 CE"))
+                fig, (axA, axB) = plt.subplots(1, 2, figsize=(9.4, 7.0), sharey=True)
+                for ax, M, ttl in [(axA, H_win, f"charge window 6-11 ke-\n{int((H_win>0).sum())} px, {int(H_win.sum())} hits"),
+                                   (axB, H_tce, f"TRUTH 482 keV conversion e-\n{int((H_tce>0).sum())} px, {int(H_tce.sum())} hits")]:
+                    vmax = max(2, int(M.max()))
+                    im = ax.imshow(M, origin="lower", aspect="equal", extent=[Z0, Z1, Y0, Y1],
+                                   cmap="viridis", norm=LogNorm(vmin=1, vmax=vmax))
+                    ax.set_title(ttl, fontsize=9); ax.set_xlabel("Z (cm)  [short]")
+                    ax.plot(Zctr, Yctr, "+", ms=13, mew=1.5, color="crimson")
+                    fig.colorbar(im, ax=ax)
+                axA.set_ylabel("Y (cm)  [long, vertical]")
+                fig.suptitle("Per-line map: reconstructed charge window vs TRUTH line origin", fontsize=10)
+                fig.tight_layout()
+                o = os.path.join(args.outdir, "bi207_line_570_truth.png")
+                fig.savefig(o, dpi=140); plt.close(fig); print(f"wrote {o}")
+            elif origin is None:
+                print("  (truth line census skipped: origin unavailable -- check --edep has 'trajectories')")
 
         # ---- near-source vs far charge spectrum: can we SEE the 1064 lines? ----
         # The conversion electrons (482 & 976 keV) range out in <1 pixel, so they pile onto the
