@@ -199,7 +199,8 @@ def main():
     print(f"line-rate radial falloff: core {diag_cal['core']:.3e} line-hits/decay, exp tail lambda "
           f"{diag_cal['lam']:.1f} cm (measured out to d={diag_cal['d_max']:.0f} cm)")
 
-    # usable (line) fraction vs distance -- shows the halo is mostly wrong-energy
+    # usable (line) fraction vs distance -- in-window fraction is ~flat with radius, because
+    # the far halo is NOT a separable activity: it is the 570/1064 keV gammas of the same decay.
     DD = np.hypot(Yc[:, None] - sY, Zc[None, :] - sZ)
     frac_lines = []
     for lo, hi in [(0, 1), (1, 3), (3, 6), (6, 12), (12, 30)]:
@@ -264,8 +265,12 @@ def main():
                + ("  [LOWER-BOUND: detected count used]" if lower_bound else "") + "\n")
     out.append("Which hits calibrate? (line window vs all hits, by distance from the source):")
     out.extend(frac_lines)
-    out.append("  -> the halo beyond ~2 cm is mostly Compton continuum (wrong energy); only the line-")
-    out.append("     window hits set a pixel's gain, so coverage is built from those.\n")
+    out.append("  -> the in-window fraction is ~flat (~50%) with radius, so energy-windowing does NOT")
+    out.append("     remove the far halo: it is the 570/1064 keV GAMMAS of the same decay, not a separable")
+    out.append("     activity. Conversion e- range out in <1 pixel (<=3 mm), so only the core sees the true")
+    out.append("     K-570 e- line; far pixels calibrate on the 570 keV full-energy gamma peak (9.53 ke-)")
+    out.append("     over a 1064-Compton pedestal. The in-window count is an UPPER bound on the usable rate")
+    out.append("     until a per-pixel peak-over-continuum fit sets the real far-field resolution.\n")
     out.append("Q1 -- hits to calibrate one pixel (from the K-570 line width):")
     out.extend(["  " + l for l in q1_lines])
     out.append("")
