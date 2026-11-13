@@ -256,20 +256,26 @@ BI207_LINES = [
 
 
 def hit_primary_origin(h, data_mask, edep_path):
-    """TRUTH-match each data packet to the mono-energetic line that made it. Walk its leading
-    segment's trajectory up the parent chain to the particle emitted directly by the decaying nucleus
-    (the conversion electron, or the decay gamma whose Compton/photo electron deposited the charge),
-    and return that primary's (pdg, E_start[MeV]) -- independent of the reconstructed charge. Returns
-    (pdg, E0) int64/float64 arrays aligned to packets[data_mask] (pdg 0 / E0 nan where unresolved),
-    or None. This is the 'truth' answer to 'does this pixel really see the line, or just charge in a
-    window?': a conversion-electron origin is the real line; a gamma origin is the delocalized halo."""
+    """TRUTH-match each data packet to the mono-energetic line that made it. Attribute the hit to the
+    particle contributing the most CHARGE (sum of mc_packets_assn 'fraction' over that particle's
+    segments -- NOT the single top segment, since a high-energy track is split into many small segments
+    while a co-located soft delta/Auger dumps its energy in one), then walk that particle up its parent
+    chain to the one emitted directly by the decaying nucleus (the conversion electron, or the decay
+    gamma whose Compton/photo electron deposited the charge). Return that primary's (pdg, E_start[MeV],
+    traj_id), aligned to packets[data_mask] (pdg 0 / E0 nan where unresolved), or None. The 'truth'
+    answer to 'is this really the line, or just charge in a window?': e- origin = real local line,
+    gamma origin = delocalized halo."""
     try:
         if "mc_packets_assn" not in h or "segments" not in h:
             return None
         assn = np.asarray(h["mc_packets_assn"][:])[data_mask]
         if "segment_ids" not in (assn.dtype.names or ()):
             return None
-        sid = np.asarray(assn["segment_ids"]).reshape(assn.shape[0], -1)[:, 0].astype(np.int64)
+        segids = np.asarray(assn["segment_ids"]).reshape(assn.shape[0], -1).astype(np.int64)   # (n, K)
+        if "fraction" in (assn.dtype.names or ()):
+            frac = np.abs(np.asarray(assn["fraction"]).reshape(assn.shape[0], -1).astype(np.float64))
+        else:
+            frac = (segids >= 0).astype(np.float64)        # equal weight if no fraction stored
         seg = h["segments"]
         sn = seg.dtype.names or ()
         if not {"event_id", "traj_id"} <= set(sn):
@@ -306,15 +312,35 @@ def hit_primary_origin(h, data_mask, edep_path):
                 cur = pkey
             return 0, float("nan"), -1
 
-        pdg = np.zeros(sid.shape, np.int64); E0 = np.full(sid.shape, np.nan)
-        atid = np.full(sid.shape, -1, np.int64)      # traj_id of the directly-emitted primary (particle key)
-        ok = (sid >= 0) & (sid < seg_ev.size)
-        cache = {}
-        for i in np.nonzero(ok)[0]:
-            key = (int(seg_ev[sid[i]]), int(seg_tj[sid[i]]))
-            if key not in cache:
-                cache[key] = emitted(*key)
-            pdg[i], E0[i], atid[i] = cache[key]
+        seg_cache = {}                               # segment index -> (pdg, E_start, emitted traj_id)
+        def seg_primary(sidx):
+            r = seg_cache.get(sidx)
+            if r is None:
+                r = emitted(int(seg_ev[sidx]), int(seg_tj[sidx])) if 0 <= sidx < seg_ev.size \
+                    else (0, float("nan"), -1)
+                seg_cache[sidx] = r
+            return r
+
+        n, K = segids.shape
+        pdg = np.zeros(n, np.int64); E0 = np.full(n, np.nan); atid = np.full(n, -1, np.int64)
+        for i in range(n):
+            acc = {}                                 # emitted traj_id -> [summed fraction, pdg, E_start]
+            for j in range(K):
+                s = int(segids[i, j])
+                if s < 0:
+                    continue
+                pg, Es, tid = seg_primary(s)
+                if tid < 0:
+                    continue
+                a = acc.get(tid)
+                if a is None:
+                    acc[tid] = [float(frac[i, j]), pg, Es]
+                else:
+                    a[0] += float(frac[i, j])
+            if acc:
+                tid_best = max(acc, key=lambda t: acc[t][0])
+                _, pg, Es = acc[tid_best]
+                pdg[i], E0[i], atid[i] = pg, Es, tid_best
         return pdg, E0, atid
     except Exception as exc:
         print(f"  (truth origin unavailable: {exc!r})")
