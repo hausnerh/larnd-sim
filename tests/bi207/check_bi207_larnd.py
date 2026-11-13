@@ -293,7 +293,8 @@ def hit_primary_origin(h, data_mask, edep_path):
         idx = {(int(e), int(t)): i for i, (e, t) in enumerate(zip(tev, ttj))}
 
         def emitted(ev, tj):
-            # climb to the particle whose parent is the decaying nucleus (pdg>1e6) / primary / absent
+            # climb to the particle whose parent is the decaying nucleus (pdg>1e6) / primary / absent;
+            # return (pdg, E_start[MeV], traj_id) of that directly-emitted particle
             cur = (ev, tj)
             for _ in range(40):
                 if cur not in idx:
@@ -301,19 +302,20 @@ def hit_primary_origin(h, data_mask, edep_path):
                 i = idx[cur]; par = int(tpar[i]); pkey = (ev, par)
                 par_nucleus = pkey in idx and abs(int(tpdg[idx[pkey]])) > 1000000
                 if par < 0 or pkey not in idx or par_nucleus:
-                    return int(tpdg[i]), float(tE[i])
+                    return int(tpdg[i]), float(tE[i]), int(ttj[i])
                 cur = pkey
-            return 0, float("nan")
+            return 0, float("nan"), -1
 
         pdg = np.zeros(sid.shape, np.int64); E0 = np.full(sid.shape, np.nan)
+        atid = np.full(sid.shape, -1, np.int64)      # traj_id of the directly-emitted primary (particle key)
         ok = (sid >= 0) & (sid < seg_ev.size)
         cache = {}
         for i in np.nonzero(ok)[0]:
             key = (int(seg_ev[sid[i]]), int(seg_tj[sid[i]]))
             if key not in cache:
                 cache[key] = emitted(*key)
-            pdg[i], E0[i] = cache[key]
-        return pdg, E0
+            pdg[i], E0[i], atid[i] = cache[key]
+        return pdg, E0, atid
     except Exception as exc:
         print(f"  (truth origin unavailable: {exc!r})")
         return None
@@ -566,7 +568,8 @@ def main():
             with open_ro(args.larnd) as h2:
                 origin = hit_primary_origin(h2, dmask, args.edep)
             if origin is not None and origin[0].shape == valid.shape:
-                pdg0, E0 = origin
+                pdg0, E0, atid = origin
+                iY0, iZ0 = (Yctr - Y0) / pitch, (Zctr - Z0) / pitch   # source pixel in index space
                 e_lines = [(lab, E) for lab, E, k, _ in BI207_LINES if k == "e"]
                 g_lines = [(lab, E) for lab, E, k, _ in BI207_LINES if k in ("g", "x")]
 
@@ -594,7 +597,7 @@ def main():
                     if n == 0:
                         continue
                     qpix = int(np.unique(iY[m] * ny + iZ[m]).size)
-                    rr = float(np.sqrt(np.mean((cY[m] - Yctr) ** 2 + (cZ[m] - Zctr) ** 2)))
+                    rr = pitch * float(np.sqrt(np.mean((iY[m] - iY0) ** 2 + (iZ[m] - iZ0) ** 2)))
                     role = "LOCAL e- line" if k == "e" else ("delocalized g peak" if k == "g" else "near-threshold")
                     census.append((lab, edep_to_ke(E), n, qpix, rr, role))
                     print(f"  {lab:12s} {E*1e3:6.0f} keV {edep_to_ke(E):7.2f} ke- {n:6d} {qpix:7d} "
@@ -680,6 +683,31 @@ def main():
                 fig.tight_layout()
                 o = os.path.join(args.outdir, "bi207_line_570_truth.png")
                 fig.savefig(o, dpi=140); plt.close(fig); print(f"wrote {o}")
+
+                # ---- multiplicity: does a line split across pixels, so the peak is in the PARTICLE-
+                #      summed Q rather than a single hit? Group each line's hits by their emitting primary
+                #      (event_id, ancestor traj_id) and sum Q across that one particle's pixels. If
+                #      hits/particle>1 and summed Q lands on the line while 1-pixel Q falls short, the line
+                #      is charge-shared and must be clustered before fitting the gain.
+                if ev is not None:
+                    pk = ev.astype(np.int64) * 1000000 + atid        # unique key per emitted primary
+                    base = valid & (atid >= 0) & (ev >= 0)
+                    print("per-line multiplicity (one emitted particle's pixels, and its Q single vs summed):")
+                    print(f"  {'line':12s} {'parts':>6s} {'hits/part':>9s} {'multi%':>6s} "
+                          f"{'1pix Q':>7s} {'summedQ':>8s}   line")
+                    for lab, E, k, _ in BI207_LINES:
+                        s = base & (line == lab)
+                        if int(s.sum()) == 0:
+                            continue
+                        keys, invp = np.unique(pk[s], return_inverse=True)
+                        nper = np.bincount(invp)
+                        sq = np.zeros(keys.size); np.add.at(sq, invp, q_ke[s])
+                        one = nper == 1
+                        q1 = float(np.mean(sq[one])) if one.any() else float("nan")
+                        print(f"  {lab:12s} {keys.size:6d} {nper.mean():9.2f} {100*np.mean(nper > 1):6.0f} "
+                              f"{q1:7.2f} {np.mean(sq):8.2f}   {edep_to_ke(E):.1f} ke-")
+                    print("  -> hits/part ~1 and 1pix Q ~ summedQ  => the line sits in single hits (no clustering"
+                          " needed); hits/part>1 with summedQ > 1pix Q => charge-shared, cluster before fitting.")
             elif origin is None:
                 print("  (truth line census skipped: origin unavailable -- check --edep has 'trajectories')")
 
