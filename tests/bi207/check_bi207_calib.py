@@ -133,6 +133,7 @@ def main():
     ap.add_argument("--n-generated", type=int, default=None, help="emitted Bi-207 decays (overrides --edep)")
     ap.add_argument("--activity", type=float, default=37000.0, help="reference source activity [Bq] (E&Z Bi-207 e- source nominal 37 kBq)")
     ap.add_argument("--n-target", type=float, default=1000.0, help="line-hits/pixel that count as 'calibrated'")
+    ap.add_argument("--q-bin", type=float, default=1.0, help="charge-spectrum bin width [ke-] for the central/annulus plots")
     ap.add_argument("--line-lo", type=float, default=5.5, help="calibration line window low edge [ke-]")
     ap.add_argument("--line-hi", type=float, default=12.4, help="calibration line window high edge [ke-]")
     ap.add_argument("--outdir", default="bi207_calib")
@@ -372,13 +373,14 @@ def main():
         for lab, q0 in LINES:
             ax.axvline(q0, color="0.45", ls=":", lw=0.9)
             ax.text(q0, ytop * 0.97, lab, rotation=90, va="top", ha="right", fontsize=7, color="0.3")
-    edges = np.arange(0.0, 32.0, 0.5)
+    qb = args.q_bin
+    edges = np.arange(0.0, 32.0 + qb, qb)
     # (a) central (source-projection) pixel -- where the sharp CE lines live
     cen = valid & (iY == si) & (iZ == sj)
     fig, ax = plt.subplots(figsize=(7.6, 4.6))
     ax.hist(q_ke[cen], bins=edges, histtype="stepfilled", color="#cc6677", alpha=0.85, edgecolor="#aa3355")
     mark(ax)
-    ax.set_xlabel("Q per pixel-hit [ke-]"); ax.set_ylabel("hits / 0.5 ke-")
+    ax.set_xlabel("Q per pixel-hit [ke-]"); ax.set_ylabel(f"hits / {qb:g} ke-")
     ax.set_title(f"Central (source-projection) pixel charge spectrum  (N={int(cen.sum())} hits, {ngen} decays)", fontsize=9)
     fig.tight_layout(); fc = os.path.join(args.outdir, "bi207_central_spectrum.png")
     fig.savefig(fc, dpi=140); plt.close(fig); print(f"wrote {fc}")
@@ -398,7 +400,7 @@ def main():
         if n >= 10:
             ax.hist(qv[m], bins=edges, histtype="step", lw=1.6, density=True, label=f"{lo}-{hi} cm (N={n})")
     mark(ax)
-    ax.set_xlabel("Q per pixel-hit [ke-]"); ax.set_ylabel("normalized hits / 0.5 ke-")
+    ax.set_xlabel("Q per pixel-hit [ke-]"); ax.set_ylabel(f"normalized hits / {qb:g} ke-")
     ax.set_title(f"Charge spectrum vs radius from the source  ({ngen} decays)", fontsize=9)
     ax.legend(fontsize=8)
     fig.tight_layout(); fa = os.path.join(args.outdir, "bi207_annulus_spectra.png")
