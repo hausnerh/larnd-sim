@@ -26,6 +26,7 @@
 #SBATCH -J bi207big
 #SBATCH -C gpu
 #SBATCH -q shared
+#SBATCH -n 1
 #SBATCH -c 32
 #SBATCH --gpus-per-task=1
 #SBATCH -t 06:00:00
