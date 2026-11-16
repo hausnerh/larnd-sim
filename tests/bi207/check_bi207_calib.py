@@ -392,7 +392,9 @@ def main():
     # -> sharp) on the source pixel; the gammas interact at random depth so their full-energy edge smears
     # UP from the marked (cathode) value toward ~1.5x it. Mapping Q->energy -- which may fold in an
     # AVERAGE (not per-event) drift-loss factor -- is the LAST step, once a usable spectrum is in hand.
-    LINES = [("K-570 CE", bq.edep_to_ke(0.4817)), ("570 g", bq.edep_to_ke(0.5697)),
+    # 0.3936 MeV = the 570 keV Compton edge (E*2E/(mec2+2E) = 570*1140/1651 = 394 keV = 0.69*full);
+    # it is the LOWER of the two humps in the central spectrum, the 570 photopeak (0.5697) is the upper.
+    LINES = [("570 Cedge", bq.edep_to_ke(0.3936)), ("K-570 CE", bq.edep_to_ke(0.4817)), ("570 g", bq.edep_to_ke(0.5697)),
              ("K-1064 CE", bq.edep_to_ke(0.9757)), ("1064 g", bq.edep_to_ke(1.0637)),
              ("1770 g", bq.edep_to_ke(1.7703))]
     def mark(ax):
@@ -402,13 +404,34 @@ def main():
             ax.text(q0, ytop * 0.97, lab, rotation=90, va="top", ha="right", fontsize=7, color="0.3")
     qb = args.q_bin
     edges = np.arange(0.0, 32.0 + qb, qb)
-    # (a) central (source-projection) pixel -- where the sharp CE lines live
+    # (a) central (source-projection) pixel -- where the sharp CE lines live.
+    #   PER-HIT vs PER-PIXEL Q-SUM: the FEE can split one large deposit into 2-3 packets on the SAME
+    #   pixel (threshold re-trigger). Per-hit Q then undercounts the biggest deposits (the high-energy
+    #   lines) -- they fall back into the 570 region as sub-packets. Summing the packets one decay puts
+    #   on THIS pixel (group by event) is the within-pixel energy estimator; overlay it to see whether
+    #   the 16-18 ke- (1064) region sharpens. (It does NOT recover charge SHARED to neighbour pixels --
+    #   that is a cross-pixel cluster sum -- nor energy lost to Compton escape.)
     cen = valid & (iY == si) & (iZ == sj)
+    cev = ev[cen]
+    if cev.size and (cev >= 0).any():
+        uev, inv = np.unique(cev, return_inverse=True)
+        cen_sum = np.zeros(uev.size); np.add.at(cen_sum, inv, q_ke[cen])
+        mult = np.bincount(inv)
+        hi = 14.0  # "high-energy" boundary: above the 570 complex, toward K-1064 CE (16.3)/1064 g (17.8)
+        f_hit = float((q_ke[cen] >= hi).mean()); f_sum = float((cen_sum >= hi).mean())
+        print(f"  central-pixel Q-SUM test: {cen.sum()} packets -> {uev.size} pixel-deposits; "
+              f"{int((mult > 1).sum())} deposits ({100.0*(mult > 1).mean():.1f}%) fired >1 packet (max {int(mult.max())})")
+        print(f"    fraction of entries above {hi:g} ke-:  per-hit {100*f_hit:.2f}%  ->  per-pixel-sum {100*f_sum:.2f}%  "
+              f"({'sharpens the high-E tail' if f_sum > 1.3*f_hit else 'little change -- splitting is not what hides the 1064'})")
+    else:
+        cen_sum = q_ke[cen]
     fig, ax = plt.subplots(figsize=(7.6, 4.6))
-    ax.hist(q_ke[cen], bins=edges, histtype="stepfilled", color="#cc6677", alpha=0.85, edgecolor="#aa3355")
+    ax.hist(q_ke[cen], bins=edges, histtype="stepfilled", color="#cc6677", alpha=0.75, edgecolor="#aa3355", label=f"per hit (packets, N={int(cen.sum())})")
+    ax.hist(cen_sum, bins=edges, histtype="step", color="#1f4e79", lw=1.8, label=f"per-pixel Q-sum (deposits, N={int(cen_sum.size)})")
     mark(ax)
-    ax.set_xlabel("Q per pixel-hit [ke-]"); ax.set_ylabel(f"hits / {qb:g} ke-")
-    ax.set_title(f"Central (source-projection) pixel charge spectrum  (N={int(cen.sum())} hits, {ngen} decays)", fontsize=9)
+    ax.set_xlabel("Q [ke-]"); ax.set_ylabel(f"entries / {qb:g} ke-")
+    ax.legend(fontsize=8, loc="upper right")
+    ax.set_title(f"Central (source-projection) pixel charge spectrum  ({ngen} decays)", fontsize=9)
     fig.tight_layout(); fc = os.path.join(args.outdir, "bi207_central_spectrum.png")
     fig.savefig(fc, dpi=140); plt.close(fig); print(f"wrote {fc}")
     # (b) annulus spectra vs radius from the source projection
