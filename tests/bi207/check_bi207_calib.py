@@ -356,6 +356,58 @@ def main():
     plt.close(fig)
     print(f"wrote {f3}")
 
+    # ---- (4) gamma full-energy peaks vs exposure (the DELOCALIZED, every-pixel calibration handle) ----
+    # The conversion-electron lines calibrate only the source pixel (the source's drift-projection); the
+    # 570/1064/1770 keV gammas put a full-energy peak on EVERY pixel -- if it clears the Compton floor.
+    # Measure each peak's excess S over the sideband continuum B in this sample, then project: the
+    # plane-integrated significance now (is the line visible in the detector at all?) and the per-pixel
+    # exposure to 50 counts (a visible per-pixel peak) and 1000 counts (calibration grade), averaged
+    # over the plane (pixels near the source reach it sooner; the far corners later).
+    def _fmt_t(days):
+        s = days * 86400.0
+        if s < 90:      return f"{s:.0f}s"
+        if s < 5400:    return f"{s/60:.0f}min"
+        if s < 2*86400: return f"{s/3600:.1f}h"
+        return f"{days:.1f}d"
+
+    q = q_ke[valid]
+    GLINES = [("570", bq.edep_to_ke(0.5697)), ("1064", bq.edep_to_ke(1.0637)), ("1770", bq.edep_to_ke(1.7703))]
+    w = 2.0                                              # half-window [ke-] ~ full-energy peak resolution
+    gout = ["", "Gamma full-energy peaks vs exposure (delocalized -> every pixel; S,B within +/-2 ke-):",
+            f"  {'line':5s}{'Q[ke-]':>8s}{'S':>6s}{'B':>6s}{'S/B':>6s}{'Z_plane':>8s}"
+            f"{'t/pix 50ct':>12s}{'t/pix 1kct':>12s}  (@{A/1000:.0f} kBq)"]
+    for name, q0 in GLINES:
+        win = (q >= q0 - w) & (q <= q0 + w)
+        sb = ((q >= q0 - 3 * w) & (q < q0 - w)) | ((q > q0 + w) & (q <= q0 + 3 * w))
+        B = int(sb.sum()) / 2.0                          # sidebands span 2x the window -> halve
+        S = max(int(win.sum()) - B, 0.0)
+        znow = S / np.sqrt(max(B, 1.0))                  # plane-integrated significance in THIS sample
+        s_pix = S / (ngen * npix)                        # plane-average full-energy rate [hits/decay/pixel]
+        if s_pix > 0:
+            tt = f"{_fmt_t(50.0/(s_pix*A)/86400.0):>12s}{_fmt_t(1000.0/(s_pix*A)/86400.0):>12s}"
+        else:
+            tt = f"{'--':>12s}{'--':>12s}"
+        gout.append(f"  {name:5s}{q0:8.2f}{S:6.0f}{B:6.0f}{S/max(B,1):6.1f}{znow:8.1f}{tt}")
+    gout.append("  Z_plane = peak significance in THIS sample (plane-integrated; >3 => already visible in")
+    gout.append("  the detector). t/pix = exposure for the plane-AVERAGE pixel to reach a visible (50) /")
+    gout.append("  calibration-grade (1000) peak; near-source pixels sooner, far corners later.")
+    for ln in gout:
+        print(ln)
+    out.extend(gout)
+    fig, ax = plt.subplots(figsize=(7.8, 4.8))
+    edges = np.arange(0.0, 34.0, 0.4)
+    ax.hist(q, bins=edges, histtype="stepfilled", color="#c5d2e2", edgecolor="#5577aa", lw=0.8)
+    ymax = ax.get_ylim()[1]
+    for name, q0 in GLINES:
+        ax.axvline(q0, color="crimson", ls="--", lw=1.1)
+        ax.text(q0, ymax * 0.8, f"{name} g {q0:.1f}", rotation=90, va="top", ha="right", fontsize=8, color="crimson")
+    ax.set_yscale("log")
+    ax.set_xlabel("Q per pixel-hit [ke-]"); ax.set_ylabel("hits / 0.4 ke-")
+    ax.set_title("Charge spectrum (log): 570/1064/1770 keV gamma full-energy peaks on the Compton background", fontsize=9)
+    fig.tight_layout()
+    fg = os.path.join(args.outdir, "bi207_gamma_peaks.png")
+    fig.savefig(fg, dpi=140); plt.close(fig); print(f"wrote {fg}")
+
     # ---- text summary + npz dump ----
     txt = os.path.join(args.outdir, "bi207_calib.txt")
     with open(txt, "w") as f:
