@@ -432,8 +432,10 @@ def main():
     ax.legend(fontsize=8)
     fig.tight_layout(); fa = os.path.join(args.outdir, "bi207_annulus_spectra.png")
     fig.savefig(fa, dpi=140); plt.close(fig); print(f"wrote {fa}")
-    aout.append("  5000 decays is thin per pixel; annuli pool many pixels for a preview. ~1 day of")
-    aout.append("  activity (the big sample) is what gives real PER-PIXEL peaks.")
+    aout.append(f"  {ngen} decays: the core pixel is well-populated but most pixels are thin, so annuli")
+    aout.append("  pool many pixels -- the 570 peak shows at every radius. Single-pixel (un-pooled) 570")
+    aout.append("  fits off the core need a larger sample; the 1064/1770 peaks are Compton-suppressed and")
+    aout.append("  do not resolve at any stats (sigma ~= 4.6 ke-, 570->1064 gap only ~1.8 sigma).")
     for ln in aout:
         print(ln)
     out.extend(aout)
