@@ -238,6 +238,37 @@ def hit_pixel_ids(h, data_mask, detector):
         return None
 
 
+def hit_drift_fraction(h, data_mask, detector):
+    """Per data-hit drift fraction f in [0,1] (0 = anode, 1 = cathode), from the leading segment's drift
+    (larnd-z) coordinate. Returns a float array aligned to packets[data_mask] (nan where unresolved),
+    or None. Lets us undo the depth-dependent drift attenuation (q = q0 * DRIFT_ATTEN**f) so the gamma
+    full-energy charge lines -- smeared across interaction depth -- collapse back to sharp peaks:
+    q_cathode = q * DRIFT_ATTEN**(1-f)."""
+    try:
+        if "mc_packets_assn" not in h or "segments" not in h:
+            return None
+        assn = np.asarray(h["mc_packets_assn"][:])[data_mask]
+        if "segment_ids" not in (assn.dtype.names or ()):
+            return None
+        sid = np.asarray(assn["segment_ids"]).reshape(assn.shape[0], -1)[:, 0].astype(np.int64)
+        seg = h["segments"]; sn = seg.dtype.names or ()
+        if "z" in sn:
+            sz = np.asarray(seg["z"][:], float)
+        elif "z_start" in sn and "z_end" in sn:
+            sz = 0.5 * (np.asarray(seg["z_start"][:], float) + np.asarray(seg["z_end"][:], float))
+        else:
+            return None
+        b = np.asarray(detector.TPC_BORDERS)[0]
+        za, zc = float(b[2][0]), float(b[2][1])          # drift (larnd-z) range: [anode, cathode]
+        f = np.full(sid.shape, np.nan)
+        ok = (sid >= 0) & (sid < sz.size)
+        f[ok] = (za - sz[sid[ok]]) / (za - zc)
+        return np.clip(f, 0.0, 1.0)
+    except Exception as exc:
+        print(f"  (drift fraction unavailable: {exc!r})")
+        return None
+
+
 # Bi-207 mono-energetic lines that could anchor a per-pixel calibration (energy of the emitted
 # particle [MeV], label, kind). Conversion electrons (e-) are LOCAL (range <1 px -> they only light
 # the source pixel, but give a clean mono line there). Full-energy gamma peaks (g) are DELOCALIZED

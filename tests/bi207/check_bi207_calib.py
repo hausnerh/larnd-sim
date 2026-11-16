@@ -150,6 +150,7 @@ def main():
         q_ke = (adc + 0.5 - intercept) / (slope * 1.0e3)
         ev = bq.event_id_per_data_packet(h, dmask)
         pix = bq.hit_pixel_ids(h, dmask, detector)
+        fdrift = bq.hit_drift_fraction(h, dmask, detector)   # drift fraction (0 anode, 1 cathode) per hit
     if pix is None:
         sys.exit("could not map packets to pixels")
     from larndsim.pixels_from_track import id2pixel
@@ -357,12 +358,13 @@ def main():
     print(f"wrote {f3}")
 
     # ---- (4) gamma full-energy peaks vs exposure (the DELOCALIZED, every-pixel calibration handle) ----
-    # The conversion-electron lines calibrate only the source pixel (the source's drift-projection); the
-    # 570/1064/1770 keV gammas put a full-energy peak on EVERY pixel -- if it clears the Compton floor.
-    # Measure each peak's excess S over the sideband continuum B in this sample, then project: the
-    # plane-integrated significance now (is the line visible in the detector at all?) and the per-pixel
-    # exposure to 50 counts (a visible per-pixel peak) and 1000 counts (calibration grade), averaged
-    # over the plane (pixels near the source reach it sooner; the far corners later).
+    # CE lines calibrate only the source pixel (its drift-projection); the 570/1064/1770 keV gammas put a
+    # full-energy peak on EVERY pixel. But gammas interact at random DEPTH, and drift attenuation
+    # (q = q0 * DRIFT_ATTEN**f, f = 0 anode .. 1 cathode) smears each line into a ~1.5x band -- so we
+    # DRIFT-CORRECT (q_cathode = q * DRIFT_ATTEN**(1-f)) to collapse the bands back to sharp lines (a
+    # source gives a per-decay t0, so drift time is measurable -- not a truth-only trick). Then measure
+    # each peak's excess S over the sideband continuum B, and project the per-pixel exposure to a visible
+    # (50-count) / calibration-grade (1000-count) peak.
     def _fmt_t(days):
         s = days * 86400.0
         if s < 90:      return f"{s:.0f}s"
@@ -370,10 +372,16 @@ def main():
         if s < 2*86400: return f"{s/3600:.1f}h"
         return f"{days:.1f}d"
 
-    q = q_ke[valid]
+    if fdrift is not None:
+        q_cor = q_ke * np.where(np.isfinite(fdrift), bq.DRIFT_ATTEN ** (1.0 - fdrift), 1.0)
+        dtag = "drift-corrected"
+    else:
+        q_cor = q_ke
+        dtag = "RAW (no per-hit drift info)"
+    qraw, q = q_ke[valid], q_cor[valid]
     GLINES = [("570", bq.edep_to_ke(0.5697)), ("1064", bq.edep_to_ke(1.0637)), ("1770", bq.edep_to_ke(1.7703))]
-    w = 2.0                                              # half-window [ke-] ~ full-energy peak resolution
-    gout = ["", "Gamma full-energy peaks vs exposure (delocalized -> every pixel; S,B within +/-2 ke-):",
+    w = 1.5                                              # half-window [ke-]; peaks are sharp post-correction
+    gout = ["", f"Gamma full-energy peaks vs exposure ({dtag}; delocalized -> every pixel; +/-{w:.1f} ke-):",
             f"  {'line':5s}{'Q[ke-]':>8s}{'S':>6s}{'B':>6s}{'S/B':>6s}{'Z_plane':>8s}"
             f"{'t/pix 50ct':>12s}{'t/pix 1kct':>12s}  (@{A/1000:.0f} kBq)"]
     for name, q0 in GLINES:
@@ -388,22 +396,24 @@ def main():
         else:
             tt = f"{'--':>12s}{'--':>12s}"
         gout.append(f"  {name:5s}{q0:8.2f}{S:6.0f}{B:6.0f}{S/max(B,1):6.1f}{znow:8.1f}{tt}")
-    gout.append("  Z_plane = peak significance in THIS sample (plane-integrated; >3 => already visible in")
-    gout.append("  the detector). t/pix = exposure for the plane-AVERAGE pixel to reach a visible (50) /")
-    gout.append("  calibration-grade (1000) peak; near-source pixels sooner, far corners later.")
+    gout.append("  Z_plane>3 => the line is already visible in the detector (plane-integrated). t/pix =")
+    gout.append("  exposure for the plane-AVERAGE pixel to a visible(50)/calibratable(1000) peak over its")
+    gout.append("  own Compton; near-source pixels sooner, far corners later.")
     for ln in gout:
         print(ln)
     out.extend(gout)
     fig, ax = plt.subplots(figsize=(7.8, 4.8))
     edges = np.arange(0.0, 34.0, 0.4)
-    ax.hist(q, bins=edges, histtype="stepfilled", color="#c5d2e2", edgecolor="#5577aa", lw=0.8)
+    ax.hist(qraw, bins=edges, histtype="step", color="#aaaaaa", lw=1.3, label="raw (depth-smeared)")
+    ax.hist(q, bins=edges, histtype="stepfilled", color="#c5d2e2", edgecolor="#3366aa", lw=0.9, label=dtag)
     ymax = ax.get_ylim()[1]
     for name, q0 in GLINES:
         ax.axvline(q0, color="crimson", ls="--", lw=1.1)
         ax.text(q0, ymax * 0.8, f"{name} g {q0:.1f}", rotation=90, va="top", ha="right", fontsize=8, color="crimson")
     ax.set_yscale("log")
     ax.set_xlabel("Q per pixel-hit [ke-]"); ax.set_ylabel("hits / 0.4 ke-")
-    ax.set_title("Charge spectrum (log): 570/1064/1770 keV gamma full-energy peaks on the Compton background", fontsize=9)
+    ax.set_title("Gamma full-energy peaks: raw (depth-smeared) vs drift-corrected", fontsize=10)
+    ax.legend(fontsize=8)
     fig.tight_layout()
     fg = os.path.join(args.outdir, "bi207_gamma_peaks.png")
     fig.savefig(fg, dpi=140); plt.close(fig); print(f"wrote {fg}")
