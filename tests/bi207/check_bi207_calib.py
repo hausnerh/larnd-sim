@@ -150,7 +150,6 @@ def main():
         q_ke = (adc + 0.5 - intercept) / (slope * 1.0e3)
         ev = bq.event_id_per_data_packet(h, dmask)
         pix = bq.hit_pixel_ids(h, dmask, detector)
-        fdrift = bq.hit_drift_fraction(h, dmask, detector)   # drift fraction (0 anode, 1 cathode) per hit
     if pix is None:
         sys.exit("could not map packets to pixels")
     from larndsim.pixels_from_track import id2pixel
@@ -357,66 +356,58 @@ def main():
     plt.close(fig)
     print(f"wrote {f3}")
 
-    # ---- (4) gamma full-energy peaks vs exposure (the DELOCALIZED, every-pixel calibration handle) ----
-    # CE lines calibrate only the source pixel (its drift-projection); the 570/1064/1770 keV gammas put a
-    # full-energy peak on EVERY pixel. But gammas interact at random DEPTH, and drift attenuation
-    # (q = q0 * DRIFT_ATTEN**f, f = 0 anode .. 1 cathode) smears each line into a ~1.5x band -- so we
-    # DRIFT-CORRECT (q_cathode = q * DRIFT_ATTEN**(1-f)) to collapse the bands back to sharp lines (a
-    # source gives a per-decay t0, so drift time is measurable -- not a truth-only trick). Then measure
-    # each peak's excess S over the sideband continuum B, and project the per-pixel exposure to a visible
-    # (50-count) / calibration-grade (1000-count) peak.
-    def _fmt_t(days):
-        s = days * 86400.0
-        if s < 90:      return f"{s:.0f}s"
-        if s < 5400:    return f"{s/60:.0f}min"
-        if s < 2*86400: return f"{s/3600:.1f}h"
-        return f"{days:.1f}d"
-
-    if fdrift is not None:
-        q_cor = q_ke * np.where(np.isfinite(fdrift), bq.DRIFT_ATTEN ** (1.0 - fdrift), 1.0)
-        dtag = "drift-corrected"
-    else:
-        q_cor = q_ke
-        dtag = "RAW (no per-hit drift info)"
-    qraw, q = q_ke[valid], q_cor[valid]
-    GLINES = [("570", bq.edep_to_ke(0.5697)), ("1064", bq.edep_to_ke(1.0637)), ("1770", bq.edep_to_ke(1.7703))]
-    w = 1.5                                              # half-window [ke-]; peaks are sharp post-correction
-    gout = ["", f"Gamma full-energy peaks vs exposure ({dtag}; delocalized -> every pixel; +/-{w:.1f} ke-):",
-            f"  {'line':5s}{'Q[ke-]':>8s}{'S':>6s}{'B':>6s}{'S/B':>6s}{'Z_plane':>8s}"
-            f"{'t/pix 50ct':>12s}{'t/pix 1kct':>12s}  (@{A/1000:.0f} kBq)"]
-    for name, q0 in GLINES:
-        win = (q >= q0 - w) & (q <= q0 + w)
-        sb = ((q >= q0 - 3 * w) & (q < q0 - w)) | ((q > q0 + w) & (q <= q0 + 3 * w))
-        B = int(sb.sum()) / 2.0                          # sidebands span 2x the window -> halve
-        S = max(int(win.sum()) - B, 0.0)
-        znow = S / np.sqrt(max(B, 1.0))                  # plane-integrated significance in THIS sample
-        s_pix = S / (ngen * npix)                        # plane-average full-energy rate [hits/decay/pixel]
-        if s_pix > 0:
-            tt = f"{_fmt_t(50.0/(s_pix*A)/86400.0):>12s}{_fmt_t(1000.0/(s_pix*A)/86400.0):>12s}"
-        else:
-            tt = f"{'--':>12s}{'--':>12s}"
-        gout.append(f"  {name:5s}{q0:8.2f}{S:6.0f}{B:6.0f}{S/max(B,1):6.1f}{znow:8.1f}{tt}")
-    gout.append("  Z_plane>3 => the line is already visible in the detector (plane-integrated). t/pix =")
-    gout.append("  exposure for the plane-AVERAGE pixel to a visible(50)/calibratable(1000) peak over its")
-    gout.append("  own Compton; near-source pixels sooner, far corners later.")
-    for ln in gout:
-        print(ln)
-    out.extend(gout)
+    # ---- (4) DATA-DRIVEN charge spectra: exactly what a real per-pixel source calibration measures ----
+    # NO event-by-event drift correction: a real Compton interaction has no t0/depth tag, so its drift
+    # loss is unknown. We just histogram the MEASURED charge per pixel / per annulus and ask the real
+    # questions: how many calibration peaks show at the central (source-projection) pixel, and how does
+    # the spectrum change with radius? The conversion-electron lines sit at the CATHODE (fixed full drift
+    # -> sharp) on the source pixel; the gammas interact at random depth so their full-energy edge smears
+    # UP from the marked (cathode) value toward ~1.5x it. Mapping Q->energy -- which may fold in an
+    # AVERAGE (not per-event) drift-loss factor -- is the LAST step, once a usable spectrum is in hand.
+    LINES = [("K-570 CE", bq.edep_to_ke(0.4817)), ("570 g", bq.edep_to_ke(0.5697)),
+             ("K-1064 CE", bq.edep_to_ke(0.9757)), ("1064 g", bq.edep_to_ke(1.0637)),
+             ("1770 g", bq.edep_to_ke(1.7703))]
+    def mark(ax):
+        ytop = ax.get_ylim()[1]
+        for lab, q0 in LINES:
+            ax.axvline(q0, color="0.45", ls=":", lw=0.9)
+            ax.text(q0, ytop * 0.97, lab, rotation=90, va="top", ha="right", fontsize=7, color="0.3")
+    edges = np.arange(0.0, 32.0, 0.5)
+    # (a) central (source-projection) pixel -- where the sharp CE lines live
+    cen = valid & (iY == si) & (iZ == sj)
+    fig, ax = plt.subplots(figsize=(7.6, 4.6))
+    ax.hist(q_ke[cen], bins=edges, histtype="stepfilled", color="#cc6677", alpha=0.85, edgecolor="#aa3355")
+    mark(ax)
+    ax.set_xlabel("Q per pixel-hit [ke-]"); ax.set_ylabel("hits / 0.5 ke-")
+    ax.set_title(f"Central (source-projection) pixel charge spectrum  (N={int(cen.sum())} hits, {ngen} decays)", fontsize=9)
+    fig.tight_layout(); fc = os.path.join(args.outdir, "bi207_central_spectrum.png")
+    fig.savefig(fc, dpi=140); plt.close(fig); print(f"wrote {fc}")
+    # (b) annulus spectra vs radius from the source projection
+    qv = q_ke[valid]
+    Rh = np.hypot(Yc[iY[valid]] - sY, Zc[iZ[valid]] - sZ)
+    anns = [(0, 1), (1, 3), (3, 6), (6, 15), (15, 30)]
     fig, ax = plt.subplots(figsize=(7.8, 4.8))
-    edges = np.arange(0.0, 34.0, 0.4)
-    ax.hist(qraw, bins=edges, histtype="step", color="#aaaaaa", lw=1.3, label="raw (depth-smeared)")
-    ax.hist(q, bins=edges, histtype="stepfilled", color="#c5d2e2", edgecolor="#3366aa", lw=0.9, label=dtag)
-    ymax = ax.get_ylim()[1]
-    for name, q0 in GLINES:
-        ax.axvline(q0, color="crimson", ls="--", lw=1.1)
-        ax.text(q0, ymax * 0.8, f"{name} g {q0:.1f}", rotation=90, va="top", ha="right", fontsize=8, color="crimson")
-    ax.set_yscale("log")
-    ax.set_xlabel("Q per pixel-hit [ke-]"); ax.set_ylabel("hits / 0.4 ke-")
-    ax.set_title("Gamma full-energy peaks: raw (depth-smeared) vs drift-corrected", fontsize=10)
+    aout = ["", f"Data-driven charge spectra ({ngen} decays; NO per-event drift correction):",
+            f"  central (source) pixel: {int(cen.sum())} hits",
+            f"  {'annulus':>9s}{'pixels':>8s}{'hits':>7s}"]
+    for lo, hi in anns:
+        m = (Rh >= lo) & (Rh < hi)
+        n = int(m.sum())
+        npx = int(np.unique(iY[valid][m] * ny + iZ[valid][m]).size) if n else 0
+        aout.append(f"  {f'{lo}-{hi}cm':>9s}{npx:8d}{n:7d}")
+        if n >= 10:
+            ax.hist(qv[m], bins=edges, histtype="step", lw=1.6, density=True, label=f"{lo}-{hi} cm (N={n})")
+    mark(ax)
+    ax.set_xlabel("Q per pixel-hit [ke-]"); ax.set_ylabel("normalized hits / 0.5 ke-")
+    ax.set_title(f"Charge spectrum vs radius from the source  ({ngen} decays)", fontsize=9)
     ax.legend(fontsize=8)
-    fig.tight_layout()
-    fg = os.path.join(args.outdir, "bi207_gamma_peaks.png")
-    fig.savefig(fg, dpi=140); plt.close(fig); print(f"wrote {fg}")
+    fig.tight_layout(); fa = os.path.join(args.outdir, "bi207_annulus_spectra.png")
+    fig.savefig(fa, dpi=140); plt.close(fig); print(f"wrote {fa}")
+    aout.append("  5000 decays is thin per pixel; annuli pool many pixels for a preview. ~1 day of")
+    aout.append("  activity (the big sample) is what gives real PER-PIXEL peaks.")
+    for ln in aout:
+        print(ln)
+    out.extend(aout)
 
     # ---- text summary + npz dump ----
     txt = os.path.join(args.outdir, "bi207_calib.txt")
