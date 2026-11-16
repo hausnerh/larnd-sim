@@ -378,6 +378,58 @@ def hit_primary_origin(h, data_mask, edep_path):
         return None
 
 
+def emitted_deposited_energy(h, edep_path):
+    """Total TRUTH deposited energy [MeV] per emitted quantum, keyed (event_id, emitted_traj_id):
+    sum segment dE over every segment whose ancestry roots to that directly-emitted particle (the
+    decay gamma or the conversion electron). This is DRIFT-INDEPENDENT, so it cleanly tags a full
+    gamma absorption (photopeak) vs a Compton escape -- which the measured charge cannot, because
+    drift attenuation (0.667-1.0x) also pulls full absorptions down into the Compton region.
+    Returns {} if the truth tables are unavailable."""
+    try:
+        if "segments" not in h:
+            return {}
+        seg = h["segments"]; sn = seg.dtype.names or ()
+        if not {"event_id", "traj_id", "dE"} <= set(sn):
+            return {}
+        seg_ev = np.asarray(seg["event_id"][:]).astype(np.int64)
+        seg_tj = np.asarray(seg["traj_id"][:]).astype(np.int64)
+        seg_dE = np.asarray(seg["dE"][:]).astype(np.float64)
+        with open_ro(edep_path) as he:
+            if "trajectories" not in he:
+                return {}
+            tr = np.asarray(he["trajectories"][:])
+        tn = tr.dtype.names or ()
+        if not {"event_id", "traj_id", "parent_id", "pdg_id"} <= set(tn):
+            return {}
+        tev = tr["event_id"].astype(np.int64); ttj = tr["traj_id"].astype(np.int64)
+        tpar = tr["parent_id"].astype(np.int64); tpdg = tr["pdg_id"].astype(np.int64)
+        idx = {(int(e), int(t)): i for i, (e, t) in enumerate(zip(tev, ttj))}
+        root_cache = {}
+        def root(ev, tj):                                   # emitted-quantum key for a trajectory
+            key = (ev, tj)
+            r = root_cache.get(key)
+            if r is not None:
+                return r
+            cur = key
+            for _ in range(40):
+                if cur not in idx:
+                    break
+                i = idx[cur]; par = int(tpar[i]); pkey = (ev, par)
+                par_nucleus = pkey in idx and abs(int(tpdg[idx[pkey]])) > 1000000
+                if par < 0 or pkey not in idx or par_nucleus:
+                    root_cache[key] = (ev, int(ttj[i])); return root_cache[key]
+                cur = pkey
+            root_cache[key] = key; return key
+        Edep = {}
+        for s in range(seg_ev.size):
+            rk = root(int(seg_ev[s]), int(seg_tj[s]))
+            Edep[rk] = Edep.get(rk, 0.0) + float(seg_dE[s])
+        return Edep
+    except Exception as exc:
+        print(f"  (emitted deposited energy unavailable: {exc!r})")
+        return {}
+
+
 def main():
     ap = argparse.ArgumentParser(description="Decode the larnd-sim FEE (LARND) output to charge, fit "
                                              "the Bi-207 K-570 line, and map pixel coverage. No ndlar_flow.")
@@ -624,6 +676,7 @@ def main():
         if getattr(args, "edep", None):
             with open_ro(args.larnd) as h2:
                 origin = hit_primary_origin(h2, dmask, args.edep)
+                Edep_emitted = emitted_deposited_energy(h2, args.edep) if origin is not None else {}
             if origin is not None and origin[0].shape == valid.shape:
                 pdg0, E0, atid = origin
                 iY0, iZ0 = (Yctr - Y0) / pitch, (Zctr - Z0) / pitch   # source pixel in index space
@@ -721,6 +774,50 @@ def main():
                     fig.tight_layout()
                     o = os.path.join(args.outdir, "bi207_charge_by_truth.png")
                     fig.savefig(o, dpi=140); plt.close(fig); print(f"wrote {o}")
+
+                # Plot B2: the measured Q spectrum colored by INTERACTION MECHANISM (not just which
+                # quantum). Truth deposited energy (drift-independent) splits gamma hits into FULL
+                # absorption (photopeak) vs PARTIAL / Compton escape, beside the conversion/Auger
+                # electrons -- so it shows which mechanism makes each hump of the central double-peak.
+                # The gamma full/partial split is robust (gamma ancestry + truth dE); the e- (CE) tag
+                # is the known-fragile part (soft-electron mis-attribution), so read it as indicative.
+                if Edep_emitted:
+                    edh = np.array([Edep_emitted.get((int(ev[i]), int(atid[i])), np.nan)
+                                    for i in range(atid.size)])
+                    isg = valid & (pdg0 == 22) & np.isfinite(edh) & np.isfinite(Ek)
+                    proc = np.full(valid.shape, "", dtype=object)
+                    proc[isg & (edh >= 0.9 * Ek)] = "gamma full (photopeak)"
+                    proc[isg & (edh < 0.9 * Ek)] = "gamma partial (Compton)"
+                    proc[valid & (np.abs(pdg0) == 11)] = "conv/Auger e-"
+                    proc[valid & (proc == "")] = "other/unresolved"
+                    porder = ["gamma full (photopeak)", "gamma partial (Compton)", "conv/Auger e-", "other/unresolved"]
+                    pcol = {"gamma full (photopeak)": "#4477aa", "gamma partial (Compton)": "#88ccee",
+                            "conv/Auger e-": "#cc6677", "other/unresolved": "0.8"}
+                    ppres = [p for p in porder if int((proc == p).sum()) > 0]
+                    edges = adc_aligned_edges(0.0, args.qmax, slope, intercept, args.nadc)
+                    fig, ax = plt.subplots(figsize=(7.6, 4.9))
+                    ax.hist([q_ke[proc == p] for p in ppres], bins=edges, stacked=True,
+                            histtype="stepfilled", color=[pcol[p] for p in ppres],
+                            label=[f"{p} ({int((proc == p).sum())})" for p in ppres])
+                    for lab, E, k, _ in BI207_LINES:
+                        ax.axvline(edep_to_ke(E), color="0.4", ls=":", lw=0.8)
+                    qce = edep_to_ke(0.3936)                     # 570 Compton edge (394 keV)
+                    ax.axvline(qce, color="crimson", ls="--", lw=1.0)
+                    ax.text(qce, ax.get_ylim()[1] * 0.5, "570 Compton edge", rotation=90,
+                            va="center", ha="right", fontsize=7, color="crimson")
+                    ax.set_xlim(0, args.qmax)
+                    ax.set_title("Collected charge by INTERACTION MECHANISM (truth dE: full vs Compton)", fontsize=9)
+                    ax.set_xlabel("Q per pixel-hit [ke-]"); ax.set_ylabel(f"hits / {args.nadc} ADC count")
+                    ax.legend(loc="upper right", fontsize=8)
+                    fig.tight_layout()
+                    o = os.path.join(args.outdir, "bi207_charge_by_process.png")
+                    fig.savefig(o, dpi=140); plt.close(fig); print(f"wrote {o}")
+                    lo_m = valid & (q_ke >= 5.0) & (q_ke < 7.5)      # lower hump (Compton-edge region)
+                    hi_m = valid & (q_ke >= 8.5) & (q_ke < 10.5)     # upper hump (photopeak region)
+                    print("  double-peak decomposition -- hits by mechanism in each hump:")
+                    for p in ppres:
+                        print(f"    {p:26s} lower[5-7.5] {int((lo_m & (proc == p)).sum()):6d}   "
+                              f"upper[8.5-10.5] {int((hi_m & (proc == p)).sum()):6d}")
 
                 # Plot C: 570 complex -- charge-window selection vs TRUTH conversion-electron origin, to
                 # show the window map's spread is gamma, not the local K-570 electron line.
