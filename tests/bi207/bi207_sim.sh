@@ -31,11 +31,16 @@ bi207_gun()
   local pos="${ND_VERTEX}" mac=bi207.mac
   if [ $# -ge 3 ]; then pos="$1 $2 $3"; shift 3; fi
   [ -n "$1" ] && mac=$1
+  # Distinct RNG seeds per chunk (BI207_SEED) so parallel array tasks generate DIFFERENT decays --
+  # without this every task would reproduce the SAME events and add no statistics. Empty = Geant4 default.
+  local seedline=""
+  [ -n "${BI207_SEED:-}" ] && seedline="/random/setSeeds ${BI207_SEED} $((BI207_SEED + 1))"
   cat > "${mac}" <<EOF
 /edep/hitSeparation ${ND_SD} -1 mm
 /edep/hitSagitta    ${ND_SD} 1.0 mm
 /edep/hitLength     ${ND_SD} 1.0 mm
 /edep/update
+${seedline}
 # Bi-207 ion at rest; G4RadioactiveDecay (requires PHYSLIST=Shielding) emits the full EC cascade
 /gps/particle ion
 /gps/ion 83 207 0 0

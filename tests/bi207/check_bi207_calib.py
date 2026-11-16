@@ -128,8 +128,8 @@ def radial_model(R, Yc, Zc, sY, sZ, pitch, n_ann=28):
 
 def main():
     ap = argparse.ArgumentParser(description="Bi-207 per-pixel calibration time + multi-source study.")
-    ap.add_argument("larnd", help="larnd-sim FEE output (…_fsd.LARND.h5)")
-    ap.add_argument("--edep", default=None, help="EDEPSIM (…_fsd.EDEPSIM.h5) to count EMITTED decays")
+    ap.add_argument("larnd", nargs="+", help="larnd-sim FEE output(s) (…_fsd.LARND.h5); pass a glob to aggregate chunks")
+    ap.add_argument("--edep", nargs="+", default=None, help="EDEPSIM (…EDEPSIM.h5) file(s) to count EMITTED decays (summed over chunks)")
     ap.add_argument("--n-generated", type=int, default=None, help="emitted Bi-207 decays (overrides --edep)")
     ap.add_argument("--activity", type=float, default=37000.0, help="reference source activity [Bq] (E&Z Bi-207 e- source nominal 37 kBq)")
     ap.add_argument("--n-target", type=float, default=1000.0, help="line-hits/pixel that count as 'calibrated'")
@@ -143,23 +143,39 @@ def main():
     detector, _ = bq.load_fsd_cube_config()
     slope, intercept, dtype = bq.adc_linear(detector)
 
-    # ---- decode (reuse base functions) ----
-    with bq.open_ro(args.larnd) as h:
-        p = np.asarray(h["packets"][:])
-        dmask = p["packet_type"] == dtype
-        adc = p["dataword"][dmask].astype(np.float64)
-        q_ke = (adc + 0.5 - intercept) / (slope * 1.0e3)
-        ev = bq.event_id_per_data_packet(h, dmask)
-        pix = bq.hit_pixel_ids(h, dmask, detector)
-    if pix is None:
-        sys.exit("could not map packets to pixels")
+    # ---- decode (reuse base functions); aggregate over all input LARND chunks ----
     from larndsim.pixels_from_track import id2pixel
-    pid, nx, ny = pix                                   # nx = Y (larnd-x, 128); ny = Z (larnd-y, 80)
-    iY = np.full(pid.shape, -1, np.int64)
-    iZ = np.full(pid.shape, -1, np.int64)
-    for i in np.nonzero(pid >= 0)[0]:
-        a, b, _ = id2pixel(int(pid[i]))
-        iY[i], iZ[i] = int(a), int(b)
+    nx, ny = int(detector.N_PIXELS[0]), int(detector.N_PIXELS[1])
+    q_parts, iY_parts, iZ_parts, ev_parts = [], [], [], []
+    ev_off = 0
+    for lf in args.larnd:
+        with bq.open_ro(lf) as h:
+            p = np.asarray(h["packets"][:])
+            dmask = p["packet_type"] == dtype
+            adc = p["dataword"][dmask].astype(np.float64)
+            qk = (adc + 0.5 - intercept) / (slope * 1.0e3)
+            evf = bq.event_id_per_data_packet(h, dmask)
+            pix = bq.hit_pixel_ids(h, dmask, detector)
+        if pix is None:
+            print(f"  (skipping {lf}: could not map packets to pixels)")
+            continue
+        pid = pix[0]
+        iYf = np.full(pid.shape, -1, np.int64); iZf = np.full(pid.shape, -1, np.int64)
+        for i in np.nonzero(pid >= 0)[0]:
+            a, b, _ = id2pixel(int(pid[i])); iYf[i], iZf[i] = int(a), int(b)
+        q_parts.append(qk); iY_parts.append(iYf); iZ_parts.append(iZf)
+        if evf is not None:
+            ev_parts.append(np.where(evf >= 0, evf + ev_off, -1))
+            if (evf >= 0).any():
+                ev_off += int(evf[evf >= 0].max()) + 1            # keep decay ids distinct across chunks
+        else:
+            ev_parts.append(np.full(qk.shape, -1, np.int64))
+    if not q_parts:
+        sys.exit("no usable LARND inputs")
+    q_ke = np.concatenate(q_parts); iY = np.concatenate(iY_parts); iZ = np.concatenate(iZ_parts)
+    ev = np.concatenate(ev_parts)
+    if len(q_parts) > 1:
+        print(f"aggregated {len(q_parts)} LARND chunks -> {q_ke.size} hits")
     valid = (iY >= 0) & (iY < nx) & (iZ >= 0) & (iZ < ny)
     inwin = (q_ke >= args.line_lo) & (q_ke <= args.line_hi)      # the calibration line window
     H = np.zeros((nx, ny), np.int64)                             # ALL hits (for the comparison profile)
@@ -169,12 +185,23 @@ def main():
     np.add.at(Hc, (iY[vln], iZ[vln]), 1)
     npix = nx * ny
     n_lit, n_lit_c = int((H > 0).sum()), int((Hc > 0).sum())
-    ndet = int(np.unique(ev[ev >= 0]).size) if ev is not None else -1
+    ndet = int(np.unique(ev[ev >= 0]).size) if (ev >= 0).any() else -1
 
-    # ---- emitted-decay count (needed to turn rate -> time) ----
+    # ---- emitted-decay count (needed to turn rate -> time); sum over all edep chunks ----
     ngen, gfield, gset = (args.n_generated, "cli", "cli") if args.n_generated else (None, None, None)
     if ngen is None and args.edep:
-        ngen, gfield, gset = count_generated(args.edep)
+        tot, okc = 0, 0
+        for ef in args.edep:
+            try:
+                n_e, gfield, gset = count_generated(ef)
+            except Exception as exc:
+                print(f"  (count_generated failed for {ef}: {exc!r})"); n_e = None
+            if n_e:
+                tot += int(n_e); okc += 1
+        if okc:
+            ngen = tot
+            if okc > 1:
+                gset = f"{okc} edep files"
     lower_bound = False
     if ngen is None:
         ngen, lower_bound = max(ndet, 1), True
@@ -258,7 +285,7 @@ def main():
     # ---- report ----
     out = []
     out.append(f"Bi-207 per-pixel calibration study  (N_target {args.n_target:.0f} LINE-hits/pixel)")
-    out.append(f"input {args.larnd}")
+    out.append(f"input {args.larnd[0]}" + (f"  (+{len(args.larnd)-1} more chunks)" if len(args.larnd) > 1 else ""))
     out.append(f"geometry: Y vertical/long 47.6cm/{nx}px; Z horizontal/short 29.76cm/{ny}px; X drift")
     out.append(f"calibration line window: {args.line_lo:.1f}-{args.line_hi:.1f} ke- (K-570 8.06/9.53 + 570 full-energy)")
     out.append(f"source: E&Z Bi-207 thin-window e- source (BIRB4391, 37 kBq nominal); reference {A:.0f} Bq")
