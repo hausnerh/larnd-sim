@@ -831,14 +831,17 @@ def main():
                                     for i in range(atid.size)])
                     isg = valid & (pdg0 == 22) & np.isfinite(edh) & np.isfinite(Ek)
                     is_ce = valid & np.isin(ls, np.array(["K-570 CE", "L-570 CE", "K-1064 CE", "L-1064 CE"]))
+                    # Compton ESCAPE is negligible here (big 3D LAr volume contains the gamma via multi-
+                    # site scatter), so the lower hump is NOT a Compton edge. 'untraced e-' = gamma e-
+                    # whose parent gamma was not saved as a trajectory (NOT Compton escape).
                     proc = np.full(valid.shape, "", dtype=object)
-                    proc[valid] = "Compton/other"
+                    proc[valid] = "untraced e-"
                     proc[is_ce] = "conv e- (CE line)"
-                    proc[isg & (edh < 0.9 * Ek)] = "gamma partial (Compton)"
-                    proc[isg & (edh >= 0.9 * Ek)] = "gamma full (photopeak)"
-                    porder = ["gamma full (photopeak)", "gamma partial (Compton)", "conv e- (CE line)", "Compton/other"]
-                    pcol = {"gamma full (photopeak)": "#4477aa", "gamma partial (Compton)": "#88ccee",
-                            "conv e- (CE line)": "#cc6677", "Compton/other": "0.8"}
+                    proc[isg & (edh < 0.9 * Ek)] = "gamma Compton escape"
+                    proc[isg & (edh >= 0.9 * Ek)] = "gamma fully absorbed"
+                    porder = ["gamma fully absorbed", "gamma Compton escape", "conv e- (CE line)", "untraced e-"]
+                    pcol = {"gamma fully absorbed": "#4477aa", "gamma Compton escape": "#88ccee",
+                            "conv e- (CE line)": "#cc6677", "untraced e-": "0.8"}
                     for psum, tag in [(False, ""), (True, "_psum")]:
                         fig, ax = plt.subplots(figsize=(7.6, 4.9))
                         if psum:
@@ -846,19 +849,61 @@ def main():
                         else:
                             vals, labs = q_ke[valid], proc[valid]
                         if stack_by_label(ax, vals, labs, porder, pcol, edges):
-                            mark_lines(ax, compton=True)
-                            finish(ax, "Collected charge by INTERACTION MECHANISM (truth dE: full vs Compton)"
+                            mark_lines(ax)
+                            finish(ax, "Collected charge by INTERACTION MECHANISM (truth dE)"
                                    + (" (per-pixel Q-sum)" if psum else ""), psum)
                             o = os.path.join(args.outdir, f"bi207_charge_by_process{tag}.png")
                             fig.savefig(o, dpi=140); print(f"wrote {o}")
                         plt.close(fig)
-                    lo_m = valid & (q_ke >= 5.0) & (q_ke < 7.5)      # lower hump (Compton-edge region)
-                    hi_m = valid & (q_ke >= 8.5) & (q_ke < 10.5)     # upper hump (photopeak region)
+                    lo_m = valid & (q_ke >= 5.0) & (q_ke < 7.5)      # lower hump
+                    hi_m = valid & (q_ke >= 8.5) & (q_ke < 10.5)     # upper hump (570 per-pixel peak)
                     print("  double-peak decomposition -- per-hit mechanism counts in each hump:")
                     for p in porder:
                         if int((proc == p).sum()):
                             print(f"    {p:26s} lower[5-7.5] {int((lo_m & (proc == p)).sum()):6d}   "
                                   f"upper[8.5-10.5] {int((hi_m & (proc == p)).sum()):6d}")
+
+                # Plot D: per-event SPATIAL-CLUSTER charge (sum over the 8-connected pixels one decay
+                # lights) -- the cross-pixel energy sum, and the real test of whether the 1064 line is
+                # recoverable. A 570 keV photo-absorption lands on ~1 pixel (short photo-e range) so it
+                # already peaks per-pixel; a 1064 keV one makes a ~1 MeV photo-e that spreads charge over
+                # 2-3 pixels, so per-pixel it FRAGMENTS and only the cluster sum rebuilds its 17.8 ke-
+                # band. DIAGNOSTIC (truth-free clustering), NOT the per-pixel threshold-fit quantity.
+                try:
+                    from scipy import ndimage as _ndi
+                    _have_ndi = True
+                except Exception:
+                    _have_ndi = False
+                if _have_ndi and int(valid.sum()) > 0:
+                    evv = ev[valid].astype(np.int64); iyv = iY[valid]; izv = iZ[valid]
+                    qv = q_ke[valid]; lbv = qlabel[valid]
+                    clid = np.full(qv.size, -1, np.int64); base = 0
+                    struct = np.ones((3, 3), int)
+                    for e in np.unique(evv):
+                        sel = np.where(evv == e)[0]
+                        img = np.zeros((nx, ny), bool); img[iyv[sel], izv[sel]] = True
+                        lab, nlab = _ndi.label(img, structure=struct)
+                        clid[sel] = base + lab[iyv[sel], izv[sel]]
+                        base += nlab + 1
+                    uc, cinv = np.unique(clid, return_inverse=True)
+                    csum = np.zeros(uc.size); np.add.at(csum, cinv, qv)
+                    clab = np.empty(uc.size, dtype=object)
+                    for k in np.argsort(qv):
+                        clab[cinv[k]] = lbv[k]
+                    fig, ax = plt.subplots(figsize=(7.6, 4.9))
+                    if stack_by_label(ax, csum, clab, qorder, qcols, edges):
+                        mark_lines(ax)
+                        ax.set_xlim(0, args.qmax); ax.set_title(
+                            "Per-event SPATIAL-CLUSTER charge (cross-pixel energy sum, by quantum)", fontsize=9)
+                        ax.set_xlabel("cluster Q [ke-]"); ax.set_ylabel(f"clusters / {args.nadc} ADC count")
+                        ax.legend(loc="upper right", fontsize=7, ncol=2); fig.tight_layout()
+                        o = os.path.join(args.outdir, "bi207_charge_by_cluster.png")
+                        fig.savefig(o, dpi=140); print(f"wrote {o}")
+                        b570 = int(((csum >= 7.5) & (csum < 11.0)).sum())
+                        b1064 = int(((csum >= 14.0) & (csum < 20.0)).sum())
+                        print(f"  cluster-sum: {uc.size} clusters; line bands 570[7.5-11] {b570}, "
+                              f"1064[14-20] {b1064} (per-pixel the 1064 fragments; clustering rebuilds it)")
+                    plt.close(fig)
 
                 # Plot C: 570 complex -- charge-window selection vs TRUTH conversion-electron origin, to
                 # show the window map's spread is gamma, not the local K-570 electron line.
