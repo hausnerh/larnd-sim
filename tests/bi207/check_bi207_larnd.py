@@ -649,6 +649,50 @@ def readout_vs_truth_incube(uev_tr, incube_mev, uev_ro, q_ro, slope, intercept, 
           "not off the cube, for these -- so a lower threshold / pixel-sum helps THIS population (unlike the escapers).")
 
 
+def anode_vs_fee(anode_by_ev, uev_ro, q_ro, uev_tr, incube_mev, slope, intercept, nadc, outdir):
+    """TRUE charge reaching the anode per decay = sum of segments['n_electrons'] -- larnd-sim's OWN
+    Birks recombination x drift attenuation, written back after quench+drift, BEFORE the FEE (no
+    threshold, no ADC quantization, no induction integration). Compared with the FEE per-event readout
+    this splits the shortfall into two gaps: truth->anode = the recombination model (my edep_to_ke is
+    Box + fixed dE/dx; larnd uses Birks + real dE/dx, so the marks need not sit on the anode peaks), and
+    anode->FEE = threshold/induction loss. If the anode spectrum shows a 1064 structure the FEE smears,
+    the loss is the per-pixel threshold (recoverable); if the anode is ALSO smeared, it is the physics."""
+    import matplotlib.pyplot as plt
+    anode_ro = np.array([anode_by_ev.get(int(e), np.nan) for e in uev_ro])   # ke- at anode, hit decays
+    all_ev = np.fromiter(anode_by_ev.keys(), dtype=np.int64)
+    all_anode = np.fromiter(anode_by_ev.values(), dtype=float)
+    emax = 42.0
+    edges = adc_aligned_edges(0.0, emax, slope, intercept, nadc)
+    fig, ax = plt.subplots(figsize=(7.8, 5.0))
+    ax.hist(all_anode, bins=edges, histtype="stepfilled", color="#9ecae1", edgecolor="#4a7fb0",
+            label=f"anode charge (n_electrons, all {all_anode.size} decays)")
+    ax.hist(q_ro, bins=edges, histtype="step", color="#b2182b", lw=1.6,
+            label=f"FEE readout total ({q_ro.size} hit decays)")
+    for e_mev, nm in [(0.5697, "570"), (1.0637, "1064"), (1.6334, "1064+570")]:
+        x = edep_to_ke(e_mev); ax.axvline(x, color="0.4", ls=":", lw=1.0)
+        ax.text(x, ax.get_ylim()[1] * 0.98, f"{nm} {x:.0f}", rotation=90, va="top", ha="right",
+                fontsize=7, color="0.3")
+    ax.set_xlim(0, emax)
+    ax.set_xlabel("charge per decay [ke-]")
+    ax.set_ylabel(f"decays / {nadc} ADC count")
+    ax.set_title("TRUE charge at the anode (pre-FEE n_electrons) vs FEE readout", fontsize=10)
+    ax.legend(loc="upper right", fontsize=8); fig.tight_layout()
+    out = os.path.join(outdir, "bi207_anode_charge.png"); fig.savefig(out, dpi=130); plt.close(fig)
+    print(f"wrote {out}")
+    print(f"  anode charge (n_electrons, pre-FEE): all-decay median {np.median(all_anode):.1f} ke-, "
+          f"max {all_anode.max():.1f}; FEE hit-decay median {np.median(q_ro):.1f} ke-")
+    tmap = {int(e): float(v) for e, v in zip(uev_tr, incube_mev)}
+    tro = np.array([tmap.get(int(e), np.nan) for e in uev_ro])
+    for name, lo, hi in [("570 ", 0.50, 0.75), ("1064", 1.00, 1.25), ("1633", 1.55, 1.90)]:
+        sel = np.isfinite(tro) & (tro >= lo) & (tro < hi) & np.isfinite(anode_ro)
+        if sel.any():
+            tmid = 0.5 * (lo + hi)
+            print(f"  in-cube {name} [{lo}-{hi}] MeV ({int(sel.sum())}): truth~{edep_to_ke(tmid):.1f} "
+                  f"-> anode {np.median(anode_ro[sel]):.1f} -> FEE {np.median(q_ro[sel]):.1f} ke- (medians)")
+    print("  -> truth->anode gap = recombination (edep_to_ke Box vs larnd Birks); anode->FEE gap = "
+          "threshold/induction. Tells us whether the 'misaligned' FEE Q is a FEE effect or my reference.")
+
+
 def main():
     ap = argparse.ArgumentParser(description="Decode the larnd-sim FEE (LARND) output to charge, fit "
                                              "the Bi-207 K-570 line, and map pixel coverage. No ndlar_flow.")
@@ -692,6 +736,20 @@ def main():
         q_ke = (adc + 0.5 - intercept) / (slope * 1.0e3)   # unclipped; sub-pedestal shows slightly <0
         ev = event_id_per_data_packet(h, dmask)
         pixinfo = hit_pixel_ids(h, dmask, detector)
+        # TRUE charge reaching the anode (pre-FEE): larnd writes the quenched+drifted tracks back as
+        # 'segments', so segments['n_electrons'] = Birks-recombined, drift-attenuated charge, no threshold.
+        anode_by_ev = None
+        if "segments" in h:
+            sg = h["segments"]; sgn = sg.dtype.names or ()
+            if "n_electrons" in sgn and "event_id" in sgn:
+                s_ne = np.asarray(sg["n_electrons"][:], float)
+                s_ev = np.asarray(sg["event_id"][:]).astype(np.int64)
+                ue_a, inv_a = np.unique(s_ev, return_inverse=True)
+                a_tot = np.zeros(ue_a.size); np.add.at(a_tot, inv_a, s_ne)
+                anode_by_ev = {int(e): float(v) / 1.0e3 for e, v in zip(ue_a, a_tot)}
+                av = np.fromiter(anode_by_ev.values(), dtype=float)
+                print(f"anode charge from segments['n_electrons']: {av.size} decays, median "
+                      f"{np.median(av):.1f} ke-, max {av.max():.1f} ke- (pre-FEE: Birks recomb x drift, no threshold)")
 
     # ---- per-decay sum + multiplicity ----
     per_evt_q = per_evt_n = uev = None
@@ -719,6 +777,9 @@ def main():
                 uev_tr, incube_mev = tr
                 readout_vs_truth_incube(uev_tr, incube_mev, uev, per_evt_q,
                                         slope, intercept, args.nadc, args.outdir)
+                if anode_by_ev is not None:
+                    anode_vs_fee(anode_by_ev, uev, per_evt_q, uev_tr, incube_mev,
+                                 slope, intercept, args.nadc, args.outdir)
         else:
             print(f"  (translated _fsd EDEPSIM not found at {fsd_edep}; pass --fsd-edep for the in-cube clip)")
 
