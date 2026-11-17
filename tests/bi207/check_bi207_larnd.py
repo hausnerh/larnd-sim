@@ -523,6 +523,77 @@ def truth_dE_per_decay(edep_path, outdir):
           "ONE 570's worth; the 1.633/2.340 cascades DO deposit in LAr but spill the small readout footprint.")
 
 
+def truth_dE_incube(fsd_edep_path, detector, outdir):
+    """IMPOSE THE FSD-CUBE BOUNDARIES on the truth. Using the TRANSLATED (_fsd) segments -- which live
+    in the cube frame and still carry EVERY deposit (bi207_to_fsd keeps them all; simulate_pixels drops
+    the out-of-volume ones only at drift) -- sum dE per decay (a) over ALL segments [= big-volume total]
+    and (b) only over segments INSIDE detector.TPC_BORDERS [= what the cube contains]. The gap is energy
+    deposited in LAr but OUTSIDE the ~30x48 cm cube: the 1.633/2.340 MeV cascade peaks drain toward the
+    ~0.57 blob the readout actually sees -- the direct proof that the loss is the footprint, not the FEE."""
+    import matplotlib.pyplot as plt
+    try:
+        with open_ro(fsd_edep_path) as he:
+            if "segments" not in he:
+                print(f"  (no 'segments' in {fsd_edep_path} -> in-cube truth unavailable)"); return
+            seg = he["segments"]; sn = seg.dtype.names or ()
+            if not {"event_id", "dE"} <= set(sn):
+                print("  (translated segments lack event_id/dE -> in-cube truth unavailable)"); return
+            def col(ax):
+                if ax in sn:
+                    return np.asarray(seg[ax][:], float)
+                if f"{ax}_start" in sn and f"{ax}_end" in sn:
+                    return 0.5 * (np.asarray(seg[f"{ax}_start"][:], float) + np.asarray(seg[f"{ax}_end"][:], float))
+                return None
+            sev = np.asarray(seg["event_id"][:]).astype(np.int64)
+            sde = np.asarray(seg["dE"][:]).astype(np.float64)
+            sx, sy, sz = col("x"), col("y"), col("z")
+    except Exception as exc:
+        print(f"  (in-cube truth unavailable: {exc!r})"); return
+    if sx is None or sy is None or sz is None:
+        print("  (translated segments lack x/y/z -> in-cube truth unavailable)"); return
+    B = np.asarray(detector.TPC_BORDERS)[0]
+    inside = np.ones(sde.size, bool)
+    for v, ax in ((sx, 0), (sy, 1), (sz, 2)):
+        lo, hi = sorted((float(B[ax, 0]), float(B[ax, 1])))
+        inside &= (v >= lo) & (v <= hi)
+    uev, inv = np.unique(sev, return_inverse=True)
+    full = np.zeros(uev.size); np.add.at(full, inv, sde)
+    incube = np.zeros(uev.size); np.add.at(incube, inv, np.where(inside, sde, 0.0))
+    ke_per_mev = edep_to_ke(1.0)
+    LEVELS = [(0.5697, "570"), (1.6334, "1064+570"), (2.3399, "1770+570")]
+    emax = 2.6
+    bins = np.linspace(0.0, emax, 261)
+    fig, ax = plt.subplots(figsize=(7.6, 5.0))
+    ax.hist(full, bins=bins, histtype="stepfilled", color="#c9d6e5", edgecolor="#8aa0b8",
+            label=f"deposited in LAr (big volume)   med {np.median(full):.2f} MeV")
+    ax.hist(incube, bins=bins, histtype="step", color="#b2182b", lw=1.7,
+            label=f"inside FSD-cube boundaries      med {np.median(incube):.2f} MeV")
+    ytop = ax.get_ylim()[1]
+    for e, lab in LEVELS:
+        ax.axvline(e, color="0.35", ls=":", lw=1.0)
+        ax.text(e, ytop * 0.985, f"{lab} {e:.3f}", rotation=90, va="top", ha="right", fontsize=7.5, color="0.25")
+    ax.set_xlim(0, emax)
+    ax.set_xlabel("TRUTH energy deposited per decay [MeV]")
+    ax.set_ylabel("decays")
+    ax.set_title("Truth per-decay energy: big LAr volume vs INSIDE the FSD-cube boundaries")
+    secax = ax.secondary_xaxis("top", functions=(lambda x: x * ke_per_mev, lambda q: q / ke_per_mev))
+    secax.set_xlabel("equivalent fully-collected charge [ke-]")
+    ax.legend(loc="center right", fontsize=8); fig.tight_layout()
+    out = os.path.join(outdir, "bi207_truth_dE_incube.png")
+    fig.savefig(out, dpi=130); plt.close(fig); print(f"wrote {out}")
+    retain = 100.0 * incube.sum() / full.sum() if full.sum() > 0 else float("nan")
+    print(f"  in-cube vs big-volume: total energy retained {retain:.1f}%; per-decay median "
+          f"{np.median(incube):.3f} vs {np.median(full):.3f} MeV ({int((incube < 0.05).sum())} decays "
+          f"deposit <0.05 MeV inside the cube)")
+    for lo, hi, name in [(0.50, 0.75, "570        [0.50-0.75]"),
+                         (1.55, 1.80, "1064+570   [1.55-1.80]"),
+                         (2.25, 2.50, "1770+570   [2.25-2.50]")]:
+        nf = int(((full >= lo) & (full < hi)).sum()); ni = int(((incube >= lo) & (incube < hi)).sum())
+        print(f"    {name} MeV: big-volume {nf:5d} -> in-cube {ni:5d}")
+    print("  -> the cascade peaks drain into the low-energy blob the readout sees: the energy is deposited "
+          "in LAr but OUTSIDE the ~30x48 cm cube, so no summing/clustering can recover it.")
+
+
 def main():
     ap = argparse.ArgumentParser(description="Decode the larnd-sim FEE (LARND) output to charge, fit "
                                              "the Bi-207 K-570 line, and map pixel coverage. No ndlar_flow.")
@@ -530,6 +601,8 @@ def main():
     ap.add_argument("--edep", default=None, help="EDEPSIM .h5 (trajectories) -> TRUTH-match the per-line "
                     "maps: tag each hit by its directly-emitted primary (conversion e- vs decay gamma), "
                     "instead of only its reconstructed charge window")
+    ap.add_argument("--fsd-edep", default=None, help="TRANSLATED (_fsd) EDEPSIM .h5 (cube frame) for the "
+                    "in-cube boundary clip; default = the LARND path with .LARND.->.EDEPSIM.")
     ap.add_argument("--outdir", default="bi207_larnd", help="output directory for the pngs + txt")
     ap.add_argument("--qmax", type=float, default=30.0, help="charge-axis max [ke-]")
     ap.add_argument("--nadc", type=int, default=1, help="ADC counts per charge-histogram bin (>=1)")
@@ -584,6 +657,11 @@ def main():
     # ---- TRUTH deposited energy per decay (readout-independent; the intrinsic Bi-207 containment) ----
     if args.edep:
         truth_dE_per_decay(args.edep, args.outdir)
+        fsd_edep = args.fsd_edep or args.larnd.replace(".LARND.", ".EDEPSIM.")
+        if fsd_edep != args.larnd and os.path.exists(fsd_edep):
+            truth_dE_incube(fsd_edep, detector, args.outdir)
+        else:
+            print(f"  (translated _fsd EDEPSIM not found at {fsd_edep}; pass --fsd-edep for the in-cube clip)")
 
     def draw_k570(ax):
         ax.axvline(q_bare, color="darkorange", ls="--", lw=1.2)
@@ -990,11 +1068,20 @@ def main():
                             continue
                         s = np.zeros(ue.size); np.add.at(s, einv[m], qv[m])
                         bett = s > best; best[bett] = s[bett]; elab[bett] = L
-                    emax = max(args.qmax, 35.0)
+                    emax = max(args.qmax, 42.0)
                     edges_e = adc_aligned_edges(0.0, emax, slope, intercept, args.nadc)
                     fig, ax = plt.subplots(figsize=(7.6, 4.9))
                     if stack_by_label(ax, etot, elab, qorder, qcols, edges_e):
                         mark_lines(ax); ax.set_xlim(0, emax)
+                        # where a FULLY-CONTAINED decay would pile (truth cascade sums -> ke-): shows the
+                        # readout reaches nowhere near these, so it is footprint loss, not a short x-axis.
+                        for e_mev, nm in [(0.5697, "570 full"), (1.6334, "1064+570 full"),
+                                          (2.3399, "1770+570 full")]:
+                            xq = edep_to_ke(e_mev)
+                            if xq <= emax:
+                                ax.axvline(xq, color="purple", ls="--", lw=1.0, alpha=0.7)
+                                ax.text(xq, ax.get_ylim()[1]*0.60, f"{nm} ({xq:.0f})", rotation=90,
+                                        va="top", ha="right", fontsize=7, color="purple")
                         ax.set_title("Per-event TOTAL charge (whole readout, no cuts) by dominant truth quantum", fontsize=9)
                         ax.set_xlabel("event total Q [ke-]"); ax.set_ylabel(f"events / {args.nadc} ADC count")
                         ax.legend(loc="upper right", fontsize=7, ncol=2); fig.tight_layout()
