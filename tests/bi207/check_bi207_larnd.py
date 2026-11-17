@@ -665,17 +665,17 @@ def anode_vs_fee(anode_by_ev, uev_ro, q_ro, uev_tr, incube_mev, slope, intercept
     edges = adc_aligned_edges(0.0, emax, slope, intercept, nadc)
     fig, ax = plt.subplots(figsize=(7.8, 5.0))
     ax.hist(all_anode, bins=edges, histtype="stepfilled", color="#9ecae1", edgecolor="#4a7fb0",
-            label=f"anode charge (n_electrons, all {all_anode.size} decays)")
+            label=f"anode charge in-cube (n_electrons, {all_anode.size} decays)")
     ax.hist(q_ro, bins=edges, histtype="step", color="#b2182b", lw=1.6,
             label=f"FEE readout total ({q_ro.size} hit decays)")
     for e_mev, nm in [(0.5697, "570"), (1.0637, "1064"), (1.6334, "1064+570")]:
         x = edep_to_ke(e_mev); ax.axvline(x, color="0.4", ls=":", lw=1.0)
-        ax.text(x, ax.get_ylim()[1] * 0.98, f"{nm} {x:.0f}", rotation=90, va="top", ha="right",
+        ax.text(x, ax.get_ylim()[1] * 0.98, f"{nm} {x:.0f} (Box)", rotation=90, va="top", ha="right",
                 fontsize=7, color="0.3")
     ax.set_xlim(0, emax)
     ax.set_xlabel("charge per decay [ke-]")
     ax.set_ylabel(f"decays / {nadc} ADC count")
-    ax.set_title("TRUE charge at the anode (pre-FEE n_electrons) vs FEE readout", fontsize=10)
+    ax.set_title("TRUE charge at the anode INSIDE the cube (pre-FEE n_electrons) vs FEE readout", fontsize=9.5)
     ax.legend(loc="upper right", fontsize=8); fig.tight_layout()
     out = os.path.join(outdir, "bi207_anode_charge.png"); fig.savefig(out, dpi=130); plt.close(fig)
     print(f"wrote {out}")
@@ -742,14 +742,37 @@ def main():
         if "segments" in h:
             sg = h["segments"]; sgn = sg.dtype.names or ()
             if "n_electrons" in sgn and "event_id" in sgn:
+                def scol(ax):
+                    if ax in sgn:
+                        return np.asarray(sg[ax][:], float)
+                    if f"{ax}_start" in sgn and f"{ax}_end" in sgn:
+                        return 0.5 * (np.asarray(sg[f"{ax}_start"][:], float) + np.asarray(sg[f"{ax}_end"][:], float))
+                    return None
                 s_ne = np.asarray(sg["n_electrons"][:], float)
                 s_ev = np.asarray(sg["event_id"][:]).astype(np.int64)
+                sX, sY, sZ = scol("x"), scol("y"), scol("z")
+                # Restrict to the fsd_cube READOUT FOOTPRINT -- same pixel-index + drift range larnd uses
+                # (hit_pixel_ids / hit_drift_fraction) -- so the anode charge is comparable to the FEE and
+                # NOT inflated by the half of the cascade that escapes the small cube.
+                incube = np.ones(s_ne.size, bool)
+                if sX is not None and sY is not None:
+                    Bb = np.asarray(detector.TPC_BORDERS)[0]
+                    pitch = float(detector.PIXEL_PITCH)
+                    nx0, ny0 = int(detector.N_PIXELS[0]), int(detector.N_PIXELS[1])
+                    i_x = np.floor((sX - float(Bb[0][0])) / pitch).astype(int)
+                    i_y = np.floor((sY - float(Bb[1][0])) / pitch).astype(int)
+                    incube &= (i_x >= 0) & (i_x < nx0) & (i_y >= 0) & (i_y < ny0)
+                    if sZ is not None:
+                        zlo, zhi = sorted((float(Bb[2][0]), float(Bb[2][1])))
+                        incube &= (sZ >= zlo) & (sZ <= zhi)
+                ne_in = np.where(incube, s_ne, 0.0)
                 ue_a, inv_a = np.unique(s_ev, return_inverse=True)
-                a_tot = np.zeros(ue_a.size); np.add.at(a_tot, inv_a, s_ne)
+                a_tot = np.zeros(ue_a.size); np.add.at(a_tot, inv_a, ne_in)
                 anode_by_ev = {int(e): float(v) / 1.0e3 for e, v in zip(ue_a, a_tot)}
                 av = np.fromiter(anode_by_ev.values(), dtype=float)
-                print(f"anode charge from segments['n_electrons']: {av.size} decays, median "
-                      f"{np.median(av):.1f} ke-, max {av.max():.1f} ke- (pre-FEE: Birks recomb x drift, no threshold)")
+                print(f"anode charge from segments['n_electrons'] (INSIDE readout footprint): {av.size} decays, "
+                      f"{100*incube.mean():.0f}% of segments in-cube, median {np.median(av):.1f} ke-, "
+                      f"max {av.max():.1f} ke- (Birks recomb x drift, pre-FEE: no threshold)")
 
     # ---- per-decay sum + multiplicity ----
     per_evt_q = per_evt_n = uev = None
