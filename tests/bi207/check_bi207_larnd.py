@@ -501,6 +501,13 @@ def truth_dE_per_decay(edep_path, outdir):
         ax.axvline(e, color="0.3", ls=":", lw=1.0)
         ax.text(e, ytop * 0.985, f"{lab}  {e:.3f}", rotation=90, va="top", ha="right",
                 fontsize=7.5, color="0.2")
+    # EC leaves a K-shell vacancy in the daughter Pb; the ~75 keV Pb Ka X-ray (or Auger) is usually
+    # absorbed locally, so each nuclear line has a companion ~75 keV HIGHER -> the taller "+Kx" peaks.
+    XRAY = 0.0749
+    for e, lab in [(0.5697, "570+Kx"), (1.6334, "1064+570+Kx"), (2.3399, "1770+570+Kx")]:
+        ax.axvline(e + XRAY, color="seagreen", ls="--", lw=1.0, alpha=0.85)
+        ax.text(e + XRAY, ytop * 0.60, f"{lab} {e+XRAY:.3f}", rotation=90, va="top", ha="left",
+                fontsize=7, color="seagreen")
     ax.set_xlim(0, emax)
     ax.set_xlabel("TRUTH energy deposited in LAr per decay [MeV]")
     ax.set_ylabel("decays")
