@@ -354,12 +354,16 @@ def hit_primary_origin(h, data_mask, edep_path):
 
         n, K = segids.shape
         pdg = np.zeros(n, np.int64); E0 = np.full(n, np.nan); atid = np.full(n, -1, np.int64)
+        aev = np.full(n, -1, np.int64)               # event id (segment frame) of the emitted quantum
         for i in range(n):
             acc = {}                                 # emitted traj_id -> [summed fraction, pdg, E_start]
+            ev_i = -1
             for j in range(K):
                 s = int(segids[i, j])
                 if s < 0:
                     continue
+                if ev_i < 0 and 0 <= s < seg_ev.size:
+                    ev_i = int(seg_ev[s])            # all a packet's segments share one event
                 pg, Es, tid = seg_primary(s)
                 if tid < 0:
                     continue
@@ -372,7 +376,8 @@ def hit_primary_origin(h, data_mask, edep_path):
                 tid_best = max(acc, key=lambda t: acc[t][0])
                 _, pg, Es = acc[tid_best]
                 pdg[i], E0[i], atid[i] = pg, Es, tid_best
-        return pdg, E0, atid
+                aev[i] = ev_i
+        return pdg, E0, atid, aev
     except Exception as exc:
         print(f"  (truth origin unavailable: {exc!r})")
         return None
@@ -428,6 +433,32 @@ def emitted_deposited_energy(h, edep_path):
     except Exception as exc:
         print(f"  (emitted deposited energy unavailable: {exc!r})")
         return {}
+
+
+def stack_by_label(ax, values, labels, order, colmap, edges):
+    """Stacked step-filled histogram of `values` grouped by `labels` (object array), in `order`,
+    colored by colmap. Returns the present labels (those with >0 entries)."""
+    pres = [L for L in order if int((labels == L).sum()) > 0]
+    if pres:
+        ax.hist([values[labels == L] for L in pres], bins=edges, stacked=True, histtype="stepfilled",
+                color=[colmap[L] for L in pres], label=[f"{L} ({int((labels == L).sum())})" for L in pres])
+    return pres
+
+
+def pixel_sum_label(q, ev, iY, iZ, mask, nx, ny, labels):
+    """Group masked hits into (event,pixel) cells, sum their charge, and label each cell by its
+    HIGHEST-charge hit. Returns (cell_sum_charge, cell_label). This is the within-pixel Q-sum (merges
+    the 2-3 packets one deposit fires on a pixel) -- NOT a cross-pixel cluster sum."""
+    qv = q[mask]; evv = ev[mask].astype(np.int64); iy = iY[mask]; iz = iZ[mask]; lb = labels[mask]
+    if qv.size == 0:
+        return np.array([]), np.array([], dtype=object)
+    cell = evv * (nx * ny) + (iy * ny + iz)
+    uc, cinv = np.unique(cell, return_inverse=True)
+    csum = np.zeros(uc.size); np.add.at(csum, cinv, qv)
+    clab = np.empty(uc.size, dtype=object)
+    for k in np.argsort(qv):                 # ascending -> the highest-charge hit labels the cell
+        clab[cinv[k]] = lb[k]
+    return csum, clab
 
 
 def main():
@@ -678,7 +709,7 @@ def main():
                 origin = hit_primary_origin(h2, dmask, args.edep)
                 Edep_emitted = emitted_deposited_energy(h2, args.edep) if origin is not None else {}
             if origin is not None and origin[0].shape == valid.shape:
-                pdg0, E0, atid = origin
+                pdg0, E0, atid, aev = origin
                 iY0, iZ0 = (Yctr - Y0) / pitch, (Zctr - Z0) / pitch   # source pixel in index space
                 # EDEPSIM trajectory E_start is TOTAL energy (KE + rest mass); the line catalogue is
                 # KINETIC, so subtract the e-/e+ rest mass (0.511 MeV) before matching. Gammas (massless)
@@ -746,78 +777,88 @@ def main():
                     o = os.path.join(args.outdir, "bi207_truth_lines.png")
                     fig.savefig(o, dpi=140); plt.close(fig); print(f"wrote {o}")
 
-                # Plot B: the reconstructed CHARGE spectrum decomposed by truth origin -- shows which lines
-                # survive as fittable peaks vs melt into the Compton continuum (what we can calibrate off).
-                order = ["K-570 CE", "570 gamma", "L-570 CE", "K-1064 CE", "1064 gamma", "L-1064 CE",
-                         "1770 gamma", "Pb-K X-ray"]
-                cols = {"K-570 CE": "#ee6677", "570 gamma": "#4477aa", "L-570 CE": "#f4a0a8",
-                        "K-1064 CE": "#228833", "1064 gamma": "#66ccee", "L-1064 CE": "#99ddbb",
-                        "1770 gamma": "#aa3377", "Pb-K X-ray": "#bbbbbb"}
-                present = [L for L in order if int((valid & (line == L)).sum()) > 0]
-                if present:
-                    edges = adc_aligned_edges(0.0, args.qmax, slope, intercept, args.nadc)
-                    stacks = [q_ke[valid & (line == L)] for L in present]
-                    rest = valid & ~np.isin(line.astype(str), np.array(present + [""], dtype=str))
-                    if int(rest.sum()) > 0:
-                        stacks.append(q_ke[rest]); present = present + ["Compton/other"]
-                        cols["Compton/other"] = "0.75"
-                    fig, ax = plt.subplots(figsize=(7.6, 4.9))
-                    ax.hist(stacks, bins=edges, stacked=True, histtype="stepfilled",
-                            color=[cols[L] for L in present], label=present)
+                edges = adc_aligned_edges(0.0, args.qmax, slope, intercept, args.nadc)
+                def mark_lines(ax, compton=False):
                     for lab, E, k, _ in BI207_LINES:
                         ax.axvline(edep_to_ke(E), color="0.4", ls=":", lw=0.8)
+                    if compton:
+                        qce = edep_to_ke(0.3936)                 # 570 Compton edge (394 keV)
+                        ax.axvline(qce, color="crimson", ls="--", lw=1.0)
+                        ax.text(qce, ax.get_ylim()[1] * 0.5, "570 Compton edge", rotation=90,
+                                va="center", ha="right", fontsize=7, color="crimson")
+                def finish(ax, title, psum):
                     ax.set_xlim(0, args.qmax)
-                    ax.set_title("Collected charge decomposed by TRUTH origin (which lines are fittable peaks)", fontsize=9)
-                    ax.set_xlabel("Q per pixel-hit [ke-]")
-                    ax.set_ylabel(f"hits / {args.nadc} ADC count")
+                    ax.set_title(title, fontsize=9)
+                    ax.set_xlabel("Q per-pixel SUM [ke-]" if psum else "Q per pixel-hit [ke-]")
+                    ax.set_ylabel(("pixel-deposits" if psum else "hits") + f" / {args.nadc} ADC count")
                     ax.legend(loc="upper right", fontsize=7, ncol=2)
                     fig.tight_layout()
-                    o = os.path.join(args.outdir, "bi207_charge_by_truth.png")
-                    fig.savefig(o, dpi=140); plt.close(fig); print(f"wrote {o}")
 
-                # Plot B2: the measured Q spectrum colored by INTERACTION MECHANISM (not just which
-                # quantum). Truth deposited energy (drift-independent) splits gamma hits into FULL
-                # absorption (photopeak) vs PARTIAL / Compton escape, beside the conversion/Auger
-                # electrons -- so it shows which mechanism makes each hump of the central double-peak.
-                # The gamma full/partial split is robust (gamma ancestry + truth dE); the e- (CE) tag
-                # is the known-fragile part (soft-electron mis-attribution), so read it as indicative.
+                # Plot B: reconstructed CHARGE decomposed by truth QUANTUM -- which lines survive as
+                # fittable peaks vs melt into the Compton continuum. Per-hit AND per-pixel-Q-sum (the
+                # sum of the packets one decay drops on a pixel), so we can see whether summing sharpens
+                # the high-energy (1064) region.
+                qorder = ["K-570 CE", "570 gamma", "L-570 CE", "K-1064 CE", "1064 gamma", "L-1064 CE",
+                          "1770 gamma", "Pb-K X-ray", "Compton/other"]
+                qcols = {"K-570 CE": "#ee6677", "570 gamma": "#4477aa", "L-570 CE": "#f4a0a8",
+                         "K-1064 CE": "#228833", "1064 gamma": "#66ccee", "L-1064 CE": "#99ddbb",
+                         "1770 gamma": "#aa3377", "Pb-K X-ray": "#bbbbbb", "Compton/other": "0.78"}
+                ls = line.astype(str)
+                qlabel = np.full(valid.shape, "", dtype=object)
+                qlabel[valid] = "Compton/other"                  # e-other / g-other / untraced -> gray
+                for L in qorder[:-1]:
+                    qlabel[valid & (ls == L)] = L
+                for psum, tag in [(False, ""), (True, "_psum")]:
+                    fig, ax = plt.subplots(figsize=(7.6, 4.9))
+                    if psum:
+                        vals, labs = pixel_sum_label(q_ke, ev, iY, iZ, valid, nx, ny, qlabel)
+                    else:
+                        vals, labs = q_ke[valid], qlabel[valid]
+                    if stack_by_label(ax, vals, labs, qorder, qcols, edges):
+                        mark_lines(ax)
+                        finish(ax, "Collected charge by truth QUANTUM" + (" (per-pixel Q-sum)" if psum else ""), psum)
+                        o = os.path.join(args.outdir, f"bi207_charge_by_truth{tag}.png")
+                        fig.savefig(o, dpi=140); print(f"wrote {o}")
+                    plt.close(fig)
+
+                # Plot B2: measured Q by INTERACTION MECHANISM. Truth deposited energy (drift-independent)
+                # splits gamma hits into FULL absorption (photopeak) vs PARTIAL / Compton escape, beside
+                # the true conversion-electron lines; the untraced remainder (Compton e- whose gamma was
+                # not saved as a trajectory, + soft deltas) is the gray 'Compton/other'. Per-hit AND
+                # per-pixel-Q-sum. The gamma full/partial split is the robust part; CE tagging is indicative.
                 if Edep_emitted:
-                    edh = np.array([Edep_emitted.get((int(ev[i]), int(atid[i])), np.nan)
+                    edh = np.array([Edep_emitted.get((int(aev[i]), int(atid[i])), np.nan)
                                     for i in range(atid.size)])
                     isg = valid & (pdg0 == 22) & np.isfinite(edh) & np.isfinite(Ek)
+                    is_ce = valid & np.isin(ls, np.array(["K-570 CE", "L-570 CE", "K-1064 CE", "L-1064 CE"]))
                     proc = np.full(valid.shape, "", dtype=object)
-                    proc[isg & (edh >= 0.9 * Ek)] = "gamma full (photopeak)"
+                    proc[valid] = "Compton/other"
+                    proc[is_ce] = "conv e- (CE line)"
                     proc[isg & (edh < 0.9 * Ek)] = "gamma partial (Compton)"
-                    proc[valid & (np.abs(pdg0) == 11)] = "conv/Auger e-"
-                    proc[valid & (proc == "")] = "other/unresolved"
-                    porder = ["gamma full (photopeak)", "gamma partial (Compton)", "conv/Auger e-", "other/unresolved"]
+                    proc[isg & (edh >= 0.9 * Ek)] = "gamma full (photopeak)"
+                    porder = ["gamma full (photopeak)", "gamma partial (Compton)", "conv e- (CE line)", "Compton/other"]
                     pcol = {"gamma full (photopeak)": "#4477aa", "gamma partial (Compton)": "#88ccee",
-                            "conv/Auger e-": "#cc6677", "other/unresolved": "0.8"}
-                    ppres = [p for p in porder if int((proc == p).sum()) > 0]
-                    edges = adc_aligned_edges(0.0, args.qmax, slope, intercept, args.nadc)
-                    fig, ax = plt.subplots(figsize=(7.6, 4.9))
-                    ax.hist([q_ke[proc == p] for p in ppres], bins=edges, stacked=True,
-                            histtype="stepfilled", color=[pcol[p] for p in ppres],
-                            label=[f"{p} ({int((proc == p).sum())})" for p in ppres])
-                    for lab, E, k, _ in BI207_LINES:
-                        ax.axvline(edep_to_ke(E), color="0.4", ls=":", lw=0.8)
-                    qce = edep_to_ke(0.3936)                     # 570 Compton edge (394 keV)
-                    ax.axvline(qce, color="crimson", ls="--", lw=1.0)
-                    ax.text(qce, ax.get_ylim()[1] * 0.5, "570 Compton edge", rotation=90,
-                            va="center", ha="right", fontsize=7, color="crimson")
-                    ax.set_xlim(0, args.qmax)
-                    ax.set_title("Collected charge by INTERACTION MECHANISM (truth dE: full vs Compton)", fontsize=9)
-                    ax.set_xlabel("Q per pixel-hit [ke-]"); ax.set_ylabel(f"hits / {args.nadc} ADC count")
-                    ax.legend(loc="upper right", fontsize=8)
-                    fig.tight_layout()
-                    o = os.path.join(args.outdir, "bi207_charge_by_process.png")
-                    fig.savefig(o, dpi=140); plt.close(fig); print(f"wrote {o}")
+                            "conv e- (CE line)": "#cc6677", "Compton/other": "0.8"}
+                    for psum, tag in [(False, ""), (True, "_psum")]:
+                        fig, ax = plt.subplots(figsize=(7.6, 4.9))
+                        if psum:
+                            vals, labs = pixel_sum_label(q_ke, ev, iY, iZ, valid, nx, ny, proc)
+                        else:
+                            vals, labs = q_ke[valid], proc[valid]
+                        if stack_by_label(ax, vals, labs, porder, pcol, edges):
+                            mark_lines(ax, compton=True)
+                            finish(ax, "Collected charge by INTERACTION MECHANISM (truth dE: full vs Compton)"
+                                   + (" (per-pixel Q-sum)" if psum else ""), psum)
+                            o = os.path.join(args.outdir, f"bi207_charge_by_process{tag}.png")
+                            fig.savefig(o, dpi=140); print(f"wrote {o}")
+                        plt.close(fig)
                     lo_m = valid & (q_ke >= 5.0) & (q_ke < 7.5)      # lower hump (Compton-edge region)
                     hi_m = valid & (q_ke >= 8.5) & (q_ke < 10.5)     # upper hump (photopeak region)
-                    print("  double-peak decomposition -- hits by mechanism in each hump:")
-                    for p in ppres:
-                        print(f"    {p:26s} lower[5-7.5] {int((lo_m & (proc == p)).sum()):6d}   "
-                              f"upper[8.5-10.5] {int((hi_m & (proc == p)).sum()):6d}")
+                    print("  double-peak decomposition -- per-hit mechanism counts in each hump:")
+                    for p in porder:
+                        if int((proc == p).sum()):
+                            print(f"    {p:26s} lower[5-7.5] {int((lo_m & (proc == p)).sum()):6d}   "
+                                  f"upper[8.5-10.5] {int((hi_m & (proc == p)).sum()):6d}")
 
                 # Plot C: 570 complex -- charge-window selection vs TRUTH conversion-electron origin, to
                 # show the window map's spread is gamma, not the local K-570 electron line.
