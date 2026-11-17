@@ -659,15 +659,17 @@ def anode_vs_fee(anode_by_ev, uev_ro, q_ro, uev_tr, incube_mev, slope, intercept
     the loss is the per-pixel threshold (recoverable); if the anode is ALSO smeared, it is the physics."""
     import matplotlib.pyplot as plt
     anode_ro = np.array([anode_by_ev.get(int(e), np.nan) for e in uev_ro])   # ke- at anode, hit decays
-    all_ev = np.fromiter(anode_by_ev.keys(), dtype=np.int64)
     all_anode = np.fromiter(anode_by_ev.values(), dtype=float)
+    fin = np.isfinite(anode_ro)
     emax = 42.0
     edges = adc_aligned_edges(0.0, emax, slope, intercept, nadc)
     fig, ax = plt.subplots(figsize=(7.8, 5.0))
-    ax.hist(all_anode, bins=edges, histtype="stepfilled", color="#9ecae1", edgecolor="#4a7fb0",
-            label=f"anode charge in-cube (n_electrons, {all_anode.size} decays)")
-    ax.hist(q_ro, bins=edges, histtype="step", color="#b2182b", lw=1.6,
-            label=f"FEE readout total ({q_ro.size} hit decays)")
+    # SAME decays on both curves (the ones that fired): anode = charge before the FEE, FEE = after. The
+    # gap between them is purely the threshold/induction loss, with the population mismatch removed.
+    ax.hist(anode_ro[fin], bins=edges, histtype="stepfilled", color="#9ecae1", edgecolor="#4a7fb0",
+            label=f"anode charge in-cube, same {int(fin.sum())} hit decays (pre-FEE)")
+    ax.hist(q_ro, bins=edges, histtype="step", color="#b2182b", lw=1.7,
+            label=f"FEE readout total (same {q_ro.size} decays)")
     for e_mev, nm in [(0.5697, "570"), (1.0637, "1064"), (1.6334, "1064+570")]:
         x = edep_to_ke(e_mev); ax.axvline(x, color="0.4", ls=":", lw=1.0)
         ax.text(x, ax.get_ylim()[1] * 0.98, f"{nm} {x:.0f} (Box)", rotation=90, va="top", ha="right",
@@ -691,6 +693,82 @@ def anode_vs_fee(anode_by_ev, uev_ro, q_ro, uev_tr, incube_mev, slope, intercept
                   f"-> anode {np.median(anode_ro[sel]):.1f} -> FEE {np.median(q_ro[sel]):.1f} ke- (medians)")
     print("  -> truth->anode gap = recombination (edep_to_ke Box vs larnd Birks); anode->FEE gap = "
           "threshold/induction. Tells us whether the 'misaligned' FEE Q is a FEE effect or my reference.")
+
+
+def source_placement_scan(fsd_edep_path, detector, outdir):
+    """Where should the source sit to contain the most cascade energy? The EDEP cloud was generated in a
+    big (fully-containing) LAr volume, so we hold each decay's COMPLETE deposit cloud; re-translating it
+    to a trial source point inside the cube and re-clipping to TPC_BORDERS gives that placement's
+    containment WITHOUT re-running the sim. Compares cathode-center (current) to a long-face (top/bottom)
+    mount, a short-face mount, and the geometric center (the mount-free ceiling). Prints energy retained
+    and how many decays keep the full 1064+570 (1.633 MeV) cascade -- the handle on whether moving the
+    source rescues a 1064 line, or whether the short transverse dimension caps it regardless."""
+    import matplotlib.pyplot as plt
+    try:
+        with open_ro(fsd_edep_path) as he:
+            if "segments" not in he:
+                print("  (no 'segments' in _fsd edep -> placement scan unavailable)"); return
+            seg = he["segments"]; sn = seg.dtype.names or ()
+            def col(ax):
+                if ax in sn:
+                    return np.asarray(seg[ax][:], float)
+                if f"{ax}_start" in sn and f"{ax}_end" in sn:
+                    return 0.5 * (np.asarray(seg[f"{ax}_start"][:], float) + np.asarray(seg[f"{ax}_end"][:], float))
+                return None
+            ev = np.asarray(seg["event_id"][:]).astype(np.int64)
+            dE = np.asarray(seg["dE"][:]).astype(np.float64)
+            X, Y, Z = col("x"), col("y"), col("z")
+    except Exception as exc:
+        print(f"  (placement scan unavailable: {exc!r})"); return
+    if X is None or Y is None or Z is None:
+        print("  (translated segments lack x/y/z -> placement scan unavailable)"); return
+    Bc = np.asarray(detector.TPC_BORDERS)[0].astype(float)
+    lo = np.minimum(Bc[:, 0], Bc[:, 1]); hi = np.maximum(Bc[:, 0], Bc[:, 1])
+    mid = 0.5 * (lo + hi); length = hi - lo
+    cathode_z = float(Bc[2, 1])                                  # bi207_to_fsd mounts on z1 = cathode
+    long_ax = int(np.argmax(length[:2])); short_ax = 1 - long_ax  # of the two plane axes 0,1
+    cur = mid.copy(); cur[2] = cathode_z                          # current source: plane-centered, cathode
+    def at(ax_set):                                              # build a target from {axis: value}
+        t = mid.copy()
+        for a, v in ax_set.items():
+            t[a] = v
+        return t
+    cands = {
+        "cathode center (current)": cur,
+        f"long-face center ({length[long_ax]:.0f}cm axis)": at({long_ax: hi[long_ax]}),
+        f"short-face center ({length[short_ax]:.0f}cm axis)": at({short_ax: hi[short_ax]}),
+        "cube center (ideal ceiling)": mid.copy(),
+    }
+    coords = np.stack([X, Y, Z], axis=1)
+    _, inv = np.unique(ev, return_inverse=True); nd = int(inv.max()) + 1
+    emax = 2.6; bins = np.linspace(0.0, emax, 261)
+    fig, ax = plt.subplots(figsize=(7.8, 5.0))
+    results = {}
+    for name, tsrc in cands.items():
+        shift = tsrc - cur
+        c2 = coords + shift
+        inside = np.all((c2 >= lo) & (c2 <= hi), axis=1)
+        etot = np.zeros(nd); np.add.at(etot, inv, np.where(inside, dE, 0.0))
+        retain = 100.0 * float(np.where(inside, dE, 0.0).sum()) / float(dE.sum())
+        n1633 = int(((etot >= 1.55) & (etot < 1.80)).sum())
+        results[name] = (retain, float(np.median(etot)), n1633)
+        ax.hist(etot, bins=bins, histtype="step", lw=1.6,
+                label=f"{name}: {retain:.0f}% kept, 1.633-band {n1633}")
+    for e, lab in [(0.5697, "570"), (1.6334, "1064+570"), (2.3399, "1770+570")]:
+        ax.axvline(e, color="0.6", ls=":", lw=0.9)
+        ax.text(e, ax.get_ylim()[1] * 0.98, lab, rotation=90, va="top", ha="right", fontsize=7, color="0.4")
+    ax.set_xlim(0, emax)
+    ax.set_xlabel("in-cube TRUTH energy per decay [MeV]")
+    ax.set_ylabel("decays")
+    ax.set_title("Source-placement scan (sim-free re-translation of the truth cloud)", fontsize=9.5)
+    ax.legend(fontsize=7.5); fig.tight_layout()
+    out = os.path.join(outdir, "bi207_source_placement.png"); fig.savefig(out, dpi=130); plt.close(fig)
+    print(f"wrote {out}")
+    for name, (r, m, n) in results.items():
+        print(f"  {name:36s}: {r:4.1f}% energy kept, median {m:.3f} MeV, 1064+570 [1.55-1.80] {n} decays")
+    print("  -> read the 1.633-band counts: if the long-face mount ~= cathode but the cube center jumps, "
+          "the SHORT transverse dim caps containment and a surface mount can't beat it; if the long-face "
+          "mount itself jumps, moving the source there genuinely helps.")
 
 
 def main():
@@ -803,6 +881,7 @@ def main():
                 if anode_by_ev is not None:
                     anode_vs_fee(anode_by_ev, uev, per_evt_q, uev_tr, incube_mev,
                                  slope, intercept, args.nadc, args.outdir)
+            source_placement_scan(fsd_edep, detector, args.outdir)
         else:
             print(f"  (translated _fsd EDEPSIM not found at {fsd_edep}; pass --fsd-edep for the in-cube clip)")
 
