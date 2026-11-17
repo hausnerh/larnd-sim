@@ -599,6 +599,54 @@ def truth_dE_incube(fsd_edep_path, detector, outdir):
         print(f"    {name} MeV: big-volume {nf:5d} -> in-cube {ni:5d}")
     print("  -> the cascade peaks drain into the low-energy blob the readout sees: the energy is deposited "
           "in LAr but OUTSIDE the ~30x48 cm cube, so no summing/clustering can recover it.")
+    return uev, incube
+
+
+def readout_vs_truth_incube(uev_tr, incube_mev, uev_ro, q_ro, slope, intercept, nadc, outdir):
+    """Reconcile the cube-contained TRUTH energy with what the READOUT actually recorded. For the decays
+    whose in-cube truth energy sits in the 570 / 1064 / 1633 bands, histogram the readout per-event TOTAL
+    charge. If collection were perfect each band would stand at its edep_to_ke mark; instead the 1064/1633
+    bands smear DOWN and broad because the delocalized gamma splits across pixels and the per-pixel
+    fragments that fall below threshold are dropped (plus depth-dependent drift attenuation). THIS is why
+    the cube contains ~18 ke- of 1064 in ~500 decays yet no sharp 1064 readout peak survives."""
+    import matplotlib.pyplot as plt
+    tmap = {int(e): float(v) for e, v in zip(uev_tr, incube_mev)}
+    tro = np.array([tmap.get(int(e), np.nan) for e in uev_ro])
+    bands = [("570  truth-in-cube [0.50-0.75]", 0.50, 0.75, "#1f6fb2"),
+             ("1064 truth-in-cube [1.00-1.25]", 1.00, 1.25, "#d1495b"),
+             ("1633 truth-in-cube [1.55-1.90]", 1.55, 1.90, "#6a3d9a")]
+    emax = 42.0
+    edges = adc_aligned_edges(0.0, emax, slope, intercept, nadc)
+    fig, ax = plt.subplots(figsize=(7.8, 5.0))
+    plotted = False
+    for name, lo, hi, c in bands:
+        sel = np.isfinite(tro) & (tro >= lo) & (tro < hi)
+        n = int(sel.sum())
+        if n == 0:
+            continue
+        plotted = True
+        ax.hist(q_ro[sel], bins=edges, histtype="step", color=c, lw=1.8,
+                label=f"{name} MeV: {n} decays, readout med {np.median(q_ro[sel]):.1f} ke-")
+        mark = edep_to_ke(0.5 * (lo + hi))     # where full collection at ~full drift would put it
+        ax.axvline(mark, color=c, ls="--", lw=1.1, alpha=0.7)
+        ax.text(mark, ax.get_ylim()[1] * 0.98, f"{mark:.0f}", color=c, fontsize=7.5, ha="right", va="top")
+    ax.set_xlim(0, emax)
+    ax.set_xlabel("readout per-event TOTAL charge [ke-]")
+    ax.set_ylabel(f"decays / {nadc} ADC count")
+    ax.set_title("Readout per-event charge, conditioned on TRUTH cube-contained energy", fontsize=10)
+    if plotted:
+        ax.legend(loc="upper right", fontsize=8)
+    fig.tight_layout()
+    out = os.path.join(outdir, "bi207_readout_vs_truth_incube.png")
+    fig.savefig(out, dpi=130); plt.close(fig); print(f"wrote {out}")
+    for name, lo, hi, c in bands:
+        sel = np.isfinite(tro) & (tro >= lo) & (tro < hi)
+        if sel.any():
+            print(f"  {name} MeV: {int(sel.sum())} decays -> readout median {np.median(q_ro[sel]):.1f}, "
+                  f"mean {np.mean(q_ro[sel]):.1f} ke-  (perfect ~{edep_to_ke(0.5*(lo+hi)):.0f} ke-)")
+    print("  -> the 1064/1633 truth-contained decays record FAR below their mark and broad: delocalized "
+          "gamma -> multi-pixel split -> sub-threshold fragments dropped. The charge is lost per-pixel, "
+          "not off the cube, for these -- so a lower threshold / pixel-sum helps THIS population (unlike the escapers).")
 
 
 def main():
@@ -646,7 +694,7 @@ def main():
         pixinfo = hit_pixel_ids(h, dmask, detector)
 
     # ---- per-decay sum + multiplicity ----
-    per_evt_q = per_evt_n = None
+    per_evt_q = per_evt_n = uev = None
     if ev is not None and (ev >= 0).any():
         good = ev >= 0
         uev, inv = np.unique(ev[good], return_inverse=True)
@@ -666,7 +714,11 @@ def main():
         truth_dE_per_decay(args.edep, args.outdir)
         fsd_edep = args.fsd_edep or args.larnd.replace(".LARND.", ".EDEPSIM.")
         if fsd_edep != args.larnd and os.path.exists(fsd_edep):
-            truth_dE_incube(fsd_edep, detector, args.outdir)
+            tr = truth_dE_incube(fsd_edep, detector, args.outdir)
+            if tr is not None and per_evt_q is not None and uev is not None:
+                uev_tr, incube_mev = tr
+                readout_vs_truth_incube(uev_tr, incube_mev, uev, per_evt_q,
+                                        slope, intercept, args.nadc, args.outdir)
         else:
             print(f"  (translated _fsd EDEPSIM not found at {fsd_edep}; pass --fsd-edep for the in-cube clip)")
 
