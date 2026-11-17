@@ -901,8 +901,42 @@ def main():
                         fig.savefig(o, dpi=140); print(f"wrote {o}")
                         b570 = int(((csum >= 7.5) & (csum < 11.0)).sum())
                         b1064 = int(((csum >= 14.0) & (csum < 20.0)).sum())
-                        print(f"  cluster-sum: {uc.size} clusters; line bands 570[7.5-11] {b570}, "
-                              f"1064[14-20] {b1064} (per-pixel the 1064 fragments; clustering rebuilds it)")
+                        print(f"  cluster-sum: {uc.size} clusters from {int(valid.sum())} hits "
+                              f"(adjacency merges little -- deposits are sparse/separated); "
+                              f"bands 570[7.5-11] {b570}, 1064[14-20] {b1064}")
+                    plt.close(fig)
+
+                # Plot E: per-EVENT TOTAL charge -- the WHOLE readout summed over every pixel in a decay,
+                # no cuts, tagged by the event's DOMINANT truth quantum. This is the cross-pixel sum with
+                # NO clustering and NO per-pixel/per-decay cap (those cannot clip it). Detection efficiency
+                # is low (median 1 hit/decay -- most gammas escape the small cube), so most events are a
+                # single interacting quantum and this ~= the per-quantum energy. A 1064 peak at 17.8 ke-
+                # appears ONLY for the fraction that fully absorbs AND stays above threshold; whatever the
+                # scattered photon carries out of the cube is gone (physical, not a reconstruction limit).
+                if int(valid.sum()) > 0:
+                    evv = ev[valid]; qv = q_ke[valid]; lbv = qlabel[valid]
+                    ue, einv = np.unique(evv, return_inverse=True)
+                    etot = np.zeros(ue.size); np.add.at(etot, einv, qv)
+                    elab = np.empty(ue.size, dtype=object); best = np.full(ue.size, -1.0)
+                    for L in qorder:                              # dominant quantum = most summed charge
+                        m = lbv == L
+                        if not m.any():
+                            continue
+                        s = np.zeros(ue.size); np.add.at(s, einv[m], qv[m])
+                        bett = s > best; best[bett] = s[bett]; elab[bett] = L
+                    emax = max(args.qmax, 35.0)
+                    edges_e = adc_aligned_edges(0.0, emax, slope, intercept, args.nadc)
+                    fig, ax = plt.subplots(figsize=(7.6, 4.9))
+                    if stack_by_label(ax, etot, elab, qorder, qcols, edges_e):
+                        mark_lines(ax); ax.set_xlim(0, emax)
+                        ax.set_title("Per-event TOTAL charge (whole readout, no cuts) by dominant truth quantum", fontsize=9)
+                        ax.set_xlabel("event total Q [ke-]"); ax.set_ylabel(f"events / {args.nadc} ADC count")
+                        ax.legend(loc="upper right", fontsize=7, ncol=2); fig.tight_layout()
+                        o = os.path.join(args.outdir, "bi207_charge_by_event_total.png")
+                        fig.savefig(o, dpi=140); print(f"wrote {o}")
+                        print(f"  per-event TOTAL ({ue.size} decays with hits): "
+                              + ", ".join(f"{nm}[{lo}-{hi}] {int(((etot >= lo) & (etot < hi)).sum())}"
+                                          for lo, hi, nm in [(7.5, 11.0, "570"), (15.0, 20.0, "1064"), (26.0, 33.0, "1770")]))
                     plt.close(fig)
 
                 # Plot C: 570 complex -- charge-window selection vs TRUTH conversion-electron origin, to
