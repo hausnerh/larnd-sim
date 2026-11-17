@@ -461,6 +461,68 @@ def pixel_sum_label(q, ev, iY, iZ, mask, nx, ny, labels):
     return csum, clab
 
 
+def truth_dE_per_decay(edep_path, outdir):
+    """TRUTH energy deposited in the LAr per decay -- straight from the EDEPSIM segments (dE summed
+    per event_id), INDEPENDENT of the pixel readout. The EDEP runs in the large module0 LAr, which
+    contains the full Bi-207 cascade, so the per-decay total piles at the Pb-207 LEVEL energies, not
+    at an isolated 1.064: the 1064 gamma is emitted in cascade WITH a 570 (1633 keV level -> 1064 g
+    -> 570 level -> 570 g), so a contained 1064 decay deposits 1.633 MeV, and a 1770 decay 2.340 MeV.
+    Compare the equivalent-charge top axis to the readout per-event-total (which peaks near 0.57
+    MeV-equiv ~ 9.5 ke-): the shortfall is the charge the small fsd_cube readout footprint misses."""
+    import matplotlib.pyplot as plt
+    try:
+        with open_ro(edep_path) as he:
+            if "segments" not in he:
+                print("  (no 'segments' in --edep -> truth per-decay dE unavailable)")
+                return
+            seg = he["segments"]; sn = seg.dtype.names or ()
+            if not {"event_id", "dE"} <= set(sn):
+                print(f"  (segments lack event_id/dE; have {sn} -> truth per-decay dE unavailable)")
+                return
+            seg_ev = np.asarray(seg["event_id"][:]).astype(np.int64)
+            seg_dE = np.asarray(seg["dE"][:]).astype(np.float64)
+    except Exception as exc:
+        print(f"  (truth per-decay dE unavailable: {exc!r})")
+        return
+    if seg_ev.size == 0:
+        print("  (no segments in --edep)"); return
+    uev, inv = np.unique(seg_ev, return_inverse=True)
+    etot = np.zeros(uev.size); np.add.at(etot, inv, seg_dE)      # MeV deposited in LAr per decay
+    ke_per_mev = edep_to_ke(1.0)                                 # linear MeV->ke- (full-drift collected)
+    # Pb-207 de-excitation levels Bi-207 feeds; full containment piles the per-decay total here.
+    LEVELS = [(0.5697, "570 level"), (1.0637, "1064 g (570 esc.)"), (1.6334, "1064+570"),
+              (1.7702, "1770 g (570 esc.)"), (2.3399, "1770+570")]
+    emax = 2.6
+    fig, ax = plt.subplots(figsize=(7.6, 5.0))
+    ax.hist(etot, bins=np.linspace(0.0, emax, 261), histtype="stepfilled",
+            color="#3b6ea5", alpha=0.92, edgecolor="#1f3a5f", linewidth=0.4)
+    ytop = ax.get_ylim()[1]
+    for e, lab in LEVELS:
+        ax.axvline(e, color="0.3", ls=":", lw=1.0)
+        ax.text(e, ytop * 0.985, f"{lab}  {e:.3f}", rotation=90, va="top", ha="right",
+                fontsize=7.5, color="0.2")
+    ax.set_xlim(0, emax)
+    ax.set_xlabel("TRUTH energy deposited in LAr per decay [MeV]")
+    ax.set_ylabel("decays")
+    ax.set_title("Truth per-decay deposited energy (EDEPSIM segments, big module0 LAr)")
+    secax = ax.secondary_xaxis("top", functions=(lambda x: x * ke_per_mev, lambda q: q / ke_per_mev))
+    secax.set_xlabel("equivalent fully-collected charge [ke-]  (edep_to_ke, full drift)")
+    fig.tight_layout()
+    out = os.path.join(outdir, "bi207_truth_dE_per_decay.png")
+    fig.savefig(out, dpi=130); plt.close(fig)
+    print(f"wrote {out}")
+    print(f"  truth per-decay dE ({etot.size} decays with any LAr deposit): median "
+          f"{np.median(etot):.3f} MeV, mean {np.mean(etot):.3f} MeV, max {etot.max():.3f} MeV")
+    for lo, hi, name in [(0.50, 0.75, "570        [0.50-0.75]"),
+                         (1.55, 1.80, "1064+570   [1.55-1.80]"),
+                         (2.25, 2.50, "1770+570   [2.25-2.50]")]:
+        n = int(((etot >= lo) & (etot < hi)).sum())
+        print(f"    {name} MeV: {n:5d} ({100.0*n/etot.size:4.1f}%)   "
+              f"~{0.5*(lo+hi)*ke_per_mev:.1f} ke- if fully collected")
+    print("  -> readout per-decay median ~9.45 ke- ~ 0.57 MeV-equiv: the fsd_cube readout collects about "
+          "ONE 570's worth; the 1.633/2.340 cascades DO deposit in LAr but spill the small readout footprint.")
+
+
 def main():
     ap = argparse.ArgumentParser(description="Decode the larnd-sim FEE (LARND) output to charge, fit "
                                              "the Bi-207 K-570 line, and map pixel coverage. No ndlar_flow.")
@@ -518,6 +580,10 @@ def main():
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     from matplotlib.colors import LogNorm
+
+    # ---- TRUTH deposited energy per decay (readout-independent; the intrinsic Bi-207 containment) ----
+    if args.edep:
+        truth_dE_per_decay(args.edep, args.outdir)
 
     def draw_k570(ax):
         ax.axvline(q_bare, color="darkorange", ls="--", lw=1.2)
