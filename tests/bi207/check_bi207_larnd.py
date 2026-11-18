@@ -735,8 +735,8 @@ def source_placement_scan(fsd_edep_path, detector, outdir):
         return t
     cands = {
         "cathode center (current)": cur,
+        "cathode corner (4-corner)": at({0: hi[0], 1: hi[1], 2: cathode_z}),
         f"long-face center ({length[long_ax]:.0f}cm axis)": at({long_ax: hi[long_ax]}),
-        f"short-face center ({length[short_ax]:.0f}cm axis)": at({short_ax: hi[short_ax]}),
         "cube center (ideal ceiling)": mid.copy(),
     }
     coords = np.stack([X, Y, Z], axis=1)
