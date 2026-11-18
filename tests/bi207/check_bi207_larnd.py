@@ -771,6 +771,69 @@ def source_placement_scan(fsd_edep_path, detector, outdir):
           "mount itself jumps, moving the source there genuinely helps.")
 
 
+def drift_depth_sweep(fsd_edep_path, detector, outdir, nstep=25):
+    """How far off the cathode must a plane-centered source sit before the 1064+570 cascade line appears?
+    Re-translate the complete truth cloud along the DRIFT axis from cathode (inset 0) to anode (inset =
+    full drift) and count decays in the 570 and 1064+570 truth bands at each depth (sim-free). The cascade
+    count rises from the cathode to a maximum at the geometric center (both gammas see 4pi + the most LAr)
+    and falls symmetrically toward the anode -- the rise tells you the inset needed."""
+    import matplotlib.pyplot as plt
+    try:
+        with open_ro(fsd_edep_path) as he:
+            if "segments" not in he:
+                print("  (no segments -> drift sweep unavailable)"); return
+            seg = he["segments"]; sn = seg.dtype.names or ()
+            def col(ax):
+                if ax in sn:
+                    return np.asarray(seg[ax][:], float)
+                if f"{ax}_start" in sn and f"{ax}_end" in sn:
+                    return 0.5 * (np.asarray(seg[f"{ax}_start"][:], float) + np.asarray(seg[f"{ax}_end"][:], float))
+                return None
+            ev = np.asarray(seg["event_id"][:]).astype(np.int64)
+            dE = np.asarray(seg["dE"][:]).astype(np.float64)
+            X, Y, Z = col("x"), col("y"), col("z")
+    except Exception as exc:
+        print(f"  (drift sweep unavailable: {exc!r})"); return
+    if X is None or Y is None or Z is None:
+        print("  (translated segments lack x/y/z -> drift sweep unavailable)"); return
+    Bc = np.asarray(detector.TPC_BORDERS)[0].astype(float)
+    lo = np.minimum(Bc[:, 0], Bc[:, 1]); hi = np.maximum(Bc[:, 0], Bc[:, 1])
+    anode_z, cathode_z = float(Bc[2, 0]), float(Bc[2, 1])
+    drift_len = abs(cathode_z - anode_z); dirz = (anode_z - cathode_z) / drift_len
+    _, inv = np.unique(ev, return_inverse=True); nd = int(inv.max()) + 1
+    insets = np.linspace(0.0, drift_len, nstep)
+    n570 = np.zeros(nstep); n1633 = np.zeros(nstep); kept = np.zeros(nstep)
+    in_plane = (X >= lo[0]) & (X <= hi[0]) & (Y >= lo[1]) & (Y <= hi[1])
+    for k, d in enumerate(insets):
+        z2 = Z + dirz * d
+        inside = in_plane & (z2 >= lo[2]) & (z2 <= hi[2])
+        etot = np.zeros(nd); np.add.at(etot, inv, np.where(inside, dE, 0.0))
+        n570[k] = int(((etot >= 0.50) & (etot < 0.75)).sum())
+        n1633[k] = int(((etot >= 1.55) & (etot < 1.80)).sum())
+        kept[k] = 100.0 * float(np.where(inside, dE, 0.0).sum()) / float(dE.sum())
+    fig, ax = plt.subplots(figsize=(7.6, 5.0))
+    ax.plot(insets, n1633, "-o", ms=3.5, color="#b2182b", label="1064+570 cascade [1.55-1.80 MeV]")
+    ax.plot(insets, n570, "-s", ms=3.5, color="#1f6fb2", label="570 [0.50-0.75 MeV]")
+    ax.axvline(drift_len / 2, color="0.5", ls="--", lw=1.0)
+    ax.text(drift_len / 2, ax.get_ylim()[1] * 0.96, "cube center", rotation=90, va="top", ha="right",
+            fontsize=8, color="0.4")
+    ax.axvline(0.5, color="green", ls=":", lw=1.0)
+    ax.text(1.0, ax.get_ylim()[1] * 0.45, "current 0.5cm", rotation=90, va="center", ha="left",
+            fontsize=7.5, color="green")
+    ax.set_xlabel("source inset off the cathode, along drift [cm]  (plane-centered)")
+    ax.set_ylabel("decays in band")
+    ax.set_title("Cascade / 570 line yield vs source drift depth (sim-free re-translation)", fontsize=9.5)
+    ax2 = ax.twinx(); ax2.plot(insets, kept, color="0.6", lw=1.1, alpha=0.75)
+    ax2.set_ylabel("% total energy kept", color="0.5"); ax2.tick_params(axis="y", colors="0.5")
+    ax.legend(loc="upper center", fontsize=8); fig.tight_layout()
+    out = os.path.join(outdir, "bi207_drift_depth_sweep.png"); fig.savefig(out, dpi=130); plt.close(fig)
+    print(f"wrote {out}")
+    for d in [0.5, 5.0, 10.0, 15.0, drift_len / 2]:
+        k = int(np.argmin(np.abs(insets - d)))
+        print(f"  inset {insets[k]:5.1f} cm: {kept[k]:4.1f}% kept, 570-band {int(n570[k])}, "
+              f"1064+570-band {int(n1633[k])}")
+
+
 def main():
     ap = argparse.ArgumentParser(description="Decode the larnd-sim FEE (LARND) output to charge, fit "
                                              "the Bi-207 K-570 line, and map pixel coverage. No ndlar_flow.")
@@ -882,6 +945,7 @@ def main():
                     anode_vs_fee(anode_by_ev, uev, per_evt_q, uev_tr, incube_mev,
                                  slope, intercept, args.nadc, args.outdir)
             source_placement_scan(fsd_edep, detector, args.outdir)
+            drift_depth_sweep(fsd_edep, detector, args.outdir)
         else:
             print(f"  (translated _fsd EDEPSIM not found at {fsd_edep}; pass --fsd-edep for the in-cube clip)")
 
